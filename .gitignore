@@ -3,5 +3,9 @@
 .idea/
 target/
 examples/
+!examples/
+examples/*
+!examples/rlock_issue_detection/
+!examples/rlock_issue_detection/**
 checker/.z3-trace
 .z3-trace

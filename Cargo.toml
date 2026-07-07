@@ -11,6 +11,12 @@ members = [
     "examples/tag_analysis/untrustworthy_inputs",
     "examples/tag_analysis/verification_status",
     "examples/tag_analysis/trait_methods",
+    "examples/rlock_issue_detection/clean_ordered",
+    "examples/rlock_issue_detection/double_acquire",
+    "examples/rlock_issue_detection/lock_order_inversion",
+    "examples/rlock_issue_detection/missing_contract",
+    "examples/rlock_issue_detection/reviewed_callee",
+    "examples/rlock_issue_detection/unheld_release",
 ]
 
 [profile.release]
