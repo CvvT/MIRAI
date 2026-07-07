@@ -14,7 +14,6 @@
 // While pretty bad, it is a lot less bad than having to write our own compiler, so here goes.
 #![allow(internal_features)]
 #![feature(rustc_private)]
-#![feature(array_chunks)]
 #![feature(box_patterns)]
 #![feature(core_intrinsics)]
 #![feature(f16)]

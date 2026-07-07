@@ -76,9 +76,9 @@ impl rustc_driver::Callbacks for MiraiCallbacks {
     fn config(&mut self, config: &mut interface::Config) {
         self.file_name = config
             .input
-            .source_name()
-            .prefer_remapped_unconditionaly()
-            .to_string();
+            .opt_path()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "unknown".to_string());
         info!("Processing input file: {}", self.file_name);
         if config.opts.test {
             info!("in test only mode");
@@ -130,7 +130,7 @@ impl MiraiCallbacks {
     #[logfn(TRACE)]
     fn analyze_with_mirai<'tcx>(&mut self, compiler: &interface::Compiler, tcx: TyCtxt<'tcx>) {
         if self.options.print_function_names {
-            for local_def_id in tcx.hir().body_owners() {
+            for local_def_id in tcx.hir_body_owners() {
                 let def_id = local_def_id.to_def_id();
                 let span = tcx.def_span(def_id);
                 eprint!("{span:?}: ");

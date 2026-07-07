@@ -862,12 +862,12 @@ impl ConstantDomain {
                         KnownNames::StdIntrinsicsLog10f16 => val.log10(),
                         KnownNames::StdIntrinsicsLog2f16 => val.log2(),
                         KnownNames::StdIntrinsicsLogf16 => val.ln(),
-                        KnownNames::StdIntrinsicsNearbyintf16 => unsafe {
-                            std::intrinsics::nearbyintf16(val)
-                        },
-                        KnownNames::StdIntrinsicsRintf16 => unsafe {
-                            std::intrinsics::rintf16(val)
-                        },
+                        KnownNames::StdIntrinsicsNearbyintf16 => {
+                            std::intrinsics::round_ties_even_f16(val)
+                        }
+                        KnownNames::StdIntrinsicsRintf16 => {
+                            std::intrinsics::round_ties_even_f16(val)
+                        }
                         KnownNames::StdIntrinsicsRoundf16 => val.round(),
                         KnownNames::StdIntrinsicsRevenf16 => f16::round_ties_even(val),
                         KnownNames::StdIntrinsicsSinf16 => val.sin(),
@@ -891,12 +891,12 @@ impl ConstantDomain {
                         KnownNames::StdIntrinsicsLog10f32 => val.log10(),
                         KnownNames::StdIntrinsicsLog2f32 => val.log2(),
                         KnownNames::StdIntrinsicsLogf32 => val.ln(),
-                        KnownNames::StdIntrinsicsNearbyintf32 => unsafe {
-                            std::intrinsics::nearbyintf32(val)
-                        },
-                        KnownNames::StdIntrinsicsRintf32 => unsafe {
-                            std::intrinsics::rintf32(val)
-                        },
+                        KnownNames::StdIntrinsicsNearbyintf32 => {
+                            std::intrinsics::round_ties_even_f32(val)
+                        }
+                        KnownNames::StdIntrinsicsRintf32 => {
+                            std::intrinsics::round_ties_even_f32(val)
+                        }
                         KnownNames::StdIntrinsicsRoundf32 => val.round(),
                         KnownNames::StdIntrinsicsRevenf32 => f32::round_ties_even(val),
                         KnownNames::StdIntrinsicsSinf32 => val.sin(),
@@ -920,12 +920,12 @@ impl ConstantDomain {
                         KnownNames::StdIntrinsicsLog10f64 => val.log10(),
                         KnownNames::StdIntrinsicsLog2f64 => val.log2(),
                         KnownNames::StdIntrinsicsLogf64 => val.ln(),
-                        KnownNames::StdIntrinsicsNearbyintf64 => unsafe {
-                            std::intrinsics::nearbyintf64(val)
-                        },
-                        KnownNames::StdIntrinsicsRintf64 => unsafe {
-                            std::intrinsics::rintf64(val)
-                        },
+                        KnownNames::StdIntrinsicsNearbyintf64 => {
+                            std::intrinsics::round_ties_even_f64(val)
+                        }
+                        KnownNames::StdIntrinsicsRintf64 => {
+                            std::intrinsics::round_ties_even_f64(val)
+                        }
                         KnownNames::StdIntrinsicsRoundf64 => val.round(),
                         KnownNames::StdIntrinsicsRevenf64 => f64::round_ties_even(val),
                         KnownNames::StdIntrinsicsSinf64 => val.sin(),

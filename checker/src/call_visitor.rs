@@ -12,11 +12,11 @@ use std::{f16, f64};
 use log_derive::*;
 
 use mirai_annotations::*;
+use rustc_abi::{ExternAbi, VariantIdx};
 use rustc_hir::def_id::DefId;
 use rustc_middle::mir;
-use rustc_middle::ty::ConstKind;
+use rustc_middle::ty::{AliasTyKind, ConstKind};
 use rustc_middle::ty::{GenericArg, GenericArgKind, GenericArgsRef, Ty, TyKind, UintTy};
-use rustc_target::abi::VariantIdx;
 
 use crate::abstract_value::{AbstractValue, AbstractValueTrait};
 use crate::block_visitor::BlockVisitor;
@@ -220,7 +220,7 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 .skip_binder()
                 .fn_sig(tcx)
                 .abi();
-            let resolved_instance = if abi == rustc_target::spec::abi::Abi::Rust {
+            let resolved_instance = if abi == ExternAbi::Rust {
                 Some(rustc_middle::ty::Instance::try_resolve(
                     tcx,
                     typing_env,
@@ -1337,14 +1337,15 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                     args.as_coroutine().args,
                     &self.type_visitor().generic_argument_map,
                 )),
-                TyKind::FnDef(_, args)
-                | TyKind::Alias(rustc_middle::ty::Opaque, rustc_middle::ty::AliasTy { args, .. }) => {
-                    Some(
-                        self.type_visitor().specialize_generic_args(
-                            args,
-                            &self.type_visitor().generic_argument_map,
-                        ),
-                    )
+                TyKind::FnDef(_, args) => Some(
+                    self.type_visitor()
+                        .specialize_generic_args(args, &self.type_visitor().generic_argument_map),
+                ),
+                TyKind::Alias(alias_ty) if matches!(alias_ty.kind, AliasTyKind::Opaque { .. }) => {
+                    Some(self.type_visitor().specialize_generic_args(
+                        alias_ty.args,
+                        &self.type_visitor().generic_argument_map,
+                    ))
                 }
                 _ => self
                     .block_visitor
@@ -2130,7 +2131,7 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             ),
             Some(rustc_gen_args) => {
                 checked_assume!(rustc_gen_args.len() == 1);
-                match rustc_gen_args[0].unpack() {
+                match rustc_gen_args[0].kind() {
                     GenericArgKind::Type(ty) => match ty.kind() {
                         TyKind::Adt(def, _) if def.is_enum() => {}
                         TyKind::Coroutine(..) => {}
@@ -2198,7 +2199,7 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             .type_visitor()
             .get_dereferenced_type(self.actual_argument_types[0]);
         if let Ok(ty_and_layout) = self.type_visitor().layout_of(t) {
-            return Rc::new((ty_and_layout.layout.align().pref.bytes() as u128).into());
+            return Rc::new((ty_and_layout.layout.align().abi.bytes() as u128).into());
         }
         // todo: need an expression that resolves to the value pref alignment once the value is known (typically after call site refinement).
         let path = self.block_visitor.visit_rh_place(&self.destination);
@@ -3323,7 +3324,7 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 checked_assume!(rustc_gen_args.len() == 2);
 
                 // The second generic argument of the function call is the tag type.
-                let tag_rustc_type = match rustc_gen_args[1].unpack() {
+                let tag_rustc_type = match rustc_gen_args[1].kind() {
                     GenericArgKind::Type(rustc_type) => rustc_type,
                     _ => {
                         // The rust type checker should ensure that the second generic argument is a type.
@@ -3353,15 +3354,15 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 };
 
                 let is_u128 = |kind: ConstKind| {
-                    if let ConstKind::Value(ty, _) = kind {
-                        *ty.kind() == TyKind::Uint(UintTy::U128)
+                    if let ConstKind::Value(value) = kind {
+                        *value.ty.kind() == TyKind::Uint(UintTy::U128)
                     } else {
                         false
                     }
                 };
 
                 // Extract the tag type's first parameter.
-                let tag_propagation_set_rustc_const = match tag_substs_ref[0].unpack() {
+                let tag_propagation_set_rustc_const = match tag_substs_ref[0].kind() {
                     GenericArgKind::Const(rustc_const) if is_u128(rustc_const.kind()) => {
                         rustc_const
                     }
