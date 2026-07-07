@@ -1429,7 +1429,7 @@ impl CallSiteOutput {
                 v.insert(index);
                 let mut file_name = None;
                 if let rustc_span::FileName::Real(real_fname) = fname {
-                    if let Some(p) = real_fname.remapped_path_if_available().to_str() {
+                    if let Some(p) = real_fname.local_path().and_then(|path| path.to_str()) {
                         file_name = p.split("/lib/rustlib/src").last().map(|s| s.to_string());
                     }
                 }

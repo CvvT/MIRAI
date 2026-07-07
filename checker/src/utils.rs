@@ -17,7 +17,7 @@ use rustc_hir::Node;
 use rustc_middle::ty;
 use rustc_middle::ty::print::{FmtPrinter, Printer};
 use rustc_middle::ty::{
-    FloatTy, GenericArgKind, GenericArgsRef, IntTy, Ty, TyCtxt, TyKind, UintTy,
+    AliasTyKind, FloatTy, GenericArgKind, GenericArgsRef, IntTy, Ty, TyCtxt, TyKind, UintTy,
 };
 
 /// Returns the location of the rust system binaries that are associated with this build of Mirai.
@@ -77,7 +77,7 @@ pub fn contains_function<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> bool {
     if let TyKind::Adt(def, args) = ty.kind() {
         for variant in def.variants().iter() {
             for field in variant.fields.iter() {
-                let field_ty = field.ty(tcx, args);
+                let field_ty = field.ty(tcx, args).skip_normalization();
                 if contains_function(field_ty, tcx) {
                     return true;
                 }
@@ -92,7 +92,7 @@ pub fn contains_function<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> bool {
 pub fn is_public(def_id: DefId, tcx: TyCtxt<'_>) -> bool {
     use rustc_hir::def_id::LocalDefId;
 
-    if tcx.hir().get_if_local(def_id).is_some() {
+    if def_id.as_local().is_some() {
         let def_id = def_id.expect_local();
         match tcx
             .resolutions(())
@@ -117,7 +117,7 @@ pub fn is_public(def_id: DefId, tcx: TyCtxt<'_>) -> bool {
                             .is_public()
                     }
                     Node::ImplItem(..) => {
-                        let parent_def_id: LocalDefId = tcx.hir().get_parent_item(hir_id).def_id;
+                        let parent_def_id: LocalDefId = tcx.parent_hir_id(hir_id).owner.def_id;
                         match tcx.hir_node_by_def_id(parent_def_id) {
                             Node::Item(rustc_hir::Item {
                                 kind:
@@ -127,13 +127,14 @@ pub fn is_public(def_id: DefId, tcx: TyCtxt<'_>) -> bool {
                                     }),
                                 ..
                             }) => tr
+                                .trait_ref
                                 .path
                                 .res
                                 .opt_def_id()
                                 .map_or_else(
                                     || {
                                         tcx.sess.dcx().span_delayed_bug(
-                                            tr.path.span,
+                                            tr.trait_ref.path.span,
                                             "trait without a def-id",
                                         );
                                         ty::Visibility::Public
@@ -216,7 +217,7 @@ fn append_mangled_type<'tcx>(str: &mut String, ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) 
         TyKind::Adt(def, subs) => {
             str.push_str(qualified_type_name(tcx, def.did()).as_str());
             for sub in *subs {
-                if let GenericArgKind::Type(ty) = sub.unpack() {
+                if let GenericArgKind::Type(ty) = sub.kind() {
                     str.push('_');
                     append_mangled_type(str, ty, tcx);
                 }
@@ -226,7 +227,7 @@ fn append_mangled_type<'tcx>(str: &mut String, ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) 
             str.push_str("closure_");
             str.push_str(qualified_type_name(tcx, *def_id).as_str());
             for sub in subs.as_closure().args {
-                if let GenericArgKind::Type(ty) = sub.unpack() {
+                if let GenericArgKind::Type(ty) = sub.kind() {
                     str.push('_');
                     append_mangled_type(str, ty, tcx);
                 }
@@ -241,7 +242,7 @@ fn append_mangled_type<'tcx>(str: &mut String, ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) 
                 );
                 str.push_str(qualified_type_name(tcx, principal.def_id).as_str());
                 for sub in principal.args {
-                    if let GenericArgKind::Type(ty) = sub.unpack() {
+                    if let GenericArgKind::Type(ty) = sub.kind() {
                         str.push('_');
                         append_mangled_type(str, ty, tcx);
                     }
@@ -256,7 +257,7 @@ fn append_mangled_type<'tcx>(str: &mut String, ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) 
             str.push_str("fn_");
             str.push_str(qualified_type_name(tcx, *def_id).as_str());
             for sub in *subs {
-                if let GenericArgKind::Type(ty) = sub.unpack() {
+                if let GenericArgKind::Type(ty) = sub.kind() {
                     str.push('_');
                     append_mangled_type(str, ty, tcx);
                 }
@@ -266,7 +267,7 @@ fn append_mangled_type<'tcx>(str: &mut String, ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) 
             str.push_str("coroutine_");
             str.push_str(qualified_type_name(tcx, *def_id).as_str());
             for sub in subs.as_coroutine().args {
-                if let GenericArgKind::Type(ty) = sub.unpack() {
+                if let GenericArgKind::Type(ty) = sub.kind() {
                     str.push('_');
                     append_mangled_type(str, ty, tcx);
                 }
@@ -278,11 +279,12 @@ fn append_mangled_type<'tcx>(str: &mut String, ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) 
                 append_mangled_type(str, ty, tcx)
             }
         }
-        TyKind::Alias(rustc_middle::ty::Opaque, rustc_middle::ty::AliasTy { def_id, args, .. }) => {
+        TyKind::Alias(alias_ty) if matches!(alias_ty.kind, AliasTyKind::Opaque { .. }) => {
+            let def_id = alias_ty.kind.def_id();
             str.push_str("impl_");
-            str.push_str(qualified_type_name(tcx, *def_id).as_str());
-            for sub in *args {
-                if let GenericArgKind::Type(ty) = sub.unpack() {
+            str.push_str(qualified_type_name(tcx, def_id).as_str());
+            for sub in alias_ty.args {
+                if let GenericArgKind::Type(ty) = sub.kind() {
                     str.push('_');
                     append_mangled_type(str, ty, tcx);
                 }
@@ -334,10 +336,12 @@ fn append_mangled_type<'tcx>(str: &mut String, ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) 
             str.push_str("generic_par_");
             str.push_str(param_ty.name.as_str());
         }
-        TyKind::Alias(rustc_middle::ty::Projection, projection_ty) => {
+        TyKind::Alias(projection_ty)
+            if matches!(projection_ty.kind, AliasTyKind::Projection { .. }) =>
+        {
             append_mangled_type(str, projection_ty.self_ty(), tcx);
             str.push_str("_as_");
-            str.push_str(qualified_type_name(tcx, projection_ty.def_id).as_str());
+            str.push_str(qualified_type_name(tcx, projection_ty.kind.def_id()).as_str());
         }
         TyKind::Never => {
             str.push('_');
@@ -496,7 +500,7 @@ pub fn def_id_display_name(tcx: TyCtxt<'_>, def_id: DefId) -> String {
 /// Returns false if any of the generic arguments are themselves generic
 pub fn are_concrete(gen_args: GenericArgsRef<'_>) -> bool {
     for gen_arg in gen_args.iter() {
-        if let GenericArgKind::Type(ty) = gen_arg.unpack() {
+        if let GenericArgKind::Type(ty) = gen_arg.kind() {
             if !is_concrete(ty.kind()) {
                 return false;
             }
@@ -511,10 +515,8 @@ pub fn is_concrete(ty: &TyKind<'_>) -> bool {
         TyKind::Adt(_, gen_args)
         | TyKind::Closure(_, gen_args)
         | TyKind::FnDef(_, gen_args)
-        | TyKind::Coroutine(_, gen_args)
-        | TyKind::Alias(_, rustc_middle::ty::AliasTy { args: gen_args, .. }) => {
-            are_concrete(gen_args)
-        }
+        | TyKind::Coroutine(_, gen_args) => are_concrete(gen_args),
+        TyKind::Alias(alias_ty) => are_concrete(alias_ty.args),
         TyKind::Tuple(types) => types.iter().all(|t| is_concrete(t.kind())),
         TyKind::Bound(..)
         | TyKind::Dynamic(..)
@@ -534,7 +536,8 @@ pub fn pretty_print_mir(tcx: TyCtxt<'_>, def_id: DefId) {
     ) {
         let mut stdout = std::io::stdout();
         stdout.write_fmt(format_args!("{def_id:?}")).unwrap();
-        rustc_middle::mir::write_mir_pretty(tcx, Some(def_id), &mut stdout).unwrap();
+        let _ = def_id;
+        rustc_middle::mir::write_mir_pretty(tcx, &mut stdout).unwrap();
         let _ = stdout.flush();
     }
 }

@@ -1731,7 +1731,7 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
                         .specialize_generic_args(args, &self.type_visitor().generic_argument_map);
                     for (i, field) in def.all_fields().enumerate() {
                         let target_type = self.type_visitor().specialize_type(
-                            field.ty(self.tcx, args),
+                            field.ty(self.tcx, args).skip_normalization(),
                             &self.type_visitor().generic_argument_map,
                         );
                         let target_path = Path::new_union_field(qualifier.clone(), i, *num_cases);
@@ -1816,10 +1816,10 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
             let variant = def.variants().iter().next().expect("at least one variant");
             for (i, field) in variant.fields.iter().enumerate() {
                 let field_path = Path::new_field(path.clone(), i);
-                let field_ty = field.ty(tcx, args);
+                let field_ty = field.ty(tcx, args).skip_normalization();
                 debug!("field_path: {:?}, field_ty: {:?}", field_path, field_ty);
                 if let TyKind::Adt(def, args) = field_ty.kind() {
-                    self.add_leaf_fields_for(field_path, def, args, tcx, accumulator)
+                    self.add_leaf_fields_for(field_path, &def, args, tcx, accumulator)
                 } else if self.type_visitor().is_slice_pointer(field_ty.kind()) {
                     let ptr_path = Path::new_field(field_path.clone(), 0);
                     let len_path = Path::new_length(field_path.clone());
@@ -2689,12 +2689,12 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
                         );
                         let source_field = def.all_fields().nth(*case_index).unwrap();
                         let source_type = self.type_visitor().specialize_type(
-                            source_field.ty(self.tcx, generic_args),
+                            source_field.ty(self.tcx, generic_args).skip_normalization(),
                             &self.type_visitor().generic_argument_map,
                         );
                         for (i, field) in def.all_fields().enumerate() {
                             let target_type = self.type_visitor().specialize_type(
-                                field.ty(self.tcx, generic_args),
+                                field.ty(self.tcx, generic_args).skip_normalization(),
                                 &self.type_visitor().generic_argument_map,
                             );
                             let target_path =
