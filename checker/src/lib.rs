@@ -91,6 +91,8 @@ pub mod k_limits;
 pub mod known_names;
 pub mod options;
 pub mod path;
+#[cfg(test)]
+mod rlock_prototype;
 pub mod smt_solver;
 pub mod summaries;
 pub mod tag_domain;
