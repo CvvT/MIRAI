@@ -49,6 +49,7 @@ pub struct CallVisitor<'call, 'block, 'analysis, 'compilation, 'tcx> {
     pub environment_before_call: Environment,
     pub function_constant_args: &'call [(Rc<Path>, Ty<'tcx>, Rc<AbstractValue>)],
     pub initial_type_cache: Option<Rc<HashMap<Rc<Path>, Ty<'tcx>>>>,
+    pub is_indirect_function_call: bool,
 }
 
 impl Debug for CallVisitor<'_, '_, '_, '_, '_> {
@@ -86,6 +87,7 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 environment_before_call,
                 function_constant_args: &[],
                 initial_type_cache: None,
+                is_indirect_function_call: false,
             }
         } else {
             unreachable!("caller should supply a constant function")
@@ -1287,7 +1289,8 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             // if the called function actually expects it.
             let tcx = self.block_visitor.bv.tcx;
             let callee_ty = self.actual_argument_types[0];
-            if !callee_ty.is_fn() || tcx.is_closure_like(def_id) {
+            let dereferenced_callee_ty = self.type_visitor().get_dereferenced_type(callee_ty);
+            if !dereferenced_callee_ty.is_fn() || tcx.is_closure_like(def_id) {
                 actual_args.insert(0, self.actual_args[0].clone());
                 actual_argument_types.insert(0, callee_ty);
                 if self.callee_known_name == KnownNames::StdOpsFunctionFnOnceCallOnce
@@ -1371,6 +1374,7 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             indirect_call_visitor.function_constant_args = &function_constant_args;
             indirect_call_visitor.callee_fun_val = callee.clone();
             indirect_call_visitor.callee_known_name = KnownNames::None;
+            indirect_call_visitor.is_indirect_function_call = dereferenced_callee_ty.is_fn();
             indirect_call_visitor.destination = self.destination;
             indirect_call_visitor.target = self.target;
             let summary = indirect_call_visitor.get_function_summary();
@@ -2799,6 +2803,14 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 // The precondition has no value, assume it is unreachable after all.
                 debug!("precondition refines to BOTTOM {:?}", precondition);
                 continue;
+            }
+
+            if self.is_indirect_function_call
+                && refined_precondition_as_bool == Some(false)
+                && entry_cond_as_bool == Some(true)
+            {
+                self.issue_diagnostic_for_call(precondition, &refined_condition, false);
+                return;
             }
 
             let warn;
