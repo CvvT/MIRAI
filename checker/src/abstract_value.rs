@@ -793,6 +793,11 @@ pub trait AbstractValueTrait: Sized {
     fn equals(&self, other: Self) -> Self;
     #[must_use]
     fn extract_promotable_conjuncts(&self, is_post_condition: bool) -> Option<Self>;
+    fn extract_promotable_conjuncts_excluding(
+        &self,
+        is_post_condition: bool,
+        excluded_paths: &HashSet<Rc<Path>>,
+    ) -> Option<Self>;
     fn extract_promotable_disjuncts(&self, is_post_condition: bool) -> Option<Self>;
     #[must_use]
     fn greater_or_equal(&self, other: Self) -> Self;
@@ -2947,18 +2952,32 @@ impl AbstractValueTrait for Rc<AbstractValue> {
     /// and which contain no references to local variables of the current function.
     #[logfn_inputs(TRACE)]
     fn extract_promotable_conjuncts(&self, is_post_condition: bool) -> Option<Rc<AbstractValue>> {
+        self.extract_promotable_conjuncts_excluding(is_post_condition, &HashSet::new())
+    }
+
+    /// Extracts promotable conjuncts that do not depend on any excluded path.
+    #[logfn_inputs(TRACE)]
+    fn extract_promotable_conjuncts_excluding(
+        &self,
+        is_post_condition: bool,
+        excluded_paths: &HashSet<Rc<Path>>,
+    ) -> Option<Rc<AbstractValue>> {
         if let Expression::And { left, right } = &self.expression {
-            if let Some(left_conjunct) = left.extract_promotable_conjuncts(is_post_condition) {
-                if let Some(right_conjunct) = right.extract_promotable_conjuncts(is_post_condition)
+            if let Some(left_conjunct) =
+                left.extract_promotable_conjuncts_excluding(is_post_condition, excluded_paths)
+            {
+                if let Some(right_conjunct) =
+                    right.extract_promotable_conjuncts_excluding(is_post_condition, excluded_paths)
                 {
                     Some(left_conjunct.and(right_conjunct))
                 } else {
                     Some(left_conjunct)
                 }
             } else {
-                right.extract_promotable_conjuncts(is_post_condition)
+                right.extract_promotable_conjuncts_excluding(is_post_condition, excluded_paths)
             }
         } else if !self.expression.contains_local_variable(is_post_condition)
+            && !self.uses(excluded_paths)
             && self.as_bool_if_known().unwrap_or(true)
         {
             Some(self.clone())

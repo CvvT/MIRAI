@@ -445,11 +445,28 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
         if self.bv.check_for_errors {
             // Done with fixed point, so prepare to summarize.
             if self.bv.post_condition.is_none() {
+                let mutated_model_fields = self
+                    .bv
+                    .current_environment
+                    .value_map
+                    .iter()
+                    .filter_map(|(path, _)| {
+                        if matches!(
+                            &path.value,
+                            PathEnum::QualifiedPath { selector, .. }
+                                if matches!(**selector, PathSelector::ModelField(_))
+                        ) {
+                            Some(path.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
                 if let Some(promotable_entry_condition) = self
                     .bv
                     .current_environment
                     .entry_condition
-                    .extract_promotable_conjuncts(true)
+                    .extract_promotable_conjuncts_excluding(true, &mutated_model_fields)
                 {
                     if promotable_entry_condition.as_bool_if_known().is_none() {
                         // If no post condition has been explicitly supplied and if the entry condition is interesting
