@@ -32,6 +32,17 @@ The fixtures are independent binaries:
 | `callback_fnptr` | `write requires no live writer` |
 | `callback_reentrant` | `write requires no live writer` |
 | `callback_clean` | no MIRAI diagnostics |
+| `callback_conditional_false` | silent; the guarded callback is not invoked |
+| `callback_conditional_true` | `conditional callback requires no live writer` |
+| `callback_generic_fnonce_clean` | silent; generic `FnOnce` summary resolution |
+| `callback_generic_fnonce_violation` | `read requires no live writer` |
+| `callback_sequential_counter_clean` | silent; callback counter reaches exactly two |
+| `callback_sequential_counter_violation` | `counter callback requires zero` on the second invocation |
+| `callback_specialization_clean` | silent; two closure specializations stay isolated |
+| `callback_specialization_violation` | `read requires no live writer` for the violating closure only |
+| `callback_unresolvable` | visible `callback invocation could not be resolved` diagnostic |
+| `callback_loop_clean` | silent; fixed-point summary retains a clean invocation |
+| `callback_fnptr_specialization_clean` | silent; bare function-pointer control |
 | `nested_field_double_write` | `write requires no live writer` |
 | `nested_field_independent` | no MIRAI diagnostics |
 | `nested_deep_double_write` | `write requires no live writer` |
@@ -86,3 +97,19 @@ Run the mode/RAII and higher-order fixtures against persisted summaries:
 
 This mode seeds provider summaries, recompiles each consumer, and fails if MIRAI enters a protected
 provider, higher-order helper, or callback body.
+
+Two controls intentionally remain visible limitations outside LiteBox's `impl FnOnce` topology:
+
+- Direct bare function-pointer calls bypass the `Fn*::call*` producer hook, so their callback
+  invocation is not recorded.
+- Fixed-point invocation records survive joining, but a loop-local path guard cannot yet be
+  projected to a caller-visible condition.
+
+Run both probes explicitly; the command exits nonzero until these limitations are implemented:
+
+```powershell
+.\examples\rwlock_annotation_detection\run_examples.ps1 -KnownLimitations
+```
+
+Callback effects are checked at each recorded snapshot. Replay does not accumulate effects between
+snapshots, which prevents double-applying arithmetic model fields such as `read_count`.

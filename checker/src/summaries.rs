@@ -22,8 +22,8 @@ use rustc_hir::def_id::DefId;
 use rustc_middle::ty::{Ty, TyCtxt};
 use rustc_span::Span;
 
-use crate::abstract_value::AbstractValue;
 use crate::abstract_value::AbstractValueTrait;
+use crate::abstract_value::{self, AbstractValue};
 use crate::constant_domain::FunctionReference;
 use crate::environment::Environment;
 use crate::expression::Expression;
@@ -125,6 +125,52 @@ pub struct CallbackInvocation {
     pub arguments: Vec<(Rc<Path>, Rc<AbstractValue>)>,
     /// Model-field values visible at the callback invocation point.
     pub pre_state: Vec<(Rc<Path>, Rc<AbstractValue>)>,
+    /// The path condition under which the callback is invoked.
+    pub guard: Rc<AbstractValue>,
+}
+
+#[derive(Deserialize)]
+struct PreviousCallbackInvocation {
+    callee: Rc<Path>,
+    arguments: Vec<(Rc<Path>, Rc<AbstractValue>)>,
+    pre_state: Vec<(Rc<Path>, Rc<AbstractValue>)>,
+}
+
+#[derive(Deserialize)]
+struct PreviousSummary {
+    is_computed: bool,
+    is_incomplete: bool,
+    preconditions: Vec<Precondition>,
+    assumed_aliases: Vec<(Rc<Path>, Rc<Path>)>,
+    guarded_aliases: Vec<(Rc<Path>, Rc<Path>, Rc<AbstractValue>)>,
+    side_effects: Vec<(Rc<Path>, Rc<AbstractValue>)>,
+    post_condition: Option<Rc<AbstractValue>>,
+    callback_invocations: Vec<PreviousCallbackInvocation>,
+}
+
+impl From<PreviousSummary> for Summary {
+    fn from(summary: PreviousSummary) -> Self {
+        Summary {
+            is_computed: summary.is_computed,
+            is_incomplete: summary.is_incomplete,
+            preconditions: summary.preconditions,
+            assumed_aliases: summary.assumed_aliases,
+            guarded_aliases: summary.guarded_aliases,
+            side_effects: summary.side_effects,
+            post_condition: summary.post_condition,
+            return_type_index: 0,
+            callback_invocations: summary
+                .callback_invocations
+                .into_iter()
+                .map(|invocation| CallbackInvocation {
+                    callee: invocation.callee,
+                    arguments: invocation.arguments,
+                    pre_state: invocation.pre_state,
+                    guard: Rc::new(abstract_value::TRUE),
+                })
+                .collect(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -262,6 +308,11 @@ impl Summary {
             .retain(|alias| other.assumed_aliases.contains(alias));
         self.guarded_aliases
             .retain(|alias| other.guarded_aliases.contains(alias));
+        for invocation in &other.callback_invocations {
+            if !self.callback_invocations.contains(invocation) {
+                self.callback_invocations.push(invocation.clone());
+            }
+        }
         let other_map: HashMap<Rc<Path>, Rc<AbstractValue>> =
             other.side_effects.clone().into_iter().collect();
         for (path, val1) in self.side_effects.iter_mut() {
@@ -704,6 +755,15 @@ impl<'tcx> SummaryCache<'tcx> {
                     let summary_is_cached = self.call_site_cache.contains_key(&typed_cache_key);
                     return if summary_is_cached {
                         self.call_site_cache.get(&typed_cache_key).unwrap()
+                    } else if let Some(summary) = Self::get_persistent_summary_for_db(
+                        &self.db,
+                        &Self::persistent_call_site_key(func_ref, func_args),
+                    ) {
+                        self.call_site_cache
+                            .entry(typed_cache_key)
+                            .or_insert(summary)
+                    } else if func_args.is_some() {
+                        self.call_site_cache.entry(typed_cache_key).or_default()
                     } else {
                         // can't have self borrowed at this point.
                         let summary = self
@@ -808,6 +868,7 @@ impl<'tcx> SummaryCache<'tcx> {
             let bytes = pinned_value.deref();
             Some(
                 bincode::deserialize(bytes)
+                    .or_else(|_| bincode::deserialize::<PreviousSummary>(bytes).map(Into::into))
                     .or_else(|_| bincode::deserialize::<LegacySummary>(bytes).map(Into::into))
                     .unwrap(),
             )
@@ -829,11 +890,8 @@ impl<'tcx> SummaryCache<'tcx> {
         summary: Summary,
     ) {
         if let Some(func_id) = func_ref.function_id {
-            if !func_ref.argument_type_key.is_empty() {
-                let persistent_key = format!(
-                    "{}{}",
-                    func_ref.summary_cache_key, func_ref.argument_type_key
-                );
+            if !func_ref.argument_type_key.is_empty() || func_args.is_some() {
+                let persistent_key = Self::persistent_call_site_key(func_ref, func_args);
                 let serialized_summary = bincode::serialize(&summary).unwrap();
                 if let Err(error) = self
                     .db
@@ -842,6 +900,7 @@ impl<'tcx> SummaryCache<'tcx> {
                     println!("unable to set key in summary database: {error:?}");
                 }
             }
+
             // if let Some(def_id) = func_ref.def_id {
             //     if func_args.is_none() && type_args.is_none() {
             //         info!("caching summary for def_id {:?}", def_id);
@@ -859,6 +918,24 @@ impl<'tcx> SummaryCache<'tcx> {
             //todo: change param to function id
             unreachable!()
         }
+    }
+
+    fn persistent_call_site_key(
+        func_ref: &FunctionReference,
+        func_args: &Option<Rc<Vec<Rc<FunctionReference>>>>,
+    ) -> String {
+        let mut key = format!(
+            "{}{}",
+            func_ref.summary_cache_key, func_ref.argument_type_key
+        );
+        if let Some(func_args) = func_args {
+            for argument in func_args.iter() {
+                key.push_str("__callback_");
+                key.push_str(&argument.summary_cache_key);
+                key.push_str(&argument.argument_type_key);
+            }
+        }
+        key
     }
 
     /// Sets or updates the DefId cache so that from now on def_id maps to the given summary.

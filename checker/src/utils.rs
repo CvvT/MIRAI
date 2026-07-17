@@ -396,6 +396,14 @@ pub fn summary_key_str(tcx: TyCtxt<'_>, def_id: DefId) -> Rc<str> {
             name.push('.');
         }
         push_component_name(component.data, &mut name);
+        if matches!(
+            component.data,
+            DefPathData::Closure | DefPathData::AnonConst
+        ) && component.disambiguator > 0
+        {
+            name.push('_');
+            name.push_str(component.disambiguator.to_string().as_str());
+        }
         if component.data == DefPathData::Impl {
             let parent_def_id = tcx.parent(def_id);
             let parent_def_kind = tcx.def_kind(parent_def_id);

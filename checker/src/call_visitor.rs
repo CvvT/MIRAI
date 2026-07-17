@@ -51,6 +51,7 @@ pub struct CallVisitor<'call, 'block, 'analysis, 'compilation, 'tcx> {
     pub initial_type_cache: Option<Rc<HashMap<Rc<Path>, Ty<'tcx>>>>,
     pub is_indirect_function_call: bool,
     pub summary_was_cached: bool,
+    pub unresolved_callback_argument: bool,
 }
 
 impl Debug for CallVisitor<'_, '_, '_, '_, '_> {
@@ -90,6 +91,7 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 initial_type_cache: None,
                 is_indirect_function_call: false,
                 summary_was_cached: false,
+                unresolved_callback_argument: false,
             }
         } else {
             unreachable!("caller should supply a constant function")
@@ -376,6 +378,25 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 .clone();
             if result.is_computed || func_ref.def_id.is_none() {
                 self.summary_was_cached = result.is_computed;
+                let has_callable_generic = self.callee_generic_arguments.is_some_and(|args| {
+                    args.types().any(|ty| {
+                        matches!(
+                            ty.kind(),
+                            TyKind::FnDef(..) | TyKind::FnPtr(..) | TyKind::Closure(..)
+                        )
+                    })
+                }) || func_ref.argument_type_key.contains("_fn_ptr")
+                    || func_ref.argument_type_key.contains("_closure_");
+                self.unresolved_callback_argument = result.is_incomplete
+                    && (has_callable_generic
+                        || utils::is_higher_order_function(
+                            self.callee_def_id,
+                            self.block_visitor.bv.tcx,
+                        ));
+                if self.unresolved_callback_argument {
+                    self.report_unresolvable_callback();
+                    self.unresolved_callback_argument = false;
+                }
                 return Some(result);
             }
             if call_depth < 4 {
@@ -397,6 +418,17 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                             &self.initial_type_cache,
                             summary.clone(),
                         );
+                }
+                self.unresolved_callback_argument = summary.is_incomplete
+                    && (func_ref.argument_type_key.contains("_fn_ptr")
+                        || func_ref.argument_type_key.contains("_closure_")
+                        || utils::is_higher_order_function(
+                            self.callee_def_id,
+                            self.block_visitor.bv.tcx,
+                        ));
+                if self.unresolved_callback_argument {
+                    self.report_unresolvable_callback();
+                    self.unresolved_callback_argument = false;
                 }
                 return Some(summary);
             } else {
@@ -1334,7 +1366,27 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             if self.block_visitor.bv.check_for_errors {
                 let callee_path = Path::get_as_path(callee.clone())
                     .canonicalize(&self.block_visitor.bv.current_environment);
-                if callee_path.is_rooted_by_parameter() {
+                let callee_parameter = if callee_path.is_rooted_by_parameter() {
+                    Some(callee_path)
+                } else {
+                    let callee_ty = self.type_visitor().get_dereferenced_type(callee_ty);
+                    (1..=self.block_visitor.bv.mir.arg_count).find_map(|ordinal| {
+                        let parameter_ty =
+                            self.block_visitor.bv.mir.local_decls[mir::Local::from(ordinal)].ty;
+                        let parameter_ty = self.type_visitor().specialize_type(
+                            parameter_ty,
+                            &self.type_visitor().generic_argument_map,
+                        );
+                        let parameter_ty = self.type_visitor().get_dereferenced_type(parameter_ty);
+                        (parameter_ty == callee_ty
+                            || matches!(
+                                (parameter_ty.kind(), callee_ty.kind()),
+                                (TyKind::FnPtr(..), TyKind::FnDef(..))
+                            ))
+                        .then(|| Path::new_parameter(ordinal))
+                    })
+                };
+                if let Some(callee_parameter) = callee_parameter {
                     let pre_state = self
                         .block_visitor
                         .bv
@@ -1355,9 +1407,17 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                         .bv
                         .callback_invocations
                         .push(CallbackInvocation {
-                            callee: callee_path,
+                            callee: callee_parameter,
                             arguments: actual_args.clone(),
                             pre_state,
+                            guard: self
+                                .block_visitor
+                                .bv
+                                .current_environment
+                                .entry_condition
+                                .extract_promotable_conjuncts(false)
+                                .filter(|guard| !guard.expression.contains_local_variable(false))
+                                .unwrap_or_else(|| Rc::new(abstract_value::TRUE)),
                         });
                     recorded_callback_invocation = true;
                 }
@@ -1418,7 +1478,12 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             indirect_call_visitor.is_indirect_function_call = dereferenced_callee_ty.is_fn();
             indirect_call_visitor.destination = self.destination;
             indirect_call_visitor.target = self.target;
+            let saved_treat_as_foreign = indirect_call_visitor.block_visitor.bv.treat_as_foreign;
+            if recorded_callback_invocation {
+                indirect_call_visitor.block_visitor.bv.treat_as_foreign = true;
+            }
             let summary = indirect_call_visitor.get_function_summary();
+            indirect_call_visitor.block_visitor.bv.treat_as_foreign = saved_treat_as_foreign;
             if let Some(summary) = summary {
                 if summary.is_computed {
                     if recorded_callback_invocation {
@@ -2730,6 +2795,10 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
     /// Give diagnostic depending on self.bv.options.diag_level
     #[logfn_inputs(TRACE)]
     pub fn report_incomplete_summary(&mut self) {
+        if self.unresolved_callback_argument {
+            self.report_unresolvable_callback();
+            return;
+        }
         if self.block_visitor.might_be_reachable().unwrap_or(true) {
             if let Some(promotable_entry_condition) = self
                 .block_visitor
@@ -2804,6 +2873,29 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             "target {:?} arguments {:?}",
             self.destination, self.actual_args
         );
+        if function_summary.is_incomplete {
+            let mut unresolved_callback = self.unresolved_callback_argument;
+            let arguments: Vec<_> = self
+                .actual_argument_types
+                .clone()
+                .into_iter()
+                .zip(self.actual_args.iter().map(|(_, value)| value.clone()))
+                .collect();
+            for (ty, value) in arguments {
+                let ty = self.type_visitor().get_dereferenced_type(ty);
+                if matches!(
+                    ty.kind(),
+                    TyKind::FnDef(..) | TyKind::FnPtr(..) | TyKind::Closure(..)
+                ) && self.block_visitor.get_func_ref(&value).is_none()
+                {
+                    unresolved_callback = true;
+                    break;
+                }
+            }
+            if unresolved_callback {
+                self.report_unresolvable_callback();
+            }
+        }
         self.check_preconditions_if_necessary(function_summary);
         check_for_early_return!(self.block_visitor.bv);
         if self.summary_was_cached {
@@ -2826,34 +2918,47 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             trace!("replaying callback invocation {:?}", invocation);
             let PathEnum::Parameter { ordinal } = invocation.callee.get_path_root().value else {
                 trace!("callback invocation is not rooted by a parameter");
+                self.report_unresolvable_callback();
                 continue;
             };
             let Some(argument_index) = ordinal.checked_sub(1) else {
+                self.report_unresolvable_callback();
                 continue;
             };
             let Some((_, callback_value)) = self.actual_args.get(argument_index) else {
+                self.report_unresolvable_callback();
                 continue;
             };
             let callback_value = callback_value.clone();
             let Some(callback_ref) = self.block_visitor.get_func_ref(&callback_value) else {
                 trace!("callback argument did not resolve to a function");
-                self.block_visitor.bv.analysis_is_incomplete = true;
+                self.report_unresolvable_callback();
                 continue;
             };
-            let callback_summary = self
+            let mut callback_summary = self
                 .block_visitor
                 .bv
                 .cv
                 .summary_cache
                 .get_summary_for_call_site(&callback_ref, &None, &None)
                 .clone();
+            if !callback_summary.is_computed {
+                let callback_args = Some(Rc::new(vec![callback_ref.clone()]));
+                callback_summary = self
+                    .block_visitor
+                    .bv
+                    .cv
+                    .summary_cache
+                    .get_summary_for_call_site(&callback_ref, &callback_args, &None)
+                    .clone();
+            }
             trace!("callback summary {:?}", callback_summary);
             if !callback_summary.is_computed {
                 info!(
                     "no persisted summary for callback {}{}",
                     callback_ref.summary_cache_key, callback_ref.argument_type_key
                 );
-                self.block_visitor.bv.analysis_is_incomplete = true;
+                self.report_unresolvable_callback();
                 continue;
             }
 
@@ -2880,6 +2985,18 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 })
                 .collect();
             let mut callback_environment = outer_environment.clone();
+            let refined_guard = invocation.guard.refine_parameters_and_paths(
+                &self.actual_args,
+                &no_result,
+                &self.environment_before_call,
+                &outer_environment,
+                self.block_visitor.bv.fresh_variable_offset,
+            );
+            if refined_guard.as_bool_if_known() == Some(false) {
+                continue;
+            }
+            callback_environment.entry_condition =
+                callback_environment.entry_condition.and(refined_guard);
             for (path, value) in &invocation.pre_state {
                 let refined_path = path.refine_parameters_and_paths(
                     &self.actual_args,
@@ -2927,6 +3044,15 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             }
             self.block_visitor.bv.current_environment = outer_environment.clone();
         }
+    }
+
+    fn report_unresolvable_callback(&mut self) {
+        self.block_visitor.bv.analysis_is_incomplete = true;
+        let warning = self.block_visitor.bv.cv.session.dcx().struct_span_warn(
+            self.block_visitor.bv.current_span,
+            "[MIRAI] callback invocation could not be resolved",
+        );
+        self.block_visitor.bv.emit_diagnostic(warning);
     }
 
     /// If we are checking for errors and have not assumed the preconditions of the called function

@@ -1,10 +1,14 @@
 param(
     [string]$Filter,
     [switch]$ShowOutput,
-    [switch]$SummaryOnly
+    [switch]$SummaryOnly,
+    [switch]$KnownLimitations
 )
 
 $ErrorActionPreference = "Stop"
+if ($KnownLimitations) {
+    $SummaryOnly = $true
+}
 
 $expectations = [ordered]@{
     "alias_same_instance"          = "write requires no live readers"
@@ -16,12 +20,25 @@ $expectations = [ordered]@{
     "array_indices"                = $null
     "array_same_index"             = "write requires no live readers"
     "callback_clean"               = $null
+    "callback_conditional_false"   = $null
+    "callback_conditional_true"    = "conditional callback requires no live writer"
     "callback_fnptr"               = "write requires no live writer"
+    "callback_fnptr_specialization_clean" = $null
+    "callback_fnptr_specialization_violation" = $null
+    "callback_generic_fnonce_clean" = $null
+    "callback_generic_fnonce_violation" = "read requires no live writer"
     "callback_hof_annotated"       = "write requires no live writer"
     "callback_hof_direct_control"  = "annotated callback requires no live writer"
     "callback_hof_invoke_twice"    = "annotated callback requires no live writer"
     "callback_inline_closure"      = "write requires no live writer"
+    "callback_loop_clean"          = $null
+    "callback_loop_violation"      = $null
     "callback_reentrant"           = "write requires no live writer"
+    "callback_sequential_counter_clean" = $null
+    "callback_sequential_counter_violation" = "counter callback requires zero"
+    "callback_specialization_clean" = $null
+    "callback_specialization_violation" = "read requires no live writer"
+    "callback_unresolvable"         = "callback invocation could not be resolved"
     "clean"                        = $null
     "double_write"                 = "write requires no live writer"
     "drop_then_release"            = "read release requires a live reader"
@@ -44,20 +61,54 @@ $expectations = [ordered]@{
     "write_then_read"              = "read requires no live writer"
 }
 
+$summaryOnlyExpectations = @{
+    "callback_fnptr_specialization_violation" = "read requires no live writer"
+    "callback_loop_violation" = "loop callback requires no live writer"
+}
+
 $summaryOnlyBins = @(
     "callback_clean",
+    "callback_conditional_false",
+    "callback_conditional_true",
+    "callback_fnptr_specialization_clean",
+    "callback_generic_fnonce_clean",
+    "callback_generic_fnonce_violation",
     "callback_hof_annotated",
     "callback_hof_invoke_twice",
+    "callback_loop_clean",
+    "callback_sequential_counter_clean",
+    "callback_sequential_counter_violation",
+    "callback_specialization_clean",
+    "callback_specialization_violation",
+    "callback_unresolvable",
     "two_readers_drop_both",
     "two_readers_drop_one",
     "write_drop_then_reacquire",
     "write_then_read"
 )
 
+$knownLimitationBins = @(
+    "callback_fnptr_specialization_violation",
+    "callback_loop_violation"
+)
+
 $summaryOnlyHofBins = @(
     "callback_clean",
+    "callback_conditional_false",
+    "callback_conditional_true",
+    "callback_fnptr_specialization_clean",
+    "callback_fnptr_specialization_violation",
+    "callback_generic_fnonce_clean",
+    "callback_generic_fnonce_violation",
     "callback_hof_annotated",
-    "callback_hof_invoke_twice"
+    "callback_hof_invoke_twice",
+    "callback_loop_clean",
+    "callback_loop_violation",
+    "callback_sequential_counter_clean",
+    "callback_sequential_counter_violation",
+    "callback_specialization_clean",
+    "callback_specialization_violation",
+    "callback_unresolvable"
 )
 
 $scriptRoot = $PSScriptRoot
@@ -114,6 +165,7 @@ try {
             throw "Failed to seed provider summaries (exit $LASTEXITCODE)."
         }
         $env:MIRAI_START_FRESH = $null
+        $env:MIRAI_FLAGS = $null
         foreach ($bin in $summaryOnlyHofBins) {
             $providerOutput = @(
                 & cargo check -q --locked --manifest-path $manifestPath --bin $bin 2>&1
@@ -123,7 +175,6 @@ try {
                 throw "Failed to seed $bin summaries (exit $LASTEXITCODE)."
             }
         }
-        $env:MIRAI_FLAGS = $null
         & cargo clean --quiet --manifest-path $manifestPath --target-dir $summarySweepTarget -p rwlock-annotation-detection
         if ($LASTEXITCODE -ne 0) {
             throw "Failed to remove provider artifacts (exit $LASTEXITCODE)."
@@ -139,18 +190,21 @@ try {
         }
     }
 
-    $bins = @($expectations.Keys)
+    $bins = @($expectations.Keys | Where-Object { $_ -notin $knownLimitationBins })
     if ($Filter) {
         if (-not $expectations.Contains($Filter)) {
             Write-Error "Unknown bin '$Filter'. Available bins: $($bins -join ', ')"
             exit 2
         }
         $bins = @($Filter)
+    } elseif ($KnownLimitations) {
+        $bins = $knownLimitationBins
     } elseif ($SummaryOnly) {
         $bins = $summaryOnlyBins
     }
-    if ($SummaryOnly -and @($bins | Where-Object { $_ -notin $summaryOnlyBins }).Count -gt 0) {
-        Write-Error "-SummaryOnly supports: $($summaryOnlyBins -join ', ')"
+    $supportedSummaryBins = $summaryOnlyBins + $knownLimitationBins
+    if ($SummaryOnly -and @($bins | Where-Object { $_ -notin $supportedSummaryBins }).Count -gt 0) {
+        Write-Error "-SummaryOnly supports: $($supportedSummaryBins -join ', ')"
         exit 2
     }
 
@@ -191,16 +245,20 @@ try {
         $exitCode = $process.ExitCode
         $process.Dispose()
         $miraiDiagnostics = @($output | Where-Object { $_ -match "\[MIRAI\]" })
-        $expected = $expectations[$bin]
+        $expected = if ($SummaryOnly -and $summaryOnlyExpectations.ContainsKey($bin)) {
+            $summaryOnlyExpectations[$bin]
+        } else {
+            $expectations[$bin]
+        }
 
         if ($null -eq $expected) {
-            $matches = $exitCode -eq 0 -and $miraiDiagnostics.Count -eq 0
+            $passedExpectation = $exitCode -eq 0 -and $miraiDiagnostics.Count -eq 0
             $expectedText = "silent"
         } else {
             $matchingDiagnostics = @(
                 $miraiDiagnostics | Where-Object { $_ -like "*$expected*" }
             )
-            $matches = $exitCode -eq 0 -and
+            $passedExpectation = $exitCode -eq 0 -and
                 $miraiDiagnostics.Count -eq 1 -and
                 $matchingDiagnostics.Count -eq 1
             $expectedText = $expected
@@ -208,7 +266,7 @@ try {
         $providerBodyEntries = @(
             $output | Where-Object {
                 $_ -match "entered body of .*rwlock_annotation_detection.*::(read|write|release_read|drop)" -or
-                $_ -match "entered body of .*callback_(clean|hof_annotated|hof_invoke_twice).*::(invoke|invoke_annotated|invoke_twice|annotated_acquire|\{closure)"
+                $_ -match "entered body of .*callback_(clean|conditional|fnptr_specialization|generic_fnonce|hof_annotated|hof_invoke_twice|loop|sequential_counter|specialization).*::(invoke|invoke_if|invoke_generic|invoke_in_loop|invoke_twice|with_write_held|annotated_acquire|acquire_once|increment|require|read|\{closure)"
             }
         )
         $persistentSummaryLoads = @(
@@ -217,7 +275,7 @@ try {
             }
         )
         if ($SummaryOnly) {
-            $matches = $matches -and
+            $passedExpectation = $passedExpectation -and
                 $providerBodyEntries.Count -eq 0 -and
                 $persistentSummaryLoads.Count -gt 0
         }
@@ -243,8 +301,8 @@ try {
             } else {
                 Write-Host "<no output>"
             }
-            Write-Host "Result: $(if ($matches) { 'PASS' } else { 'FAIL' })"
-        } elseif ($matches) {
+            Write-Host "Result: $(if ($passedExpectation) { 'PASS' } else { 'FAIL' })"
+        } elseif ($passedExpectation) {
             Write-Host "✅ $bin — expected: $expectedText; actual: $actualText"
         } else {
             Write-Host "❌ $bin — expected: $expectedText; actual: $actualText; exit: $exitCode"
@@ -255,7 +313,7 @@ try {
             }
         }
 
-        if ($matches) {
+        if ($passedExpectation) {
             $passed++
         }
     }
