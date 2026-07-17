@@ -2,6 +2,7 @@
 .vscode/
 .idea/
 target/
-examples/
+examples/*
+!examples/rwlock_annotation_detection/
 checker/.z3-trace
 .z3-trace
