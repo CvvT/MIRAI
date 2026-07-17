@@ -186,7 +186,31 @@ pub mod alloc {
         }
     }
 
+    pub mod rc {
+        pub mod implement_alloc_rc_Rc_generic_par_T_generic_par_A {
+            use std::alloc::Allocator;
+            use std::rc::Rc;
+
+            pub fn clone<T: ?Sized, A: Allocator + Clone>(source: &Rc<T, A>) -> Rc<T, A> {
+                let result: Rc<T, A> = result!();
+                assumed_alias!(&result, source);
+                result
+            }
+        }
+    }
+
     pub mod sync {
+        pub mod implement_alloc_sync_Arc_generic_par_T_generic_par_A {
+            use std::alloc::Allocator;
+            use std::sync::Arc;
+
+            pub fn clone<T: ?Sized, A: Allocator + Clone>(source: &Arc<T, A>) -> Arc<T, A> {
+                let result: Arc<T, A> = result!();
+                assumed_alias!(&result, source);
+                result
+            }
+        }
+
         fn MAX_REFCOUNT() -> usize {
             (ISIZE_MAX!()) as usize
         }

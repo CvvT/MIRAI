@@ -504,6 +504,10 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 self.handle_assume();
                 return true;
             }
+            KnownNames::MiraiAssumeAlias => {
+                self.handle_assume_alias();
+                return true;
+            }
             KnownNames::MiraiAssumePreconditions => {
                 checked_assume!(self.actual_args.is_empty());
                 self.use_entry_condition_as_exit_condition();
@@ -1534,6 +1538,7 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
         } else {
             assume_unreachable!();
         }
+
         if let mir::UnwindAction::Cleanup(target) = self.unwind {
             self.block_visitor
                 .bv
@@ -1541,6 +1546,49 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 .exit_conditions
                 .insert_mut(target, abstract_value::FALSE.into());
         }
+    }
+
+    /// Records that the first referenced location is an alias for the second.
+    fn handle_assume_alias(&mut self) {
+        checked_assume!(self.actual_args.len() == 2);
+        checked_assume!(self.actual_argument_types.len() == 2);
+        let alias_type = ExpressionType::from(
+            self.type_visitor()
+                .get_dereferenced_type(self.actual_argument_types[0])
+                .kind(),
+        );
+        let source_type = ExpressionType::from(
+            self.type_visitor()
+                .get_dereferenced_type(self.actual_argument_types[1])
+                .kind(),
+        );
+        checked_assume!(alias_type == source_type);
+
+        let mut alias_path = Path::new_deref(self.actual_args[0].0.clone(), alias_type)
+            .canonicalize(&self.block_visitor.bv.current_environment);
+        let mut source_path = Path::new_deref(self.actual_args[1].0.clone(), source_type)
+            .canonicalize(&self.block_visitor.bv.current_environment);
+        if let Some(value) = self
+            .block_visitor
+            .bv
+            .current_environment
+            .value_at(&alias_path)
+        {
+            alias_path = Path::get_as_path(value.clone());
+        }
+        if let Some(value) = self
+            .block_visitor
+            .bv
+            .current_environment
+            .value_at(&source_path)
+        {
+            source_path = Path::get_as_path(value.clone());
+        }
+        self.block_visitor
+            .bv
+            .assumed_aliases
+            .insert((alias_path, source_path));
+        self.use_entry_condition_as_exit_condition();
     }
 
     /// Check if a tag has been attached to the first and only value in actual_args.
@@ -3074,7 +3122,7 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             // Effects on the call result
             self.block_visitor.bv.transfer_and_refine(
                 &function_summary.side_effects,
-                target_path,
+                target_path.clone(),
                 &return_value_path,
                 result_path,
                 &self.actual_args,
@@ -3104,7 +3152,39 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             let result =
                 self.callee_fun_val
                     .uninterpreted_call(args, result_type, return_value_path);
-            self.block_visitor.bv.update_value_at(target_path, result);
+            self.block_visitor
+                .bv
+                .update_value_at(target_path.clone(), result);
+        }
+
+        for (alias, source) in &function_summary.assumed_aliases {
+            let refined_alias = alias.refine_parameters_and_paths(
+                &self.actual_args,
+                result_path,
+                &self.environment_before_call,
+                &self.block_visitor.bv.current_environment,
+                self.block_visitor.bv.fresh_variable_offset,
+            );
+            let refined_source = source.refine_parameters_and_paths(
+                &self.actual_args,
+                result_path,
+                &self.environment_before_call,
+                &self.block_visitor.bv.current_environment,
+                self.block_visitor.bv.fresh_variable_offset,
+            );
+            let source_type = self
+                .type_visitor()
+                .get_path_rustc_type(&refined_source, self.block_visitor.bv.current_span);
+            self.block_visitor.bv.copy_or_move_elements(
+                refined_alias.clone(),
+                refined_source.clone(),
+                source_type,
+                false,
+            );
+            self.block_visitor
+                .bv
+                .assumed_aliases
+                .insert((refined_alias, refined_source));
         }
     }
 

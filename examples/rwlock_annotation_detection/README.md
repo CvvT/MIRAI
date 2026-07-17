@@ -34,9 +34,9 @@ The fixtures are independent binaries:
 | `nested_deep_independent` | no MIRAI diagnostics |
 | `struct_field_double_write` | `write requires no live writer` |
 | `struct_fields_independent` | no MIRAI diagnostics; distinct fields remain distinct |
-| `arc_alias_double_write` | known false negative: currently no MIRAI diagnostic |
+| `arc_alias_double_write` | `write requires no live writer`; cloned handles share one pointee |
 | `arc_instances_independent` | no MIRAI diagnostics |
-| `rc_alias_double_write` | known false negative: currently no MIRAI diagnostic |
+| `rc_alias_double_write` | `write requires no live writer`; cloned handles share one pointee |
 | `rc_instances_independent` | no MIRAI diagnostics |
 
 Unpatched stock MIRAI considers the continuation after `acquire_write` unreachable because it
@@ -65,6 +65,7 @@ Run the complete sweep with raw output:
 .\examples\rwlock_annotation_detection\run_examples.ps1 -ShowOutput
 ```
 
-Use `-Filter <binary>` to run one fixture. The runner intentionally exits nonzero at `26/28`
-because the `Arc::clone` and `Rc::clone` alias fixtures encode known false-negative soundness gaps
-as expected violations rather than masking them as passing behavior.
+Use `-Filter <binary>` to run one fixture. Every violating row requires exactly one matching MIRAI
+diagnostic, so a missed alias or a duplicate diagnostic makes the runner exit nonzero.
+The `Arc`/`Rc` rows load MIRAI's embedded standard contracts; other rows start with an empty summary
+store to retain their original standalone-analysis oracle.

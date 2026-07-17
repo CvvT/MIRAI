@@ -65,7 +65,6 @@ try {
 
     $env:PATH = "$(Join-Path $sysroot "bin");$originalPath"
     $env:RUSTC_WORKSPACE_WRAPPER = (Resolve-Path $miraiPath).Path
-    $env:MIRAI_START_FRESH = "true"
     $env:CARGO_TARGET_DIR = $sweepTarget
 
     if (Test-Path $sweepTarget) {
@@ -84,6 +83,12 @@ try {
     $cargoPath = (Get-Command cargo -CommandType Application | Select-Object -First 1).Source
     $passed = 0
     foreach ($bin in $bins) {
+        if ($bin -like "arc_*" -or $bin -like "rc_*") {
+            $env:MIRAI_START_FRESH = $null
+        } else {
+            $env:MIRAI_START_FRESH = "true"
+        }
+
         $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
         $startInfo.FileName = $cargoPath
         $startInfo.Arguments = "check -q --locked --manifest-path `"$manifestPath`" --bin `"$bin`""

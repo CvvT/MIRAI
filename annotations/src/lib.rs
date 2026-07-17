@@ -427,6 +427,20 @@ macro_rules! assumed_postcondition {
     };
 }
 
+/// Declares that two referenced pointer-like values dereference to the same memory location.
+///
+/// MIRAI propagates this relationship to callers as part of the enclosing function's summary.
+/// The first argument is treated as the alias and the second as the canonical source.
+#[macro_export]
+macro_rules! assumed_alias {
+    ($alias:expr, $source:expr) => {
+        #[cfg(mirai)]
+        {
+            mirai_annotations::mirai_assume_alias($alias, $source)
+        }
+    };
+}
+
 /// Equivalent to the standard assert! when used with an unmodified Rust compiler.
 /// When compiled with MIRAI, this causes MIRAI to verify the condition at the
 /// point where it appears in a function, but to also add it a postcondition that can
@@ -1159,6 +1173,10 @@ pub fn mirai_does_not_have_tag<V: ?Sized, T>(_v: &V) -> bool {
 // Helper function for MIRAI. Should only be called via the assume macros.
 #[doc(hidden)]
 pub fn mirai_assume(_condition: bool) {}
+
+// Helper function for MIRAI. Should only be called via the assumed_alias macro.
+#[doc(hidden)]
+pub fn mirai_assume_alias<T: ?Sized>(_alias: &T, _source: &T) {}
 
 // Helper function for MIRAI. Should only be called via the assume_precondition macro.
 #[doc(hidden)]

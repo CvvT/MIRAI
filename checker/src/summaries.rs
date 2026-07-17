@@ -84,6 +84,10 @@ pub struct Summary {
     // wrong at runtime if the precondition is not satisfied by the caller.
     pub preconditions: Vec<Precondition>,
 
+    /// Pairs of pointer-like paths whose dereference targets are the same allocation.
+    #[serde(default)]
+    pub assumed_aliases: Vec<(Rc<Path>, Rc<Path>)>,
+
     // Modifications the function makes to mutable state external to the function.
     // Every path will be rooted in a static or in a mutable parameter.
     // No two paths in this collection will lead to the same place in memory.
@@ -138,6 +142,13 @@ impl Summary {
         if !Self::is_subset_of_side_effects(&self.side_effects[0..], &other.side_effects[0..]) {
             return false;
         }
+        if !self
+            .assumed_aliases
+            .iter()
+            .all(|alias| other.assumed_aliases.contains(alias))
+        {
+            return false;
+        }
         true
     }
 
@@ -187,6 +198,9 @@ impl Summary {
     }
 
     pub fn join_side_effects(&mut self, other: &Summary) {
+        // Aliasing is a must-property, so retain only relationships present on both iterations.
+        self.assumed_aliases
+            .retain(|alias| other.assumed_aliases.contains(alias));
         let other_map: HashMap<Rc<Path>, Rc<AbstractValue>> =
             other.side_effects.clone().into_iter().collect();
         for (path, val1) in self.side_effects.iter_mut() {
@@ -221,6 +235,7 @@ impl Summary {
 pub fn summarize(
     argument_count: usize,
     exit_environment: Option<&Environment>,
+    assumed_aliases: &HashSet<(Rc<Path>, Rc<Path>)>,
     preconditions: &[Precondition],
     post_condition: &Option<Rc<AbstractValue>>,
     return_type_index: usize,
@@ -233,6 +248,19 @@ pub fn summarize(
         post_condition,
     );
     let mut preconditions: Vec<Precondition> = add_provenance(preconditions, tcx);
+    let mut assumed_aliases: Vec<(Rc<Path>, Rc<Path>)> = assumed_aliases
+        .iter()
+        .filter(|(alias, source)| {
+            let is_boundary_path = |path: &Rc<Path>| {
+                matches!(
+                    path.get_path_root().value,
+                    PathEnum::Parameter { .. } | PathEnum::Result | PathEnum::StaticVariable { .. }
+                )
+            };
+            is_boundary_path(alias) && is_boundary_path(source)
+        })
+        .cloned()
+        .collect();
     let mut side_effects = if let Some(exit_environment) = exit_environment {
         extract_side_effects(exit_environment, argument_count)
     } else {
@@ -240,12 +268,14 @@ pub fn summarize(
     };
 
     preconditions.sort();
+    assumed_aliases.sort();
     side_effects.sort();
 
     Summary {
         is_computed: true,
         is_incomplete: false,
         preconditions,
+        assumed_aliases,
         side_effects,
         post_condition: post_condition.clone(),
         return_type_index,
