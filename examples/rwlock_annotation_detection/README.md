@@ -1,0 +1,70 @@
+# RwLock annotation detection
+
+This example uses stock MIRAI model fields to shadow a sequential read/write lock protocol:
+
+- `readers: usize` counts simultaneously live read guards on the analyzed path.
+- `writer: usize` uses `0/1` to record a live writer.
+- `Guard::drop` calls the modeled read release.
+
+The fixtures are independent binaries:
+
+| Binary | Expected result |
+| --- | --- |
+| `clean` | no MIRAI diagnostics |
+| `read_then_write` | `write requires no live readers` |
+| `unheld_release` | `read release requires a live reader` |
+| `drop_then_release` | `read release requires a live reader`; proves reader `Drop` decremented |
+| `double_write` | `write requires no live writer` with the checker fix |
+| `instances_independent` | silent; a reader on `a` does not block a writer on `b` |
+| `seeded_writer_other_instance` | silent; known writer state on `a` does not block reading `b` |
+| `instance_violation` | `write requires no live writer` on `a`, while `b` remains unlocked |
+| `alias_same_instance` | `write requires no live readers`; `&a` shares `a`'s state |
+| `array_indices` | silent; constant indices `locks[0]` and `locks[1]` remain distinct |
+| `array_same_index` | `write requires no live readers`; repeated `locks[0]` is the same instance |
+| `callback_inline_closure` | `write requires no live writer` |
+| `callback_hof_annotated` | `write requires no live writer` |
+| `callback_hof_invoke_twice` | `annotated callback requires no live writer` |
+| `callback_hof_direct_control` | `annotated callback requires no live writer` |
+| `callback_fnptr` | `write requires no live writer` |
+| `callback_reentrant` | `write requires no live writer` |
+| `callback_clean` | no MIRAI diagnostics |
+| `nested_field_double_write` | `write requires no live writer` |
+| `nested_field_independent` | no MIRAI diagnostics |
+| `nested_deep_double_write` | `write requires no live writer` |
+| `nested_deep_independent` | no MIRAI diagnostics |
+| `struct_field_double_write` | `write requires no live writer` |
+| `struct_fields_independent` | no MIRAI diagnostics; distinct fields remain distinct |
+| `arc_alias_double_write` | known false negative: currently no MIRAI diagnostic |
+| `arc_instances_independent` | no MIRAI diagnostics |
+| `rc_alias_double_write` | known false negative: currently no MIRAI diagnostic |
+| `rc_instances_independent` | no MIRAI diagnostics |
+
+Unpatched stock MIRAI considers the continuation after `acquire_write` unreachable because it
+promotes the stale `writer == 0` precondition into a postcondition. The checker fix excludes
+body-mutated model fields from automatically inferred postconditions, so the second ordinary
+acquisition is now reached and rejected.
+
+Model fields are qualified by the receiver path, not keyed only by type or acquisition site.
+`handle_get_model_field` and `handle_set_model_field` build and canonicalize
+`receiver.model_field(name)` paths. This distinguishes separate locals and constant array elements
+while canonicalizing a direct reference alias back to the same instance. Runtime-selected or
+imprecisely indexed collections are not covered by these fixtures.
+
+The wrapper models sequential acquisition discipline, not thread interleavings or the behavior of
+`std::sync::RwLock`. The clean result refers to MIRAI's default diagnostic policy; paranoid mode
+also reports possible reader-count overflow and read-release imprecision.
+
+Stock MIRAI derives the callable summaries used here by analyzing the wrapper method bodies. These
+examples therefore do not satisfy strict contract-only modularity, where a caller may read only a
+direct callee's annotations and never its body. Enforcing that boundary requires a checker change;
+it cannot be achieved by annotations alone on stock main.
+
+Run the complete sweep with raw output:
+
+```powershell
+.\examples\rwlock_annotation_detection\run_examples.ps1 -ShowOutput
+```
+
+Use `-Filter <binary>` to run one fixture. The runner intentionally exits nonzero at `26/28`
+because the `Arc::clone` and `Rc::clone` alias fixtures encode known false-negative soundness gaps
+as expected violations rather than masking them as passing behavior.

@@ -1,0 +1,9 @@
+[package]
+name = "rwlock-annotation-detection"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+mirai-annotations = { path = "../../annotations" }
