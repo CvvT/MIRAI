@@ -19,7 +19,7 @@ use rustc_middle::mir;
 use rustc_middle::ty::{
     AdtDef, AliasTyKind, Const, ConstKind, CoroutineArgsExt, ExistentialPredicate,
     ExistentialProjection, ExistentialTraitRef, FnSig, GenericArg, GenericArgKind, GenericArgs,
-    GenericArgsRef, ParamTy, Ty, TyCtxt, TyKind,
+    GenericArgsRef, ParamTy, Ty, TyCtxt, TyKind, Unnormalized,
 };
 
 use crate::abstract_value::AbstractValue;
@@ -1073,28 +1073,13 @@ impl<'tcx> TypeVisitor<'tcx> {
                     let typing_env = self.get_typing_env_for(
                         self.tcx.associated_item(item_def_id).container_id(self.tcx),
                     );
-                    if let Ok(Some(instance)) = rustc_middle::ty::Instance::try_resolve(
-                        self.tcx,
+                    let specialized_projection =
+                        Ty::new_projection(self.tcx, item_def_id, specialized_substs);
+                    if let Ok(normalized_ty) = self.tcx.try_normalize_erasing_regions(
                         typing_env,
-                        item_def_id,
-                        specialized_substs,
+                        Unnormalized::new_wip(specialized_projection),
                     ) {
-                        let instance_item_def_id = instance.def.def_id();
-                        if item_def_id == instance_item_def_id {
-                            return Ty::new_projection(self.tcx, item_def_id, specialized_substs);
-                        }
-                        let item_type = self.tcx.type_of(instance_item_def_id).skip_binder();
-                        let map = self.get_generic_arguments_map(
-                            instance_item_def_id,
-                            instance.args,
-                            &[],
-                        );
-                        if item_type == ty && map.is_none() {
-                            // Can happen if the projection just adds a life time
-                            item_type
-                        } else {
-                            self.specialize_type(item_type, &map)
-                        }
+                        normalized_ty
                     } else {
                         let projection_trait = Some(self.tcx.parent(item_def_id));
                         if projection_trait == self.tcx.lang_items().pointee_trait() {

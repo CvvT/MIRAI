@@ -284,6 +284,14 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
                     self.tcx,
                 );
             }
+        } else if elapsed_time_in_seconds < max_analysis_time_for_body {
+            // Timed-out analyses are removed by report_timeout above.
+            let entry = self.active_calls_map.entry(self.def_id).or_insert(0);
+            if *entry <= 1 {
+                self.active_calls_map.remove(&self.def_id);
+            } else {
+                *entry -= 1;
+            }
         }
         self.cv
             .constant_value_cache
