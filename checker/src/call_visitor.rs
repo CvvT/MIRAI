@@ -1586,8 +1586,8 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
         }
         self.block_visitor
             .bv
-            .assumed_aliases
-            .insert((alias_path, source_path));
+            .current_environment
+            .assume_alias(alias_path, source_path);
         self.use_entry_condition_as_exit_condition();
     }
 
@@ -3158,34 +3158,68 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
         }
 
         for (alias, source) in &function_summary.assumed_aliases {
-            let refined_alias = alias.refine_parameters_and_paths(
-                &self.actual_args,
-                result_path,
-                &self.environment_before_call,
-                &self.block_visitor.bv.current_environment,
-                self.block_visitor.bv.fresh_variable_offset,
-            );
-            let refined_source = source.refine_parameters_and_paths(
-                &self.actual_args,
-                result_path,
-                &self.environment_before_call,
-                &self.block_visitor.bv.current_environment,
-                self.block_visitor.bv.fresh_variable_offset,
-            );
-            let source_type = self
-                .type_visitor()
-                .get_path_rustc_type(&refined_source, self.block_visitor.bv.current_span);
-            self.block_visitor.bv.copy_or_move_elements(
-                refined_alias.clone(),
-                refined_source.clone(),
-                source_type,
-                false,
-            );
-            self.block_visitor
-                .bv
-                .assumed_aliases
-                .insert((refined_alias, refined_source));
+            self.transfer_alias(alias, source, None, result_path);
         }
+        for (alias, source, condition) in &function_summary.guarded_aliases {
+            self.transfer_alias(alias, source, Some(condition), result_path);
+        }
+    }
+
+    fn transfer_alias(
+        &mut self,
+        alias: &Rc<Path>,
+        source: &Rc<Path>,
+        condition: Option<&Rc<AbstractValue>>,
+        result_path: &Option<Rc<Path>>,
+    ) {
+        let refined_alias = alias.refine_parameters_and_paths(
+            &self.actual_args,
+            result_path,
+            &self.environment_before_call,
+            &self.block_visitor.bv.current_environment,
+            self.block_visitor.bv.fresh_variable_offset,
+        );
+        let refined_source = source.refine_parameters_and_paths(
+            &self.actual_args,
+            result_path,
+            &self.environment_before_call,
+            &self.block_visitor.bv.current_environment,
+            self.block_visitor.bv.fresh_variable_offset,
+        );
+        if let Some(condition) = condition {
+            let refined_condition = condition.refine_parameters_and_paths(
+                &self.actual_args,
+                result_path,
+                &self.environment_before_call,
+                &self.block_visitor.bv.current_environment,
+                self.block_visitor.bv.fresh_variable_offset,
+            );
+            match refined_condition.as_bool_if_known() {
+                Some(false) => return,
+                None => {
+                    self.block_visitor.bv.current_environment.assume_alias_if(
+                        refined_alias,
+                        refined_source,
+                        refined_condition,
+                    );
+                    return;
+                }
+                Some(true) => {}
+            }
+        }
+        let source_type = self
+            .type_visitor()
+            .get_path_rustc_type(&refined_source, self.block_visitor.bv.current_span);
+        self.block_visitor.bv.copy_or_move_elements(
+            refined_alias.clone(),
+            refined_source.clone(),
+            source_type,
+            false,
+        );
+        self.block_visitor
+            .bv
+            .current_environment
+            .assume_alias(refined_alias, refined_source);
     }
 
     /// If the function summary has a post condition, refine this and add it to the

@@ -88,6 +88,10 @@ pub struct Summary {
     #[serde(default)]
     pub assumed_aliases: Vec<(Rc<Path>, Rc<Path>)>,
 
+    /// Alias relationships that hold when the associated condition is true.
+    #[serde(default)]
+    pub guarded_aliases: Vec<(Rc<Path>, Rc<Path>, Rc<AbstractValue>)>,
+
     // Modifications the function makes to mutable state external to the function.
     // Every path will be rooted in a static or in a mutable parameter.
     // No two paths in this collection will lead to the same place in memory.
@@ -149,6 +153,13 @@ impl Summary {
         {
             return false;
         }
+        if !self
+            .guarded_aliases
+            .iter()
+            .all(|alias| other.guarded_aliases.contains(alias))
+        {
+            return false;
+        }
         true
     }
 
@@ -201,6 +212,8 @@ impl Summary {
         // Aliasing is a must-property, so retain only relationships present on both iterations.
         self.assumed_aliases
             .retain(|alias| other.assumed_aliases.contains(alias));
+        self.guarded_aliases
+            .retain(|alias| other.guarded_aliases.contains(alias));
         let other_map: HashMap<Rc<Path>, Rc<AbstractValue>> =
             other.side_effects.clone().into_iter().collect();
         for (path, val1) in self.side_effects.iter_mut() {
@@ -235,7 +248,6 @@ impl Summary {
 pub fn summarize(
     argument_count: usize,
     exit_environment: Option<&Environment>,
-    assumed_aliases: &HashSet<(Rc<Path>, Rc<Path>)>,
     preconditions: &[Precondition],
     post_condition: &Option<Rc<AbstractValue>>,
     return_type_index: usize,
@@ -248,8 +260,10 @@ pub fn summarize(
         post_condition,
     );
     let mut preconditions: Vec<Precondition> = add_provenance(preconditions, tcx);
-    let mut assumed_aliases: Vec<(Rc<Path>, Rc<Path>)> = assumed_aliases
-        .iter()
+    let mut assumed_aliases: Vec<(Rc<Path>, Rc<Path>)> = exit_environment
+        .map(|environment| environment.assumed_aliases.iter())
+        .into_iter()
+        .flatten()
         .filter(|(alias, source)| {
             let is_boundary_path = |path: &Rc<Path>| {
                 matches!(
@@ -261,6 +275,25 @@ pub fn summarize(
         })
         .cloned()
         .collect();
+    let mut guarded_aliases: Vec<(Rc<Path>, Rc<Path>, Rc<AbstractValue>)> = exit_environment
+        .map(|environment| environment.guarded_aliases.iter())
+        .into_iter()
+        .flatten()
+        .filter(|((alias, source), _)| {
+            let is_boundary_path = |path: &Rc<Path>| {
+                matches!(
+                    path.get_path_root().value,
+                    PathEnum::Parameter { .. } | PathEnum::Result | PathEnum::StaticVariable { .. }
+                )
+            };
+            is_boundary_path(alias) && is_boundary_path(source)
+        })
+        .filter_map(|((alias, source), condition)| {
+            condition
+                .extract_promotable_disjuncts(false)
+                .map(|condition| (alias.clone(), source.clone(), condition))
+        })
+        .collect();
     let mut side_effects = if let Some(exit_environment) = exit_environment {
         extract_side_effects(exit_environment, argument_count)
     } else {
@@ -269,6 +302,7 @@ pub fn summarize(
 
     preconditions.sort();
     assumed_aliases.sort();
+    guarded_aliases.sort();
     side_effects.sort();
 
     Summary {
@@ -276,6 +310,7 @@ pub fn summarize(
         is_incomplete: false,
         preconditions,
         assumed_aliases,
+        guarded_aliases,
         side_effects,
         post_condition: post_condition.clone(),
         return_type_index,

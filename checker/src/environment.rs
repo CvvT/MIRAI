@@ -14,7 +14,7 @@ use crate::constant_domain::ConstantDomain;
 use log_derive::{logfn, logfn_inputs};
 use rpds::HashTrieMap;
 use rustc_middle::mir::BasicBlock;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter, Result};
 use std::rc::Rc;
 
@@ -22,6 +22,10 @@ use std::rc::Rc;
 pub struct Environment {
     /// The disjunction of all the exit conditions from the predecessors of this block.
     pub entry_condition: Rc<AbstractValue>,
+    /// Alias relationships that hold on every path reaching this environment.
+    pub assumed_aliases: HashSet<(Rc<Path>, Rc<Path>)>,
+    /// Alias relationships guarded by conditions over boundary-visible values.
+    pub guarded_aliases: HashMap<(Rc<Path>, Rc<Path>), Rc<AbstractValue>>,
     /// The conditions that guard exit from this block to successor blocks
     pub exit_conditions: HashTrieMap<BasicBlock, Rc<AbstractValue>>,
     /// Does not include any entries where the value is abstract_value::Bottom
@@ -34,6 +38,8 @@ impl Default for Environment {
     fn default() -> Environment {
         Environment {
             entry_condition: Rc::new(abstract_value::TRUE),
+            assumed_aliases: HashSet::new(),
+            guarded_aliases: HashMap::new(),
             exit_conditions: HashTrieMap::default(),
             value_map: HashTrieMap::default(),
         }
@@ -48,6 +54,36 @@ impl Debug for Environment {
 
 /// Methods
 impl Environment {
+    /// Records an alias relationship that holds throughout this environment.
+    pub fn assume_alias(&mut self, alias: Rc<Path>, source: Rc<Path>) {
+        let relationship = (alias, source);
+        self.guarded_aliases.remove(&relationship);
+        self.assumed_aliases.insert(relationship);
+    }
+
+    /// Records an alias relationship that holds when condition is true.
+    pub fn assume_alias_if(
+        &mut self,
+        alias: Rc<Path>,
+        source: Rc<Path>,
+        condition: Rc<AbstractValue>,
+    ) {
+        let relationship = (alias, source);
+        if self.assumed_aliases.contains(&relationship) {
+            return;
+        }
+        match condition.as_bool_if_known() {
+            Some(true) => self.assume_alias(relationship.0, relationship.1),
+            Some(false) => {}
+            None => {
+                self.guarded_aliases
+                    .entry(relationship)
+                    .and_modify(|existing| *existing = existing.or(condition.clone()))
+                    .or_insert(condition);
+            }
+        }
+    }
+
     /// Returns a reference to the value associated with the given path, if there is one.
     #[logfn_inputs(TRACE)]
     pub fn value_at(&self, path: &Rc<Path>) -> Option<&Rc<AbstractValue>> {
@@ -488,7 +524,9 @@ impl Environment {
         condition: &Rc<AbstractValue>,
         other_condition: &Rc<AbstractValue>,
     ) -> Environment {
-        self.join_or_widen(other, |x, y, _p| {
+        let (assumed_aliases, guarded_aliases) =
+            self.conditional_join_aliases(&other, condition, other_condition);
+        let mut result = self.join_or_widen(other, |x, y, _p| {
             if let (Expression::CompileTimeConstant(v1), Expression::CompileTimeConstant(v2)) =
                 (&x.expression, &y.expression)
             {
@@ -503,7 +541,10 @@ impl Environment {
                 }
             }
             condition.conditional_expression(x.clone(), y.clone())
-        })
+        });
+        result.assumed_aliases = assumed_aliases;
+        result.guarded_aliases = guarded_aliases;
+        result
     }
 
     /// Returns an environment with a path for every entry in self and other and an associated
@@ -585,6 +626,28 @@ impl Environment {
     {
         let value_map1 = &self.value_map;
         let value_map2 = &other.value_map;
+        let assumed_aliases = self
+            .assumed_aliases
+            .intersection(&other.assumed_aliases)
+            .cloned()
+            .collect();
+        let mut guarded_aliases = HashMap::new();
+        let mut relationships = self.alias_relationships();
+        relationships.extend(other.alias_relationships());
+        for relationship in relationships {
+            if let (Some(left), Some(right)) = (
+                self.alias_condition(&relationship),
+                other.alias_condition(&relationship),
+            ) {
+                let condition = left.and(right);
+                if condition.as_bool_if_known() == Some(true) {
+                    continue;
+                }
+                if condition.as_bool_if_known() != Some(false) {
+                    guarded_aliases.insert(relationship, condition);
+                }
+            }
+        }
         let mut value_map: HashTrieMap<Rc<Path>, Rc<AbstractValue>> = value_map1.clone();
         for (path, val2) in value_map2.iter() {
             let p = path.clone();
@@ -610,8 +673,66 @@ impl Environment {
         Environment {
             value_map,
             entry_condition: abstract_value::TRUE.into(),
+            assumed_aliases,
+            guarded_aliases,
             exit_conditions: HashTrieMap::default(),
         }
+    }
+
+    fn alias_relationships(&self) -> HashSet<(Rc<Path>, Rc<Path>)> {
+        self.assumed_aliases
+            .iter()
+            .cloned()
+            .chain(self.guarded_aliases.keys().cloned())
+            .collect()
+    }
+
+    fn alias_condition(&self, relationship: &(Rc<Path>, Rc<Path>)) -> Option<Rc<AbstractValue>> {
+        if self.assumed_aliases.contains(relationship) {
+            Some(Rc::new(abstract_value::TRUE))
+        } else {
+            self.guarded_aliases.get(relationship).cloned()
+        }
+    }
+
+    fn conditional_join_aliases(
+        &self,
+        other: &Environment,
+        condition: &Rc<AbstractValue>,
+        other_condition: &Rc<AbstractValue>,
+    ) -> (
+        HashSet<(Rc<Path>, Rc<Path>)>,
+        HashMap<(Rc<Path>, Rc<Path>), Rc<AbstractValue>>,
+    ) {
+        let mut assumed_aliases = HashSet::new();
+        let mut guarded_aliases = HashMap::new();
+        let mut relationships = self.alias_relationships();
+        relationships.extend(other.alias_relationships());
+        for relationship in relationships {
+            if self.assumed_aliases.contains(&relationship)
+                && other.assumed_aliases.contains(&relationship)
+            {
+                assumed_aliases.insert(relationship);
+                continue;
+            }
+            let left = self
+                .alias_condition(&relationship)
+                .unwrap_or_else(|| Rc::new(abstract_value::FALSE));
+            let right = other
+                .alias_condition(&relationship)
+                .unwrap_or_else(|| Rc::new(abstract_value::FALSE));
+            let joined_condition = condition.and(left).or(other_condition.and(right));
+            match joined_condition.as_bool_if_known() {
+                Some(true) => {
+                    assumed_aliases.insert(relationship);
+                }
+                Some(false) => {}
+                None => {
+                    guarded_aliases.insert(relationship, joined_condition);
+                }
+            }
+        }
+        (assumed_aliases, guarded_aliases)
     }
 
     /// Returns true if for every path, self.value_at(path).subset(other.value_at(path))

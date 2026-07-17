@@ -53,7 +53,6 @@ pub struct BodyVisitor<'analysis, 'compilation, 'tcx> {
     pub analyzing_static_var: bool,
     // True if the current function cannot be completely analyzed.
     pub analysis_is_incomplete: bool,
-    pub assumed_aliases: HashSet<(Rc<Path>, Rc<Path>)>,
     pub assume_preconditions_of_next_call: bool,
     pub async_fn_summary: Option<Summary>,
     pub check_for_errors: bool,
@@ -127,7 +126,6 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
             already_reported_errors_for_call_to: HashSet::new(),
             analyzing_static_var: false,
             analysis_is_incomplete: false,
-            assumed_aliases: HashSet::new(),
             assume_preconditions_of_next_call: false,
             async_fn_summary: None,
             check_for_errors: false,
@@ -157,7 +155,6 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
     fn reset_visitor_state(&mut self) {
         self.already_reported_errors_for_call_to = HashSet::new();
         self.analysis_is_incomplete = false;
-        self.assumed_aliases = HashSet::new();
         self.check_for_errors = false;
         self.check_for_unconditional_precondition = false;
         self.current_environment = Environment::default();
@@ -281,7 +278,6 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
                 result = summaries::summarize(
                     self.mir.arg_count,
                     self.exit_environment.as_ref(),
-                    &self.assumed_aliases,
                     &self.preconditions,
                     &self.post_condition,
                     return_type_index,

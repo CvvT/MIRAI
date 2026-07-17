@@ -35,6 +35,9 @@ The fixtures are independent binaries:
 | `struct_field_double_write` | `write requires no live writer` |
 | `struct_fields_independent` | no MIRAI diagnostics; distinct fields remain distinct |
 | `arc_alias_double_write` | `write requires no live writer`; cloned handles share one pointee |
+| `arc_clone_or_fresh_false` | no MIRAI diagnostics; the selected branch returns a fresh allocation |
+| `arc_clone_or_fresh_true` | `write requires no live writer`; the selected branch clones the input |
+| `arc_clone_wrapper_double_write` | `write requires no live writer`; an unconditional wrapper preserves the clone alias |
 | `arc_instances_independent` | no MIRAI diagnostics |
 | `rc_alias_double_write` | `write requires no live writer`; cloned handles share one pointee |
 | `rc_instances_independent` | no MIRAI diagnostics |
