@@ -45,10 +45,19 @@ $expectations = [ordered]@{
 }
 
 $summaryOnlyBins = @(
+    "callback_clean",
+    "callback_hof_annotated",
+    "callback_hof_invoke_twice",
     "two_readers_drop_both",
     "two_readers_drop_one",
     "write_drop_then_reacquire",
     "write_then_read"
+)
+
+$summaryOnlyHofBins = @(
+    "callback_clean",
+    "callback_hof_annotated",
+    "callback_hof_invoke_twice"
 )
 
 $scriptRoot = $PSScriptRoot
@@ -102,7 +111,20 @@ try {
             throw "Failed to seed provider summaries (exit $LASTEXITCODE)."
         }
         $env:MIRAI_START_FRESH = $null
+        foreach ($bin in $summaryOnlyHofBins) {
+            $providerOutput = @(
+                & cargo check -q --locked --manifest-path $manifestPath --bin $bin 2>&1
+            )
+            if ($LASTEXITCODE -ne 0) {
+                $providerOutput | ForEach-Object { Write-Host $_ }
+                throw "Failed to seed $bin summaries (exit $LASTEXITCODE)."
+            }
+        }
         $env:MIRAI_FLAGS = $null
+        & cargo clean --quiet --manifest-path $manifestPath --target-dir $summarySweepTarget -p rwlock-annotation-detection
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to remove provider artifacts (exit $LASTEXITCODE)."
+        }
         & cargo check -q --locked --manifest-path $manifestPath --lib
         if ($LASTEXITCODE -ne 0) {
             throw "Failed to restore provider artifacts (exit $LASTEXITCODE)."
@@ -135,7 +157,7 @@ try {
         if ($SummaryOnly) {
             $env:MIRAI_START_FRESH = $null
             $env:MIRAI_SHARE_PERSISTENT_STORE = "true"
-            $env:MIRAI_LOG = "debug"
+            $env:MIRAI_LOG = "mirai::summaries=trace,mirai::body_visitor=debug"
         } elseif ($bin -like "arc_*" -or $bin -like "rc_*") {
             $env:MIRAI_START_FRESH = $null
         } else {
@@ -182,11 +204,19 @@ try {
         }
         $providerBodyEntries = @(
             $output | Where-Object {
-                $_ -match "entered body of .*rwlock_annotation_detection.*::(read|write|release_read|drop)"
+                $_ -match "entered body of .*rwlock_annotation_detection.*::(read|write|release_read|drop)" -or
+                $_ -match "entered body of .*callback_(clean|hof_annotated|hof_invoke_twice).*::(invoke|invoke_annotated|invoke_twice|annotated_acquire|\{closure)"
+            }
+        )
+        $persistentSummaryLoads = @(
+            $output | Where-Object {
+                $_ -match "get_persistent_summary_for_db\(\) => Some\(Summary"
             }
         )
         if ($SummaryOnly) {
-            $matches = $matches -and $providerBodyEntries.Count -eq 0
+            $matches = $matches -and
+                $providerBodyEntries.Count -eq 0 -and
+                $persistentSummaryLoads.Count -gt 0
         }
 
         $actualText = if ($miraiDiagnostics.Count -eq 0) {
@@ -197,7 +227,7 @@ try {
             "$($miraiDiagnostics.Count) MIRAI diagnostics"
         }
         if ($SummaryOnly) {
-            $actualText += "; provider body entries: $($providerBodyEntries.Count)"
+            $actualText += "; persistent loads: $($persistentSummaryLoads.Count); provider body entries: $($providerBodyEntries.Count)"
         }
 
         if ($ShowOutput) {

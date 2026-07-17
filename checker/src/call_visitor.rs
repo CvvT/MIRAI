@@ -28,7 +28,7 @@ use crate::k_limits;
 use crate::known_names::KnownNames;
 use crate::options::DiagLevel;
 use crate::path::{Path, PathEnum, PathRefinement, PathRoot, PathSelector};
-use crate::summaries::{Precondition, Summary};
+use crate::summaries::{CallbackInvocation, Precondition, Summary};
 use crate::tag_domain::Tag;
 use crate::type_visitor::TypeVisitor;
 use crate::{abstract_value, utils};
@@ -50,6 +50,7 @@ pub struct CallVisitor<'call, 'block, 'analysis, 'compilation, 'tcx> {
     pub function_constant_args: &'call [(Rc<Path>, Ty<'tcx>, Rc<AbstractValue>)],
     pub initial_type_cache: Option<Rc<HashMap<Rc<Path>, Ty<'tcx>>>>,
     pub is_indirect_function_call: bool,
+    pub summary_was_cached: bool,
 }
 
 impl Debug for CallVisitor<'_, '_, '_, '_, '_> {
@@ -88,6 +89,7 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 function_constant_args: &[],
                 initial_type_cache: None,
                 is_indirect_function_call: false,
+                summary_was_cached: false,
             }
         } else {
             unreachable!("caller should supply a constant function")
@@ -373,6 +375,7 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 .get_summary_for_call_site(func_ref, &func_args, &type_args)
                 .clone();
             if result.is_computed || func_ref.def_id.is_none() {
+                self.summary_was_cached = result.is_computed;
                 return Some(result);
             }
             if call_depth < 4 {
@@ -1327,6 +1330,39 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 .block_visitor
                 .get_function_constant_args(&actual_args, &actual_argument_types);
 
+            let mut recorded_callback_invocation = false;
+            if self.block_visitor.bv.check_for_errors {
+                let callee_path = Path::get_as_path(callee.clone())
+                    .canonicalize(&self.block_visitor.bv.current_environment);
+                if callee_path.is_rooted_by_parameter() {
+                    let pre_state = self
+                        .block_visitor
+                        .bv
+                        .current_environment
+                        .value_map
+                        .iter()
+                        .filter(|(path, _)| {
+                            path.is_rooted_by_parameter()
+                                && matches!(
+                                    path.value,
+                                    PathEnum::QualifiedPath { ref selector, .. }
+                                        if matches!(**selector, PathSelector::ModelField(_))
+                                )
+                        })
+                        .map(|(path, value)| (path.clone(), value.clone()))
+                        .collect();
+                    self.block_visitor
+                        .bv
+                        .callback_invocations
+                        .push(CallbackInvocation {
+                            callee: callee_path,
+                            arguments: actual_args.clone(),
+                            pre_state,
+                        });
+                    recorded_callback_invocation = true;
+                }
+            }
+
             // Get the generic argument map for the indirectly called function
             let generic_arguments = match callee_ty.kind() {
                 TyKind::Closure(_, args) => Some(self.type_visitor().specialize_generic_args(
@@ -1385,6 +1421,12 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             let summary = indirect_call_visitor.get_function_summary();
             if let Some(summary) = summary {
                 if summary.is_computed {
+                    if recorded_callback_invocation {
+                        indirect_call_visitor
+                            .block_visitor
+                            .bv
+                            .assume_preconditions_of_next_call = true;
+                    }
                     indirect_call_visitor.transfer_and_refine_into_current_environment(&summary);
                 }
                 if summary.is_incomplete
@@ -2764,10 +2806,127 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
         );
         self.check_preconditions_if_necessary(function_summary);
         check_for_early_return!(self.block_visitor.bv);
+        if self.summary_was_cached {
+            self.replay_callback_invocations(function_summary);
+            check_for_early_return!(self.block_visitor.bv);
+        }
         self.transfer_and_refine_normal_return_state(function_summary);
         check_for_early_return!(self.block_visitor.bv);
         self.add_post_condition_to_exit_conditions(function_summary);
         debug!("post env {:?}", self.block_visitor.bv.current_environment);
+    }
+
+    fn replay_callback_invocations(&mut self, function_summary: &Summary) {
+        if function_summary.callback_invocations.is_empty() {
+            return;
+        }
+        let outer_environment = self.block_visitor.bv.current_environment.clone();
+        let no_result = None;
+        for invocation in &function_summary.callback_invocations {
+            trace!("replaying callback invocation {:?}", invocation);
+            let PathEnum::Parameter { ordinal } = invocation.callee.get_path_root().value else {
+                trace!("callback invocation is not rooted by a parameter");
+                continue;
+            };
+            let Some(argument_index) = ordinal.checked_sub(1) else {
+                continue;
+            };
+            let Some((_, callback_value)) = self.actual_args.get(argument_index) else {
+                continue;
+            };
+            let callback_value = callback_value.clone();
+            let Some(callback_ref) = self.block_visitor.get_func_ref(&callback_value) else {
+                trace!("callback argument did not resolve to a function");
+                self.block_visitor.bv.analysis_is_incomplete = true;
+                continue;
+            };
+            let callback_summary = self
+                .block_visitor
+                .bv
+                .cv
+                .summary_cache
+                .get_summary_for_call_site(&callback_ref, &None, &None)
+                .clone();
+            trace!("callback summary {:?}", callback_summary);
+            if !callback_summary.is_computed {
+                info!(
+                    "no persisted summary for callback {}{}",
+                    callback_ref.summary_cache_key, callback_ref.argument_type_key
+                );
+                self.block_visitor.bv.analysis_is_incomplete = true;
+                continue;
+            }
+
+            let callback_arguments: Vec<(Rc<Path>, Rc<AbstractValue>)> = invocation
+                .arguments
+                .iter()
+                .map(|(path, value)| {
+                    (
+                        path.refine_parameters_and_paths(
+                            &self.actual_args,
+                            &no_result,
+                            &self.environment_before_call,
+                            &outer_environment,
+                            self.block_visitor.bv.fresh_variable_offset,
+                        ),
+                        value.refine_parameters_and_paths(
+                            &self.actual_args,
+                            &no_result,
+                            &self.environment_before_call,
+                            &outer_environment,
+                            self.block_visitor.bv.fresh_variable_offset,
+                        ),
+                    )
+                })
+                .collect();
+            let mut callback_environment = outer_environment.clone();
+            for (path, value) in &invocation.pre_state {
+                let refined_path = path.refine_parameters_and_paths(
+                    &self.actual_args,
+                    &no_result,
+                    &self.environment_before_call,
+                    &outer_environment,
+                    self.block_visitor.bv.fresh_variable_offset,
+                );
+                let refined_value = value.refine_parameters_and_paths(
+                    &self.actual_args,
+                    &no_result,
+                    &self.environment_before_call,
+                    &outer_environment,
+                    self.block_visitor.bv.fresh_variable_offset,
+                );
+                callback_environment.strong_update_value_at(refined_path, refined_value);
+            }
+
+            self.block_visitor.bv.current_environment = callback_environment.clone();
+            {
+                let mut block_visitor = BlockVisitor::new(self.block_visitor.bv);
+                let mut callback_visitor = CallVisitor::new(
+                    &mut block_visitor,
+                    callback_ref.def_id.unwrap_or(self.callee_def_id),
+                    None,
+                    None,
+                    callback_environment.clone(),
+                    ConstantDomain::Function(callback_ref),
+                );
+                callback_visitor.actual_args = callback_arguments;
+                callback_visitor.callee_fun_val = callback_value;
+                callback_visitor.is_indirect_function_call = true;
+                callback_visitor.check_preconditions_if_necessary(&callback_summary);
+
+                for (index, (target_path, _)) in callback_visitor.actual_args.iter().enumerate() {
+                    callback_visitor.block_visitor.bv.transfer_and_refine(
+                        &callback_summary.side_effects,
+                        target_path.clone(),
+                        &Path::new_parameter(index + 1),
+                        &no_result,
+                        &callback_visitor.actual_args,
+                        &callback_environment,
+                    );
+                }
+            }
+            self.block_visitor.bv.current_environment = outer_environment.clone();
+        }
     }
 
     /// If we are checking for errors and have not assumed the preconditions of the called function

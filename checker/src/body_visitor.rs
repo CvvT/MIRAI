@@ -33,7 +33,7 @@ use crate::path::{PathRefinement, PathRoot};
 use crate::smt_solver::SolverStub;
 use crate::smt_solver::{SmtResult, SmtSolver};
 use crate::summaries;
-use crate::summaries::{Precondition, Summary};
+use crate::summaries::{CallbackInvocation, Precondition, Summary};
 use crate::tag_domain::Tag;
 use crate::type_visitor::{self, TypeCache, TypeVisitor};
 #[cfg(feature = "z3")]
@@ -57,6 +57,7 @@ pub struct BodyVisitor<'analysis, 'compilation, 'tcx> {
     pub async_fn_summary: Option<Summary>,
     pub check_for_errors: bool,
     pub check_for_unconditional_precondition: bool,
+    pub callback_invocations: Vec<CallbackInvocation>,
     pub current_environment: Environment,
     pub current_location: mir::Location,
     pub current_span: rustc_span::Span,
@@ -130,6 +131,7 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
             async_fn_summary: None,
             check_for_errors: false,
             check_for_unconditional_precondition: false, // logging + new mir code gen breaks this for now
+            callback_invocations: Vec::new(),
             current_environment: Environment::default(),
             current_location: mir::Location::START,
             current_span: rustc_span::DUMMY_SP,
@@ -157,6 +159,7 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
         self.analysis_is_incomplete = false;
         self.check_for_errors = false;
         self.check_for_unconditional_precondition = false;
+        self.callback_invocations = Vec::new();
         self.current_environment = Environment::default();
         self.current_location = mir::Location::START;
         self.current_span = rustc_span::DUMMY_SP;
@@ -279,6 +282,7 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
                     self.mir.arg_count,
                     self.exit_environment.as_ref(),
                     &self.preconditions,
+                    &self.callback_invocations,
                     &self.post_condition,
                     return_type_index,
                     self.tcx,

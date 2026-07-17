@@ -61,12 +61,11 @@ The wrapper models sequential acquisition discipline, not thread interleavings o
 `std::sync::RwLock`. The clean result refers to MIRAI's default diagnostic policy; paranoid mode
 also reports possible reader-count overflow and read-release imprecision.
 
-The four mode/RAII fixtures can also consume persisted provider summaries without entering the
-provider method bodies. This proves that write/read acquisition, both guard releases, and
-`read_count + 1`/`read_count - 1` survive the summary boundary. Other rows still use MIRAI's
-top-down body analysis and do not establish strict contract-only modularity. In particular,
-ordinary summaries do not represent a callback invocation under an intermediate lock state, so
-the higher-order propagation requirement needs a separate checker design.
+The mode/RAII and higher-order fixtures can also consume persisted provider summaries without
+entering the provider method or callback bodies. This proves that write/read acquisition, both
+guard releases, `read_count + 1`/`read_count - 1`, and callback invocations under intermediate
+model-field state survive the summary boundary. Other rows still use MIRAI's top-down body analysis
+and do not establish strict contract-only modularity.
 
 Run the complete sweep with raw output:
 
@@ -79,11 +78,11 @@ diagnostic, so a missed alias or a duplicate diagnostic makes the runner exit no
 The `Arc`/`Rc` rows load MIRAI's embedded standard contracts; other rows start with an empty summary
 store to retain their original standalone-analysis oracle.
 
-Run the four mode/RAII fixtures against persisted summaries:
+Run the mode/RAII and higher-order fixtures against persisted summaries:
 
 ```powershell
 .\examples\rwlock_annotation_detection\run_examples.ps1 -SummaryOnly
 ```
 
-This mode seeds provider summaries, recompiles each consumer, and fails if MIRAI enters a provider
-`read`, `write`, release, or guard `Drop` body.
+This mode seeds provider summaries, recompiles each consumer, and fails if MIRAI enters a protected
+provider, higher-order helper, or callback body.

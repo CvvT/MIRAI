@@ -111,6 +111,47 @@ pub struct Summary {
     /// but the return type specification is abstract.
     #[serde(skip)]
     pub return_type_index: usize,
+
+    /// Calls to function-typed parameters, together with their boundary-visible state.
+    #[serde(default)]
+    pub callback_invocations: Vec<CallbackInvocation>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+pub struct CallbackInvocation {
+    /// The function-typed parameter invoked by the summarized function.
+    pub callee: Rc<Path>,
+    /// Callback arguments expressed in terms of the summarized function's parameters.
+    pub arguments: Vec<(Rc<Path>, Rc<AbstractValue>)>,
+    /// Model-field values visible at the callback invocation point.
+    pub pre_state: Vec<(Rc<Path>, Rc<AbstractValue>)>,
+}
+
+#[derive(Deserialize)]
+struct LegacySummary {
+    is_computed: bool,
+    is_incomplete: bool,
+    preconditions: Vec<Precondition>,
+    assumed_aliases: Vec<(Rc<Path>, Rc<Path>)>,
+    guarded_aliases: Vec<(Rc<Path>, Rc<Path>, Rc<AbstractValue>)>,
+    side_effects: Vec<(Rc<Path>, Rc<AbstractValue>)>,
+    post_condition: Option<Rc<AbstractValue>>,
+}
+
+impl From<LegacySummary> for Summary {
+    fn from(summary: LegacySummary) -> Self {
+        Summary {
+            is_computed: summary.is_computed,
+            is_incomplete: summary.is_incomplete,
+            preconditions: summary.preconditions,
+            assumed_aliases: summary.assumed_aliases,
+            guarded_aliases: summary.guarded_aliases,
+            side_effects: summary.side_effects,
+            post_condition: summary.post_condition,
+            return_type_index: 0,
+            callback_invocations: Vec::new(),
+        }
+    }
 }
 
 /// Bundles together the condition of a precondition with the provenance (place where defined) of
@@ -157,6 +198,13 @@ impl Summary {
             .guarded_aliases
             .iter()
             .all(|alias| other.guarded_aliases.contains(alias))
+        {
+            return false;
+        }
+        if !self
+            .callback_invocations
+            .iter()
+            .all(|invocation| other.callback_invocations.contains(invocation))
         {
             return false;
         }
@@ -249,6 +297,7 @@ pub fn summarize(
     argument_count: usize,
     exit_environment: Option<&Environment>,
     preconditions: &[Precondition],
+    callback_invocations: &[CallbackInvocation],
     post_condition: &Option<Rc<AbstractValue>>,
     return_type_index: usize,
     tcx: TyCtxt<'_>,
@@ -314,6 +363,7 @@ pub fn summarize(
         side_effects,
         post_condition: post_condition.clone(),
         return_type_index,
+        callback_invocations: callback_invocations.to_vec(),
     }
 }
 
@@ -755,7 +805,12 @@ impl<'tcx> SummaryCache<'tcx> {
     #[logfn(TRACE)]
     fn get_persistent_summary_for_db(db: &Db, persistent_key: &str) -> Option<Summary> {
         if let Ok(Some(pinned_value)) = db.get(persistent_key.as_bytes()) {
-            Some(bincode::deserialize(pinned_value.deref()).unwrap())
+            let bytes = pinned_value.deref();
+            Some(
+                bincode::deserialize(bytes)
+                    .or_else(|_| bincode::deserialize::<LegacySummary>(bytes).map(Into::into))
+                    .unwrap(),
+            )
         } else {
             None
         }
@@ -774,6 +829,19 @@ impl<'tcx> SummaryCache<'tcx> {
         summary: Summary,
     ) {
         if let Some(func_id) = func_ref.function_id {
+            if !func_ref.argument_type_key.is_empty() {
+                let persistent_key = format!(
+                    "{}{}",
+                    func_ref.summary_cache_key, func_ref.argument_type_key
+                );
+                let serialized_summary = bincode::serialize(&summary).unwrap();
+                if let Err(error) = self
+                    .db
+                    .insert(persistent_key.as_bytes(), serialized_summary)
+                {
+                    println!("unable to set key in summary database: {error:?}");
+                }
+            }
             // if let Some(def_id) = func_ref.def_id {
             //     if func_args.is_none() && type_args.is_none() {
             //         info!("caching summary for def_id {:?}", def_id);
