@@ -2,9 +2,9 @@
 
 This example uses stock MIRAI model fields to shadow a sequential read/write lock protocol:
 
-- `readers: usize` counts simultaneously live read guards on the analyzed path.
-- `writer: usize` uses `0/1` to record a live writer.
-- `Guard::drop` calls the modeled read release.
+- `read_count: usize` counts simultaneously live read guards on the analyzed path.
+- `write_held: usize` uses `0/1` to record a live writer.
+- `Guard::drop` and `WriteGuard::drop` release their corresponding mode.
 
 The fixtures are independent binaries:
 
@@ -15,6 +15,10 @@ The fixtures are independent binaries:
 | `unheld_release` | `read release requires a live reader` |
 | `drop_then_release` | `read release requires a live reader`; proves reader `Drop` decremented |
 | `double_write` | `write requires no live writer` with the checker fix |
+| `write_then_read` | `read requires no live writer` |
+| `write_drop_then_reacquire` | silent; write `Drop` permits a later read and write |
+| `two_readers_drop_one` | `write requires no live readers`; one reader remains live |
+| `two_readers_drop_both` | silent; both reader releases survive summary arithmetic |
 | `instances_independent` | silent; a reader on `a` does not block a writer on `b` |
 | `seeded_writer_other_instance` | silent; known writer state on `a` does not block reading `b` |
 | `instance_violation` | `write requires no live writer` on `a`, while `b` remains unlocked |
@@ -57,10 +61,12 @@ The wrapper models sequential acquisition discipline, not thread interleavings o
 `std::sync::RwLock`. The clean result refers to MIRAI's default diagnostic policy; paranoid mode
 also reports possible reader-count overflow and read-release imprecision.
 
-Stock MIRAI derives the callable summaries used here by analyzing the wrapper method bodies. These
-examples therefore do not satisfy strict contract-only modularity, where a caller may read only a
-direct callee's annotations and never its body. Enforcing that boundary requires a checker change;
-it cannot be achieved by annotations alone on stock main.
+The four mode/RAII fixtures can also consume persisted provider summaries without entering the
+provider method bodies. This proves that write/read acquisition, both guard releases, and
+`read_count + 1`/`read_count - 1` survive the summary boundary. Other rows still use MIRAI's
+top-down body analysis and do not establish strict contract-only modularity. In particular,
+ordinary summaries do not represent a callback invocation under an intermediate lock state, so
+the higher-order propagation requirement needs a separate checker design.
 
 Run the complete sweep with raw output:
 
@@ -72,3 +78,12 @@ Use `-Filter <binary>` to run one fixture. Every violating row requires exactly 
 diagnostic, so a missed alias or a duplicate diagnostic makes the runner exit nonzero.
 The `Arc`/`Rc` rows load MIRAI's embedded standard contracts; other rows start with an empty summary
 store to retain their original standalone-analysis oracle.
+
+Run the four mode/RAII fixtures against persisted summaries:
+
+```powershell
+.\examples\rwlock_annotation_detection\run_examples.ps1 -SummaryOnly
+```
+
+This mode seeds provider summaries, recompiles each consumer, and fails if MIRAI enters a provider
+`read`, `write`, release, or guard `Drop` body.

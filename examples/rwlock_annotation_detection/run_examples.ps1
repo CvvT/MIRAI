@@ -1,6 +1,7 @@
 param(
     [string]$Filter,
-    [switch]$ShowOutput
+    [switch]$ShowOutput,
+    [switch]$SummaryOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -36,18 +37,33 @@ $expectations = [ordered]@{
     "seeded_writer_other_instance" = $null
     "struct_field_double_write"    = "write requires no live writer"
     "struct_fields_independent"    = $null
+    "two_readers_drop_both"        = $null
+    "two_readers_drop_one"         = "write requires no live readers"
     "unheld_release"               = "read release requires a live reader"
+    "write_drop_then_reacquire"    = $null
+    "write_then_read"              = "read requires no live writer"
 }
+
+$summaryOnlyBins = @(
+    "two_readers_drop_both",
+    "two_readers_drop_one",
+    "write_drop_then_reacquire",
+    "write_then_read"
+)
 
 $scriptRoot = $PSScriptRoot
 $repositoryRoot = (Resolve-Path (Join-Path $scriptRoot "..\..")).Path
 $manifestPath = Join-Path $scriptRoot "Cargo.toml"
 $miraiPath = Join-Path $repositoryRoot "target\debug\mirai.exe"
 $sweepTarget = Join-Path $repositoryRoot "target\rwlock-example-sweep"
+$summarySweepTarget = Join-Path $repositoryRoot "target\rwlock-summary-sweep"
 $originalLocation = Get-Location
 $originalPath = $env:PATH
 $originalWrapper = $env:RUSTC_WORKSPACE_WRAPPER
 $originalStartFresh = $env:MIRAI_START_FRESH
+$originalSharePersistentStore = $env:MIRAI_SHARE_PERSISTENT_STORE
+$originalFlags = $env:MIRAI_FLAGS
+$originalLog = $env:MIRAI_LOG
 $originalTargetDir = $env:CARGO_TARGET_DIR
 
 try {
@@ -68,10 +84,34 @@ try {
 
     $env:PATH = "$(Join-Path $sysroot "bin");$originalPath"
     $env:RUSTC_WORKSPACE_WRAPPER = (Resolve-Path $miraiPath).Path
-    $env:CARGO_TARGET_DIR = $sweepTarget
 
-    if (Test-Path $sweepTarget) {
-        Remove-Item -Recurse -Force $sweepTarget
+    if ($SummaryOnly) {
+        $env:CARGO_TARGET_DIR = $summarySweepTarget
+        $env:MIRAI_SHARE_PERSISTENT_STORE = "true"
+        $env:MIRAI_START_FRESH = "true"
+        $env:MIRAI_FLAGS = "--print_summaries"
+        $env:MIRAI_LOG = $null
+        if (Test-Path $summarySweepTarget) {
+            Remove-Item -Recurse -Force $summarySweepTarget
+        }
+        $providerOutput = @(
+            & cargo check -q --locked --manifest-path $manifestPath --lib 2>&1
+        )
+        if ($LASTEXITCODE -ne 0) {
+            $providerOutput | ForEach-Object { Write-Host $_ }
+            throw "Failed to seed provider summaries (exit $LASTEXITCODE)."
+        }
+        $env:MIRAI_START_FRESH = $null
+        $env:MIRAI_FLAGS = $null
+        & cargo check -q --locked --manifest-path $manifestPath --lib
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to restore provider artifacts (exit $LASTEXITCODE)."
+        }
+    } else {
+        $env:CARGO_TARGET_DIR = $sweepTarget
+        if (Test-Path $sweepTarget) {
+            Remove-Item -Recurse -Force $sweepTarget
+        }
     }
 
     $bins = @($expectations.Keys)
@@ -81,12 +121,22 @@ try {
             exit 2
         }
         $bins = @($Filter)
+    } elseif ($SummaryOnly) {
+        $bins = $summaryOnlyBins
+    }
+    if ($SummaryOnly -and @($bins | Where-Object { $_ -notin $summaryOnlyBins }).Count -gt 0) {
+        Write-Error "-SummaryOnly supports: $($summaryOnlyBins -join ', ')"
+        exit 2
     }
 
     $cargoPath = (Get-Command cargo -CommandType Application | Select-Object -First 1).Source
     $passed = 0
     foreach ($bin in $bins) {
-        if ($bin -like "arc_*" -or $bin -like "rc_*") {
+        if ($SummaryOnly) {
+            $env:MIRAI_START_FRESH = $null
+            $env:MIRAI_SHARE_PERSISTENT_STORE = "true"
+            $env:MIRAI_LOG = "debug"
+        } elseif ($bin -like "arc_*" -or $bin -like "rc_*") {
             $env:MIRAI_START_FRESH = $null
         } else {
             $env:MIRAI_START_FRESH = "true"
@@ -130,6 +180,14 @@ try {
                 $matchingDiagnostics.Count -eq 1
             $expectedText = $expected
         }
+        $providerBodyEntries = @(
+            $output | Where-Object {
+                $_ -match "entered body of .*rwlock_annotation_detection.*::(read|write|release_read|drop)"
+            }
+        )
+        if ($SummaryOnly) {
+            $matches = $matches -and $providerBodyEntries.Count -eq 0
+        }
 
         $actualText = if ($miraiDiagnostics.Count -eq 0) {
             "silent"
@@ -137,6 +195,9 @@ try {
             $miraiDiagnostics[0] -replace "^warning: \[MIRAI\] ", ""
         } else {
             "$($miraiDiagnostics.Count) MIRAI diagnostics"
+        }
+        if ($SummaryOnly) {
+            $actualText += "; provider body entries: $($providerBodyEntries.Count)"
         }
 
         if ($ShowOutput) {
@@ -175,6 +236,9 @@ try {
     $env:PATH = $originalPath
     $env:RUSTC_WORKSPACE_WRAPPER = $originalWrapper
     $env:MIRAI_START_FRESH = $originalStartFresh
+    $env:MIRAI_SHARE_PERSISTENT_STORE = $originalSharePersistentStore
+    $env:MIRAI_FLAGS = $originalFlags
+    $env:MIRAI_LOG = $originalLog
     $env:CARGO_TARGET_DIR = $originalTargetDir
     Set-Location $originalLocation
 }

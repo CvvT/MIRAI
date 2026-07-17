@@ -7,7 +7,7 @@ fn main() {
     let a = ModeledRwLock::new(());
     let b = ModeledRwLock::new(());
 
-    set_model_field!(&a, writer, 1usize);
+    set_model_field!(&a, write_held, 1usize);
     let b_reader = b.read();
     std::hint::black_box((&a, &b_reader));
 }
