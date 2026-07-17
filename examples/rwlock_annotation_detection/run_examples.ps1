@@ -74,6 +74,7 @@ $originalSharePersistentStore = $env:MIRAI_SHARE_PERSISTENT_STORE
 $originalFlags = $env:MIRAI_FLAGS
 $originalLog = $env:MIRAI_LOG
 $originalTargetDir = $env:CARGO_TARGET_DIR
+$originalBuildJobs = $env:CARGO_BUILD_JOBS
 
 try {
     Set-Location $repositoryRoot
@@ -93,6 +94,8 @@ try {
 
     $env:PATH = "$(Join-Path $sysroot "bin");$originalPath"
     $env:RUSTC_WORKSPACE_WRAPPER = (Resolve-Path $miraiPath).Path
+    # MIRAI_START_FRESH recreates the shared summary directory, so wrapped rustc jobs must serialize.
+    $env:CARGO_BUILD_JOBS = "1"
 
     if ($SummaryOnly) {
         $env:CARGO_TARGET_DIR = $summarySweepTarget
@@ -270,5 +273,6 @@ try {
     $env:MIRAI_FLAGS = $originalFlags
     $env:MIRAI_LOG = $originalLog
     $env:CARGO_TARGET_DIR = $originalTargetDir
+    $env:CARGO_BUILD_JOBS = $originalBuildJobs
     Set-Location $originalLocation
 }
