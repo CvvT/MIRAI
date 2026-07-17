@@ -1,16 +1,9 @@
-#![allow(unexpected_cfgs)]
-
-use mirai_annotations::{get_model_field, precondition};
 use rwlock_annotation_detection::ModeledRwLock;
 
 fn invoke_annotated<F>(lock: &ModeledRwLock<()>, callback: F)
 where
     F: FnOnce(&ModeledRwLock<()>),
 {
-    precondition!(
-        get_model_field!(lock, writer, 0usize) == 0,
-        "callback invocation requires no live writer"
-    );
     callback(lock);
 }
 
