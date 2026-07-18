@@ -134,6 +134,7 @@ $originalFlags = $env:MIRAI_FLAGS
 $originalLog = $env:MIRAI_LOG
 $originalTargetDir = $env:CARGO_TARGET_DIR
 $originalBuildJobs = $env:CARGO_BUILD_JOBS
+$originalIncremental = $env:CARGO_INCREMENTAL
 
 try {
     Set-Location $repositoryRoot
@@ -155,6 +156,8 @@ try {
     $env:RUSTC_WORKSPACE_WRAPPER = (Resolve-Path $miraiPath).Path
     # MIRAI_START_FRESH recreates the shared summary directory, so wrapped rustc jobs must serialize.
     $env:CARGO_BUILD_JOBS = "1"
+    # Each sweep starts from an empty target; incremental state only adds Windows cleanup races.
+    $env:CARGO_INCREMENTAL = "0"
 
     if ($SummaryOnly) {
         $env:CARGO_TARGET_DIR = $summarySweepTarget
@@ -165,6 +168,11 @@ try {
         if (Test-Path $summarySweepTarget) {
             Remove-Item -Recurse -Force $summarySweepTarget
         }
+        New-Item -ItemType Directory -Path $summarySweepTarget -Force | Out-Null
+        [System.IO.File]::WriteAllText(
+            (Join-Path $summarySweepTarget "CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55`n# This file is a cache directory tag created by cargo.`n# For information about cache directory tags see https://bford.info/cachedir/`n"
+        )
         $providerOutput = @(
             & cargo check -q --locked --manifest-path $manifestPath --lib 2>&1
         )
@@ -347,5 +355,6 @@ try {
     $env:MIRAI_LOG = $originalLog
     $env:CARGO_TARGET_DIR = $originalTargetDir
     $env:CARGO_BUILD_JOBS = $originalBuildJobs
+    $env:CARGO_INCREMENTAL = $originalIncremental
     Set-Location $originalLocation
 }
