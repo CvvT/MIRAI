@@ -344,8 +344,16 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             // can be included in the type specific key that is used to look up non-generic
             // predefined summaries.
 
-            let func_args = self.get_function_constant_signature(self.function_constant_args);
             let tcx = self.block_visitor.bv.tcx;
+            let has_callable_argument = self.actual_argument_types.iter().any(|ty| {
+                let ty = self.type_visitor().get_dereferenced_type(*ty);
+                utils::contains_function(ty, tcx)
+            });
+            let func_args = if has_callable_argument {
+                self.get_function_constant_signature(self.function_constant_args)
+            } else {
+                None
+            };
             let callee_def_id = func_ref.def_id.unwrap_or(self.callee_def_id);
             self.block_visitor.bv.cv.call_graph.add_call_site(
                 self.block_visitor.bv.current_span,
