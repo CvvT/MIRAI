@@ -39,7 +39,7 @@ use crate::options::DiagLevel;
 use crate::path::{Path, PathEnum, PathSelector};
 use crate::path::{PathOrFunction, PathRefinement, PathRoot};
 use crate::smt_solver::{SmtResult, SmtSolver};
-use crate::summaries::Precondition;
+use crate::summaries::{CallbackInvocation, Precondition};
 use crate::tag_domain::Tag;
 use crate::type_visitor::TypeVisitor;
 use crate::utils;
@@ -605,6 +605,46 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
         );
         trace!("env {:?}", self.bv.current_environment);
         let func_to_call = self.visit_operand(func);
+        let func_path = self
+            .get_operand_path(func)
+            .canonicalize(&self.bv.current_environment);
+        let func_ty = self.get_operand_rustc_type(func);
+        let dereferenced_func_ty = self.type_visitor().get_dereferenced_type(func_ty);
+        if matches!(dereferenced_func_ty.kind(), TyKind::FnPtr(..))
+            && matches!(&func_path.value, PathEnum::Parameter { .. })
+        {
+            // Bare function pointers have no Fn* call shim, so defer the parameter call to replay.
+            let callback_args: Vec<(Rc<Path>, Rc<AbstractValue>)> = args
+                .iter()
+                .map(|arg| {
+                    (
+                        self.get_operand_path(&arg.node),
+                        self.visit_operand(&arg.node),
+                    )
+                })
+                .collect();
+            if self.record_callback_invocation(func_path, func_ty, &callback_args) {
+                let destination_path = self.visit_rh_place(&destination);
+                let destination_type = self
+                    .type_visitor()
+                    .get_place_type(&destination, self.bv.current_span);
+                let unknown_result =
+                    AbstractValue::make_typed_unknown(destination_type, destination_path.clone());
+                self.bv.update_value_at(destination_path, unknown_result);
+                if let mir::UnwindAction::Cleanup(target) = unwind {
+                    self.bv
+                        .current_environment
+                        .exit_conditions
+                        .insert_mut(target, self.bv.current_environment.entry_condition.clone());
+                }
+                if let Some(target) = target {
+                    self.visit_goto(target);
+                } else {
+                    self.visit_return();
+                }
+                return;
+            }
+        }
         let func_ref = self.get_func_ref(&func_to_call);
         let func_ref_to_call = if let Some(fr) = func_ref {
             fr
@@ -759,6 +799,67 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
         } else {
             call_visitor.transfer_and_refine_into_current_environment(&function_summary);
         }
+    }
+
+    pub fn record_callback_invocation(
+        &mut self,
+        callee_path: Rc<Path>,
+        callee_ty: Ty<'tcx>,
+        actual_args: &[(Rc<Path>, Rc<AbstractValue>)],
+    ) -> bool {
+        if !self.bv.check_for_errors {
+            return false;
+        }
+        let callee_path = callee_path.canonicalize(&self.bv.current_environment);
+        let callee_parameter = if callee_path.is_rooted_by_parameter() {
+            Some(callee_path)
+        } else {
+            let callee_ty = self.type_visitor().get_dereferenced_type(callee_ty);
+            (1..=self.bv.mir.arg_count).find_map(|ordinal| {
+                let parameter_ty = self.bv.mir.local_decls[mir::Local::from(ordinal)].ty;
+                let parameter_ty = self
+                    .type_visitor()
+                    .specialize_type(parameter_ty, &self.type_visitor().generic_argument_map);
+                let parameter_ty = self.type_visitor().get_dereferenced_type(parameter_ty);
+                (parameter_ty == callee_ty
+                    || matches!(
+                        (parameter_ty.kind(), callee_ty.kind()),
+                        (TyKind::FnPtr(..), TyKind::FnDef(..))
+                    ))
+                .then(|| Path::new_parameter(ordinal))
+            })
+        };
+        let Some(callee_parameter) = callee_parameter else {
+            return false;
+        };
+        let pre_state = self
+            .bv
+            .current_environment
+            .value_map
+            .iter()
+            .filter(|(path, _)| {
+                path.is_rooted_by_parameter()
+                    && matches!(
+                        path.value,
+                        PathEnum::QualifiedPath { ref selector, .. }
+                            if matches!(**selector, PathSelector::ModelField(_))
+                    )
+            })
+            .map(|(path, value)| (path.clone(), value.clone()))
+            .collect();
+        self.bv.callback_invocations.push(CallbackInvocation {
+            callee: callee_parameter,
+            arguments: actual_args.to_vec(),
+            pre_state,
+            guard: self
+                .bv
+                .current_environment
+                .entry_condition
+                .extract_promotable_conjuncts(false)
+                .filter(|guard| !guard.expression.contains_local_variable(false))
+                .unwrap_or_else(|| Rc::new(abstract_value::TRUE)),
+        });
+        true
     }
 
     #[logfn_inputs(TRACE)]

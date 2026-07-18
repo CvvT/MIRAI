@@ -28,7 +28,7 @@ use crate::k_limits;
 use crate::known_names::KnownNames;
 use crate::options::DiagLevel;
 use crate::path::{Path, PathEnum, PathRefinement, PathRoot, PathSelector};
-use crate::summaries::{CallbackInvocation, Precondition, Summary};
+use crate::summaries::{Precondition, Summary};
 use crate::tag_domain::Tag;
 use crate::type_visitor::TypeVisitor;
 use crate::{abstract_value, utils};
@@ -1370,66 +1370,10 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 .block_visitor
                 .get_function_constant_args(&actual_args, &actual_argument_types);
 
-            let mut recorded_callback_invocation = false;
-            if self.block_visitor.bv.check_for_errors {
-                let callee_path = Path::get_as_path(callee.clone())
-                    .canonicalize(&self.block_visitor.bv.current_environment);
-                let callee_parameter = if callee_path.is_rooted_by_parameter() {
-                    Some(callee_path)
-                } else {
-                    let callee_ty = self.type_visitor().get_dereferenced_type(callee_ty);
-                    (1..=self.block_visitor.bv.mir.arg_count).find_map(|ordinal| {
-                        let parameter_ty =
-                            self.block_visitor.bv.mir.local_decls[mir::Local::from(ordinal)].ty;
-                        let parameter_ty = self.type_visitor().specialize_type(
-                            parameter_ty,
-                            &self.type_visitor().generic_argument_map,
-                        );
-                        let parameter_ty = self.type_visitor().get_dereferenced_type(parameter_ty);
-                        (parameter_ty == callee_ty
-                            || matches!(
-                                (parameter_ty.kind(), callee_ty.kind()),
-                                (TyKind::FnPtr(..), TyKind::FnDef(..))
-                            ))
-                        .then(|| Path::new_parameter(ordinal))
-                    })
-                };
-                if let Some(callee_parameter) = callee_parameter {
-                    let pre_state = self
-                        .block_visitor
-                        .bv
-                        .current_environment
-                        .value_map
-                        .iter()
-                        .filter(|(path, _)| {
-                            path.is_rooted_by_parameter()
-                                && matches!(
-                                    path.value,
-                                    PathEnum::QualifiedPath { ref selector, .. }
-                                        if matches!(**selector, PathSelector::ModelField(_))
-                                )
-                        })
-                        .map(|(path, value)| (path.clone(), value.clone()))
-                        .collect();
-                    self.block_visitor
-                        .bv
-                        .callback_invocations
-                        .push(CallbackInvocation {
-                            callee: callee_parameter,
-                            arguments: actual_args.clone(),
-                            pre_state,
-                            guard: self
-                                .block_visitor
-                                .bv
-                                .current_environment
-                                .entry_condition
-                                .extract_promotable_conjuncts(false)
-                                .filter(|guard| !guard.expression.contains_local_variable(false))
-                                .unwrap_or_else(|| Rc::new(abstract_value::TRUE)),
-                        });
-                    recorded_callback_invocation = true;
-                }
-            }
+            let callee_path = Path::get_as_path(callee.clone());
+            let recorded_callback_invocation =
+                self.block_visitor
+                    .record_callback_invocation(callee_path, callee_ty, &actual_args);
 
             // Get the generic argument map for the indirectly called function
             let generic_arguments = match callee_ty.kind() {

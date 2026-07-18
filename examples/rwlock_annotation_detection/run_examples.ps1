@@ -24,7 +24,7 @@ $expectations = [ordered]@{
     "callback_conditional_true"    = "conditional callback requires no live writer"
     "callback_fnptr"               = "write requires no live writer"
     "callback_fnptr_specialization_clean" = $null
-    "callback_fnptr_specialization_violation" = $null
+    "callback_fnptr_specialization_violation" = "read requires no live writer"
     "callback_generic_fnonce_clean" = $null
     "callback_generic_fnonce_violation" = "read requires no live writer"
     "callback_hof_annotated"       = "write requires no live writer"
@@ -61,15 +61,12 @@ $expectations = [ordered]@{
     "write_then_read"              = "read requires no live writer"
 }
 
-$summaryOnlyExpectations = @{
-    "callback_fnptr_specialization_violation" = "read requires no live writer"
-}
-
 $summaryOnlyBins = @(
     "callback_clean",
     "callback_conditional_false",
     "callback_conditional_true",
     "callback_fnptr_specialization_clean",
+    "callback_fnptr_specialization_violation",
     "callback_generic_fnonce_clean",
     "callback_generic_fnonce_violation",
     "callback_hof_annotated",
@@ -87,9 +84,11 @@ $summaryOnlyBins = @(
     "write_then_read"
 )
 
-$knownLimitationBins = @(
+$resolvedKnownLimitationBins = @(
     "callback_fnptr_specialization_violation"
 )
+
+$knownLimitationBins = @()
 
 $summaryOnlyOnlyBins = @(
     "callback_loop_violation",
@@ -217,11 +216,11 @@ try {
         }
         $bins = @($Filter)
     } elseif ($KnownLimitations) {
-        $bins = $knownLimitationBins
+        $bins = $knownLimitationBins + $resolvedKnownLimitationBins
     } elseif ($SummaryOnly) {
         $bins = $summaryOnlyBins
     }
-    $supportedSummaryBins = $summaryOnlyBins + $knownLimitationBins
+    $supportedSummaryBins = $summaryOnlyBins + $knownLimitationBins + $resolvedKnownLimitationBins
     if ($SummaryOnly -and @($bins | Where-Object { $_ -notin $supportedSummaryBins }).Count -gt 0) {
         Write-Error "-SummaryOnly supports: $($supportedSummaryBins -join ', ')"
         exit 2
@@ -265,11 +264,7 @@ try {
         $exitCode = $process.ExitCode
         $process.Dispose()
         $miraiDiagnostics = @($output | Where-Object { $_ -match "\[MIRAI\]" })
-        $expected = if ($SummaryOnly -and $summaryOnlyExpectations.ContainsKey($bin)) {
-            $summaryOnlyExpectations[$bin]
-        } else {
-            $expectations[$bin]
-        }
+        $expected = $expectations[$bin]
 
         if ($null -eq $expected) {
             $passedExpectation = $exitCode -eq 0 -and $miraiDiagnostics.Count -eq 0

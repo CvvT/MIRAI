@@ -44,6 +44,7 @@ The fixtures are independent binaries:
 | `callback_loop_clean` | silent; asymmetric fixed-point summary retains a clean invocation |
 | `callback_loop_violation` | summary-only `read requires no live writer`; union-retained asymmetric invocation |
 | `callback_fnptr_specialization_clean` | silent; bare function-pointer control |
+| `callback_fnptr_specialization_violation` | `read requires no live writer`; same-typed `clean`/`read` pointers stay isolated |
 | `nested_field_double_write` | `write requires no live writer` |
 | `nested_field_independent` | no MIRAI diagnostics |
 | `nested_deep_double_write` | `write requires no live writer` |
@@ -99,12 +100,11 @@ Run the mode/RAII and higher-order fixtures against persisted summaries:
 This mode seeds provider summaries, recompiles each consumer, and fails if MIRAI enters a protected
 provider, higher-order helper, or callback body.
 
-One control intentionally remains a visible limitation outside LiteBox's `impl FnOnce` topology:
+Direct bare function-pointer calls are recorded from their ordinary indirect MIR `Call`, while
+concrete callback identity remains specialized at each consumer call site. The clean/violation pair
+uses same-typed function pointers to ensure their obligations do not contaminate each other.
 
-- Direct bare function-pointer calls bypass the `Fn*::call*` producer hook, so their callback
-  invocation is not recorded.
-
-Run the probe explicitly; the command exits nonzero until this limitation is implemented:
+Run the former limitation probe explicitly as a focused regression:
 
 ```powershell
 .\examples\rwlock_annotation_detection\run_examples.ps1 -KnownLimitations
