@@ -1,21 +1,23 @@
 use rwlock_annotation_detection::ModeledRwLock;
 
-fn invoke_in_loop<F>(lock: &ModeledRwLock<()>, callback: F)
+fn invoke_at_inner_depth<F>(depth: usize, lock: &ModeledRwLock<()>, callback: F)
 where
-    F: Fn(&ModeledRwLock<()>),
+    F: Fn(&ModeledRwLock<()>) + Copy,
 {
-    for _ in 0..2 {
-        callback(lock);
+    if depth == 0 {
+        return;
     }
+    if depth == 1 {
+        let writer = lock.write();
+        callback(lock);
+        drop(writer);
+    }
+    invoke_at_inner_depth(depth - 1, lock, callback);
 }
 
 fn main() {
-    let first = ModeledRwLock::new(());
-    invoke_in_loop(&first, |lock| {
+    let lock = ModeledRwLock::new(());
+    invoke_at_inner_depth(1, &lock, |lock| {
         std::hint::black_box(lock);
-    });
-    let second = ModeledRwLock::new(());
-    invoke_in_loop(&second, |lock| {
-        std::hint::black_box((lock, 1usize));
     });
 }

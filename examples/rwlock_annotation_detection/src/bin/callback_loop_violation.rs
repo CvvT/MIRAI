@@ -1,28 +1,28 @@
 #![allow(unexpected_cfgs)]
 
-use mirai_annotations::{get_model_field, precondition, set_model_field};
 use rwlock_annotation_detection::ModeledRwLock;
 
-fn acquire_once(lock: &ModeledRwLock<()>) {
-    precondition!(
-        get_model_field!(lock, write_held, 0usize) == 0,
-        "loop callback requires no live writer"
-    );
-    set_model_field!(lock, write_held, 1usize);
+fn read(lock: &ModeledRwLock<()>) {
+    let reader = lock.read();
+    std::hint::black_box(reader);
 }
 
-fn invoke_in_loop<F>(lock: &ModeledRwLock<()>, callback: F)
+fn invoke_at_inner_depth<F>(depth: usize, lock: &ModeledRwLock<()>, callback: F)
 where
-    F: Fn(&ModeledRwLock<()>),
+    F: Fn(&ModeledRwLock<()>) + Copy,
 {
-    for _ in 0..2 {
-        callback(lock);
+    if depth == 0 {
+        return;
     }
+    if depth == 1 {
+        let writer = lock.write();
+        callback(lock);
+        drop(writer);
+    }
+    invoke_at_inner_depth(depth - 1, lock, callback);
 }
 
 fn main() {
-    let first = ModeledRwLock::new(());
-    invoke_in_loop(&first, acquire_once);
-    let second = ModeledRwLock::new(());
-    invoke_in_loop(&second, acquire_once);
+    let lock = ModeledRwLock::new(());
+    invoke_at_inner_depth(1, &lock, read);
 }

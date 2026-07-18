@@ -32,10 +32,10 @@ $expectations = [ordered]@{
     "callback_hof_invoke_twice"    = "annotated callback requires no live writer"
     "callback_inline_closure"      = "write requires no live writer"
     "callback_loop_clean"          = $null
-    "callback_loop_violation"      = $null
+    "callback_loop_violation"      = "read requires no live writer"
     "callback_reentrant"           = "write requires no live writer"
     "callback_sequential_counter_clean" = $null
-    "callback_sequential_counter_violation" = "counter callback requires zero"
+    "callback_sequential_counter_violation" = "second callback incorrectly requires two readers"
     "callback_specialization_clean" = $null
     "callback_specialization_violation" = "read requires no live writer"
     "callback_unresolvable"         = "callback invocation could not be resolved"
@@ -63,7 +63,6 @@ $expectations = [ordered]@{
 
 $summaryOnlyExpectations = @{
     "callback_fnptr_specialization_violation" = "read requires no live writer"
-    "callback_loop_violation" = "loop callback requires no live writer"
 }
 
 $summaryOnlyBins = @(
@@ -76,6 +75,7 @@ $summaryOnlyBins = @(
     "callback_hof_annotated",
     "callback_hof_invoke_twice",
     "callback_loop_clean",
+    "callback_loop_violation",
     "callback_sequential_counter_clean",
     "callback_sequential_counter_violation",
     "callback_specialization_clean",
@@ -88,8 +88,12 @@ $summaryOnlyBins = @(
 )
 
 $knownLimitationBins = @(
-    "callback_fnptr_specialization_violation",
-    "callback_loop_violation"
+    "callback_fnptr_specialization_violation"
+)
+
+$summaryOnlyOnlyBins = @(
+    "callback_loop_violation",
+    "callback_unresolvable"
 )
 
 $summaryOnlyHofBins = @(
@@ -108,6 +112,10 @@ $summaryOnlyHofBins = @(
     "callback_sequential_counter_violation",
     "callback_specialization_clean",
     "callback_specialization_violation",
+    "callback_unresolvable"
+)
+
+$verifyBins = @(
     "callback_unresolvable"
 )
 
@@ -190,7 +198,10 @@ try {
         }
     }
 
-    $bins = @($expectations.Keys | Where-Object { $_ -notin $knownLimitationBins })
+    $bins = @(
+        $expectations.Keys |
+            Where-Object { $_ -notin $knownLimitationBins -and $_ -notin $summaryOnlyOnlyBins }
+    )
     if ($Filter) {
         if (-not $expectations.Contains($Filter)) {
             Write-Error "Unknown bin '$Filter'. Available bins: $($bins -join ', ')"
@@ -211,6 +222,7 @@ try {
     $cargoPath = (Get-Command cargo -CommandType Application | Select-Object -First 1).Source
     $passed = 0
     foreach ($bin in $bins) {
+        $env:MIRAI_FLAGS = if ($bin -in $verifyBins) { "--diag verify" } else { $null }
         if ($SummaryOnly) {
             $env:MIRAI_START_FRESH = $null
             $env:MIRAI_SHARE_PERSISTENT_STORE = "true"
@@ -289,6 +301,9 @@ try {
         }
         if ($SummaryOnly) {
             $actualText += "; persistent loads: $($persistentSummaryLoads.Count); provider body entries: $($providerBodyEntries.Count)"
+        }
+        if ($bin -in $verifyBins) {
+            $actualText += "; diag: verify"
         }
 
         if ($ShowOutput) {

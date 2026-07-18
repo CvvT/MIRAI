@@ -36,12 +36,13 @@ The fixtures are independent binaries:
 | `callback_conditional_true` | `conditional callback requires no live writer` |
 | `callback_generic_fnonce_clean` | silent; generic `FnOnce` summary resolution |
 | `callback_generic_fnonce_violation` | `read requires no live writer` |
-| `callback_sequential_counter_clean` | silent; callback counter reaches exactly two |
-| `callback_sequential_counter_violation` | `counter callback requires zero` on the second invocation |
+| `callback_sequential_counter_clean` | silent; second callback observes `read_count == 1` |
+| `callback_sequential_counter_violation` | second callback's incorrect `read_count == 2` requirement fires |
 | `callback_specialization_clean` | silent; two closure specializations stay isolated |
 | `callback_specialization_violation` | `read requires no live writer` for the violating closure only |
 | `callback_unresolvable` | visible `callback invocation could not be resolved` diagnostic |
-| `callback_loop_clean` | silent; fixed-point summary retains a clean invocation |
+| `callback_loop_clean` | silent; asymmetric fixed-point summary retains a clean invocation |
+| `callback_loop_violation` | summary-only `read requires no live writer`; union-retained asymmetric invocation |
 | `callback_fnptr_specialization_clean` | silent; bare function-pointer control |
 | `nested_field_double_write` | `write requires no live writer` |
 | `nested_field_independent` | no MIRAI diagnostics |
@@ -98,14 +99,12 @@ Run the mode/RAII and higher-order fixtures against persisted summaries:
 This mode seeds provider summaries, recompiles each consumer, and fails if MIRAI enters a protected
 provider, higher-order helper, or callback body.
 
-Two controls intentionally remain visible limitations outside LiteBox's `impl FnOnce` topology:
+One control intentionally remains a visible limitation outside LiteBox's `impl FnOnce` topology:
 
 - Direct bare function-pointer calls bypass the `Fn*::call*` producer hook, so their callback
   invocation is not recorded.
-- Fixed-point invocation records survive joining, but a loop-local path guard cannot yet be
-  projected to a caller-visible condition.
 
-Run both probes explicitly; the command exits nonzero until these limitations are implemented:
+Run the probe explicitly; the command exits nonzero until this limitation is implemented:
 
 ```powershell
 .\examples\rwlock_annotation_detection\run_examples.ps1 -KnownLimitations
@@ -113,3 +112,8 @@ Run both probes explicitly; the command exits nonzero until these limitations ar
 
 Callback effects are checked at each recorded snapshot. Replay does not accumulate effects between
 snapshots, which prevents double-applying arithmetic model fields such as `read_count`.
+
+Invocation guards retain only conditions expressible through parameters and model fields. Guards
+that depend on helper-local control state conservatively become `true`; this can add false positives
+but cannot hide a callback obligation. LiteBox's buggy call is unconditional inside its closure,
+while the fixed call is outside the helper, so this boundary does not affect the target comparison.

@@ -3,25 +3,28 @@
 use mirai_annotations::{get_model_field, precondition, set_model_field};
 use rwlock_annotation_detection::ModeledRwLock;
 
-fn increment(lock: &ModeledRwLock<()>) {
-    let count = get_model_field!(lock, callback_count, 0usize);
-    precondition!(count < 2, "callback count must stay below two");
-    set_model_field!(lock, callback_count, count + 1);
+fn increment_read_count(lock: &ModeledRwLock<()>) {
+    let read_count = get_model_field!(lock, read_count, 0usize);
+    set_model_field!(lock, read_count, read_count + 1);
 }
 
-fn invoke_twice<F>(lock: &ModeledRwLock<()>, callback: F)
+fn require_one_reader(lock: &ModeledRwLock<()>) {
+    precondition!(
+        get_model_field!(lock, read_count, 0usize) == 1,
+        "second callback requires one reader"
+    );
+}
+
+fn invoke_in_order<F, G>(lock: &ModeledRwLock<()>, first: F, second: G)
 where
     F: Fn(&ModeledRwLock<()>),
+    G: Fn(&ModeledRwLock<()>),
 {
-    callback(lock);
-    callback(lock);
+    first(lock);
+    second(lock);
 }
 
 fn main() {
     let lock = ModeledRwLock::new(());
-    invoke_twice(&lock, increment);
-    precondition!(
-        get_model_field!(&lock, callback_count, 0usize) == 2,
-        "callback count must be exactly two"
-    );
+    invoke_in_order(&lock, increment_read_count, require_one_reader);
 }
