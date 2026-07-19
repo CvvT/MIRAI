@@ -5781,6 +5781,32 @@ impl AbstractValueTrait for Rc<AbstractValue> {
             Expression::InitialParameterValue { path, .. }
             | Expression::Reference(path)
             | Expression::Variable { path, .. } => path.get_path_root(),
+            Expression::Cast {
+                operand,
+                target_type: ExpressionType::ThinPointer,
+            }
+            | Expression::Transmute {
+                operand,
+                target_type: ExpressionType::ThinPointer,
+            } => {
+                // Integer-to-pointer transmute truncates via unsigned_modulo; ignore only that mask.
+                let provenance_operand =
+                    if let Expression::Rem { left, right } = &operand.expression {
+                        let pointer_modulus = 1u128 << ExpressionType::ThinPointer.bit_length();
+                        if matches!(
+                            right.expression,
+                            Expression::CompileTimeConstant(ConstantDomain::U128(value))
+                                if value == pointer_modulus
+                        ) {
+                            left
+                        } else {
+                            operand
+                        }
+                    } else {
+                        operand
+                    };
+                provenance_operand.get_path_root(default)
+            }
             _ => default,
         }
     }
