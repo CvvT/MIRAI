@@ -424,16 +424,11 @@ impl PathRoot for Rc<Path> {
                 {
                     return *path == *root || path.is_rooted_by(root);
                 }
-                if matches!(
-                    value.expression,
-                    Expression::Cast {
-                        target_type: ExpressionType::ThinPointer,
-                        ..
-                    } | Expression::Transmute {
-                        target_type: ExpressionType::ThinPointer,
-                        ..
-                    }
-                ) {
+                if let Expression::Transmute {
+                    target_type: ExpressionType::ThinPointer,
+                    ..
+                } = &value.expression
+                {
                     let value_root = value.get_path_root(self);
                     if value_root != self {
                         return *value_root == *root || value_root.is_rooted_by(root);
