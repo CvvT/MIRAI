@@ -4893,9 +4893,9 @@ impl AbstractValueTrait for Rc<AbstractValue> {
     #[logfn_inputs(TRACE)]
     fn remainder(&self, other: Rc<AbstractValue>) -> Rc<AbstractValue> {
         // [(x % y) % y] -> x % y
-        if let Expression::Rem { left: x, right: y } = &self.expression {
+        if let Expression::Rem { right: y, .. } = &self.expression {
             if y.eq(&other) {
-                return x.clone();
+                return self.clone();
             }
         }
 
@@ -5786,28 +5786,21 @@ impl AbstractValueTrait for Rc<AbstractValue> {
                 target_type: ExpressionType::ThinPointer,
             } => {
                 // Integer-to-pointer transmute truncates via unsigned_modulo; unwrap only that mask.
-                let provenance_operand =
-                    if let Expression::Rem { left, right } = &operand.expression {
-                        let pointer_modulus = 1u128 << ExpressionType::ThinPointer.bit_length();
-                        if matches!(
-                            right.expression,
-                            Expression::CompileTimeConstant(ConstantDomain::U128(value))
-                                if value == pointer_modulus
-                        ) {
-                            left
-                        } else {
-                            operand
-                        }
-                    } else {
-                        operand
-                    };
-                if let Expression::InitialParameterValue { path, .. } =
-                    &provenance_operand.expression
-                {
-                    path.get_path_root()
-                } else {
-                    default
+                let Expression::Rem { left, right } = &operand.expression else {
+                    return default;
+                };
+                let pointer_modulus = 1u128 << ExpressionType::ThinPointer.bit_length();
+                if !matches!(
+                    right.expression,
+                    Expression::CompileTimeConstant(ConstantDomain::U128(value))
+                        if value == pointer_modulus
+                ) {
+                    return default;
                 }
+                let Expression::InitialParameterValue { path, .. } = &left.expression else {
+                    return default;
+                };
+                path.get_path_root()
             }
             _ => default,
         }
@@ -6921,6 +6914,18 @@ impl AbstractValueTrait for Rc<AbstractValue> {
         let expression_type = self.expression.infer_type();
         if expression_type == target_type {
             self.clone()
+        } else if target_type == ExpressionType::ThinPointer
+            && matches!(self.expression, Expression::InitialParameterValue { .. })
+        {
+            let pointer_modulus =
+                Rc::new(ConstantDomain::U128(1u128 << target_type.bit_length()).into());
+            let truncated = self.remainder(pointer_modulus);
+            AbstractValue::make_typed_unary(truncated, target_type, |operand, target_type| {
+                Expression::Transmute {
+                    operand,
+                    target_type,
+                }
+            })
         } else if target_type.is_integer()
             || target_type == ExpressionType::ThinPointer && expression_type.is_integer()
         {
@@ -7194,6 +7199,21 @@ impl AbstractValueTrait for Rc<AbstractValue> {
 mod tests {
     use super::*;
 
+    fn pointer_transmute(operand: Rc<AbstractValue>) -> Rc<AbstractValue> {
+        AbstractValue::make_typed_unary(
+            operand,
+            ExpressionType::ThinPointer,
+            |operand, target_type| Expression::Transmute {
+                operand,
+                target_type,
+            },
+        )
+    }
+
+    fn masked_pointer_transmute(operand: Rc<AbstractValue>, modulus: u128) -> Rc<AbstractValue> {
+        pointer_transmute(operand.remainder(Rc::new(ConstantDomain::U128(modulus).into())))
+    }
+
     // Checks consistency of `Ord`, `PartialOrd`, `PartialEq` and `Eq` implementations for `AbstractValue`.
     #[test]
     fn eq_and_ord_consistency_check() {
@@ -7223,5 +7243,82 @@ mod tests {
             var_non_null.partial_cmp(&var_nullable),
             Some(Ordering::Equal)
         );
+    }
+
+    #[test]
+    fn masked_pointer_provenance_requires_initial_parameter_value() {
+        let parameter = Path::new_parameter(1);
+        let default = Path::new_computed(TOP.into());
+        let pointer_modulus = 1u128 << ExpressionType::ThinPointer.bit_length();
+        let initial_parameter =
+            AbstractValue::make_initial_parameter_value(ExpressionType::U128, parameter.clone());
+        let pointer_sized_initial =
+            AbstractValue::make_initial_parameter_value(ExpressionType::U64, parameter.clone());
+        let non_primitive_initial = AbstractValue::make_initial_parameter_value(
+            ExpressionType::NonPrimitive,
+            parameter.clone(),
+        );
+
+        let canonical_transmute = pointer_sized_initial.transmute(ExpressionType::ThinPointer);
+        assert!(matches!(
+            canonical_transmute.expression,
+            Expression::Transmute { ref operand, .. }
+                if matches!(operand.expression, Expression::Rem { .. })
+        ));
+        assert_eq!(canonical_transmute.get_path_root(&default), &parameter);
+        assert!(Path::new_computed(canonical_transmute).is_rooted_by(&parameter));
+
+        let canonical_non_primitive = non_primitive_initial.transmute(ExpressionType::ThinPointer);
+        assert!(matches!(
+            canonical_non_primitive.expression,
+            Expression::Transmute { ref operand, .. }
+                if matches!(operand.expression, Expression::Rem { .. })
+        ));
+        assert_eq!(canonical_non_primitive.get_path_root(&default), &parameter);
+        assert!(Path::new_computed(canonical_non_primitive).is_rooted_by(&parameter));
+
+        let masked_initial = masked_pointer_transmute(initial_parameter.clone(), pointer_modulus);
+        assert_eq!(masked_initial.get_path_root(&default), &parameter);
+        assert!(Path::new_computed(masked_initial).is_rooted_by(&parameter));
+
+        let modulus: Rc<AbstractValue> = Rc::new(ConstantDomain::U128(pointer_modulus).into());
+        let masked_value = initial_parameter.remainder(modulus.clone());
+        assert_eq!(masked_value.remainder(modulus), masked_value);
+
+        let unmasked_initial = pointer_transmute(initial_parameter.clone());
+        assert_eq!(unmasked_initial.get_path_root(&default), &default);
+        assert!(!Path::new_computed(unmasked_initial).is_rooted_by(&parameter));
+
+        let wrong_mask = masked_pointer_transmute(initial_parameter.clone(), pointer_modulus / 2);
+        assert_eq!(wrong_mask.get_path_root(&default), &default);
+        assert!(!Path::new_computed(wrong_mask).is_rooted_by(&parameter));
+
+        let cast_initial = AbstractValue::make_typed_unary(
+            initial_parameter,
+            ExpressionType::ThinPointer,
+            |operand, target_type| Expression::Cast {
+                operand,
+                target_type,
+            },
+        );
+        assert_eq!(cast_initial.get_path_root(&default), &default);
+        assert!(!Path::new_computed(cast_initial).is_rooted_by(&parameter));
+
+        let live_parameter =
+            AbstractValue::make_typed_unknown(ExpressionType::U128, parameter.clone());
+        let masked_live_parameter = masked_pointer_transmute(live_parameter, pointer_modulus);
+        assert_eq!(masked_live_parameter.get_path_root(&default), &default);
+        assert!(!Path::new_computed(masked_live_parameter).is_rooted_by(&parameter));
+
+        let reference = AbstractValue::make_reference(parameter.clone());
+        let masked_reference = masked_pointer_transmute(reference, pointer_modulus);
+        assert_eq!(masked_reference.get_path_root(&default), &default);
+        assert!(!Path::new_computed(masked_reference).is_rooted_by(&parameter));
+
+        let local = Path::new_local(2, 0);
+        let reassigned_local = AbstractValue::make_typed_unknown(ExpressionType::U128, local);
+        let masked_reassigned_local = masked_pointer_transmute(reassigned_local, pointer_modulus);
+        assert_eq!(masked_reassigned_local.get_path_root(&default), &default);
+        assert!(!Path::new_computed(masked_reassigned_local).is_rooted_by(&parameter));
     }
 }
