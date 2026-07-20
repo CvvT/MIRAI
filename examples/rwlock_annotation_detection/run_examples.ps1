@@ -19,6 +19,7 @@ $expectations = [ordered]@{
     "arc_instances_independent"    = $null
     "array_indices"                = $null
     "array_same_index"             = "write requires no live readers"
+    "callback_accessor_violation" = "read requires no live writer"
     "callback_clean"               = $null
     "callback_conditional_false"   = $null
     "callback_conditional_true"    = "conditional callback requires no live writer"
@@ -33,6 +34,8 @@ $expectations = [ordered]@{
     "callback_inline_closure"      = "write requires no live writer"
     "callback_loop_clean"          = $null
     "callback_loop_violation"      = "read requires no live writer"
+    "callback_nested_hof_clean"    = $null
+    "callback_nested_hof_violation" = "read requires no live writer"
     "callback_reentrant"           = "write requires no live writer"
     "callback_sequential_counter_clean" = $null
     "callback_sequential_counter_violation" = "second callback incorrectly requires two readers"
@@ -62,6 +65,9 @@ $expectations = [ordered]@{
 }
 
 $summaryOnlyBins = @(
+    "callback_accessor_violation",
+    "callback_nested_hof_clean",
+    "callback_nested_hof_violation",
     "callback_clean",
     "callback_conditional_false",
     "callback_conditional_true",
@@ -96,6 +102,8 @@ $summaryOnlyOnlyBins = @(
 )
 
 $summaryOnlyHofBins = @(
+    "callback_accessor_violation",
+    "callback_nested_hof_clean",
     "callback_clean",
     "callback_conditional_false",
     "callback_conditional_true",
@@ -107,6 +115,7 @@ $summaryOnlyHofBins = @(
     "callback_hof_invoke_twice",
     "callback_loop_clean",
     "callback_loop_violation",
+    "callback_nested_hof_violation",
     "callback_sequential_counter_clean",
     "callback_sequential_counter_violation",
     "callback_specialization_clean",
@@ -134,6 +143,59 @@ $originalLog = $env:MIRAI_LOG
 $originalTargetDir = $env:CARGO_TARGET_DIR
 $originalBuildJobs = $env:CARGO_BUILD_JOBS
 $originalIncremental = $env:CARGO_INCREMENTAL
+$cargoPath = (Get-Command cargo -CommandType Application | Select-Object -First 1).Source
+
+function Invoke-CargoCapture {
+    param([string]$Arguments)
+
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $cargoPath
+    $startInfo.Arguments = $Arguments
+    $startInfo.WorkingDirectory = $repositoryRoot
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    [void]$process.Start()
+    $stdoutRead = $process.StandardOutput.ReadToEndAsync()
+    $stderrRead = $process.StandardError.ReadToEndAsync()
+    $process.WaitForExit()
+    $rawOutput = ($stdoutRead.Result + $stderrRead.Result).TrimEnd([char[]]"`r`n")
+    $output = if ($rawOutput.Length -eq 0) {
+        @()
+    } else {
+        @($rawOutput -split "\r?\n")
+    }
+    $exitCode = $process.ExitCode
+    $process.Dispose()
+
+    [pscustomobject]@{
+        ExitCode = $exitCode
+        Output = $output
+    }
+}
+
+function Remove-DirectoryWithRetry {
+    param([string]$Path)
+
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        try {
+            if (Test-Path $Path) {
+                Remove-Item -Recurse -Force -ErrorAction Stop $Path
+            }
+            if (-not (Test-Path $Path)) {
+                return
+            }
+        } catch {
+            if ($attempt -eq 5) {
+                throw
+            }
+        }
+        Start-Sleep -Milliseconds (200 * $attempt)
+    }
+}
 
 try {
     Set-Location $repositoryRoot
@@ -165,43 +227,41 @@ try {
         $env:MIRAI_FLAGS = "--print_summaries"
         $env:MIRAI_LOG = $null
         if (Test-Path $summarySweepTarget) {
-            Remove-Item -Recurse -Force $summarySweepTarget
+            Remove-DirectoryWithRetry $summarySweepTarget
         }
         New-Item -ItemType Directory -Path $summarySweepTarget -Force | Out-Null
         [System.IO.File]::WriteAllText(
             (Join-Path $summarySweepTarget "CACHEDIR.TAG"),
             "Signature: 8a477f597d28d172789f06886806bc55`n# This file is a cache directory tag created by cargo.`n# For information about cache directory tags see https://bford.info/cachedir/`n"
         )
-        $providerOutput = @(
-            & cargo check -q --locked --manifest-path $manifestPath --lib 2>&1
-        )
-        if ($LASTEXITCODE -ne 0) {
-            $providerOutput | ForEach-Object { Write-Host $_ }
-            throw "Failed to seed provider summaries (exit $LASTEXITCODE)."
+        $seedResult = Invoke-CargoCapture "check -q --locked --manifest-path `"$manifestPath`" --lib"
+        if ($seedResult.ExitCode -ne 0) {
+            $seedResult.Output | ForEach-Object { Write-Host $_ }
+            throw "Failed to seed provider summaries (exit $($seedResult.ExitCode))."
         }
         $env:MIRAI_START_FRESH = $null
         $env:MIRAI_FLAGS = $null
         foreach ($bin in $summaryOnlyHofBins) {
-            $providerOutput = @(
-                & cargo check -q --locked --manifest-path $manifestPath --bin $bin 2>&1
-            )
-            if ($LASTEXITCODE -ne 0) {
-                $providerOutput | ForEach-Object { Write-Host $_ }
-                throw "Failed to seed $bin summaries (exit $LASTEXITCODE)."
+            $seedResult = Invoke-CargoCapture "check -q --locked --manifest-path `"$manifestPath`" --bin `"$bin`""
+            if ($seedResult.ExitCode -ne 0) {
+                $seedResult.Output | ForEach-Object { Write-Host $_ }
+                throw "Failed to seed $bin summaries (exit $($seedResult.ExitCode))."
             }
         }
-        & cargo clean --quiet --manifest-path $manifestPath --target-dir $summarySweepTarget -p rwlock-annotation-detection
-        if ($LASTEXITCODE -ne 0) {
-            throw "Failed to remove provider artifacts (exit $LASTEXITCODE)."
+        $cleanResult = Invoke-CargoCapture "clean --quiet --manifest-path `"$manifestPath`" --target-dir `"$summarySweepTarget`" -p rwlock-annotation-detection"
+        if ($cleanResult.ExitCode -ne 0) {
+            $cleanResult.Output | ForEach-Object { Write-Host $_ }
+            throw "Failed to remove provider artifacts (exit $($cleanResult.ExitCode))."
         }
-        & cargo check -q --locked --manifest-path $manifestPath --lib
-        if ($LASTEXITCODE -ne 0) {
-            throw "Failed to restore provider artifacts (exit $LASTEXITCODE)."
+        $restoreResult = Invoke-CargoCapture "check -q --locked --manifest-path `"$manifestPath`" --lib"
+        if ($restoreResult.ExitCode -ne 0) {
+            $restoreResult.Output | ForEach-Object { Write-Host $_ }
+            throw "Failed to restore provider artifacts (exit $($restoreResult.ExitCode))."
         }
     } else {
         $env:CARGO_TARGET_DIR = $sweepTarget
         if (Test-Path $sweepTarget) {
-            Remove-Item -Recurse -Force $sweepTarget
+            Remove-DirectoryWithRetry $sweepTarget
         }
     }
 
@@ -226,7 +286,6 @@ try {
         exit 2
     }
 
-    $cargoPath = (Get-Command cargo -CommandType Application | Select-Object -First 1).Source
     $passed = 0
     foreach ($bin in $bins) {
         $env:MIRAI_FLAGS = if ($bin -in $verifyBins) { "--diag verify" } else { $null }
@@ -281,7 +340,7 @@ try {
         $providerBodyEntries = @(
             $output | Where-Object {
                 $_ -match "entered body of .*rwlock_annotation_detection.*::(read|write|release_read|drop)" -or
-                $_ -match "entered body of .*callback_(clean|conditional|fnptr_specialization|generic_fnonce|hof_annotated|hof_invoke_twice|loop|sequential_counter|specialization).*::(invoke|invoke_if|invoke_generic|invoke_in_loop|invoke_twice|with_write_held|annotated_acquire|acquire_once|increment|require|read|\{closure)"
+                $_ -match "entered body of .*callback_(accessor|clean|conditional|fnptr_specialization|generic_fnonce|hof_annotated|hof_invoke_twice|loop|nested_hof|sequential_counter|specialization).*::(invoke|invoke_if|invoke_generic|invoke_in_loop|invoke_twice|through_adapter|with_metadata_mut|without_write_held|with_write_held|annotated_acquire|acquire_once|increment|require|read|\{closure)"
             }
         )
         $persistentSummaryLoads = @(
@@ -321,9 +380,9 @@ try {
             }
             Write-Host "Result: $(if ($passedExpectation) { 'PASS' } else { 'FAIL' })"
         } elseif ($passedExpectation) {
-            Write-Host "✅ $bin — expected: $expectedText; actual: $actualText"
+            Write-Host "[PASS] $bin - expected: $expectedText; actual: $actualText"
         } else {
-            Write-Host "❌ $bin — expected: $expectedText; actual: $actualText; exit: $exitCode"
+            Write-Host "[FAIL] $bin - expected: $expectedText; actual: $actualText; exit: $exitCode"
             if ($output.Count -gt 0) {
                 $output | ForEach-Object { Write-Host $_ }
             } else {

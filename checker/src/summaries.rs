@@ -963,6 +963,131 @@ pub struct SummariesForLLM {
     entries: Vec<(String, String, String, LLMSummary)>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{Summary, SummaryCache};
+    use crate::constant_domain::FunctionReference;
+    use crate::known_names::KnownNames;
+    use rustc_hir::def_id::{DefId, DefIndex};
+    use std::env;
+    use std::ffi::OsString;
+    use std::rc::Rc;
+    use std::sync::Mutex;
+    use tempfile::TempDir;
+
+    static SUMMARY_STORE_ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
+
+    struct SummaryStoreEnvironment {
+        start_fresh: Option<OsString>,
+        share_persistent_store: Option<OsString>,
+    }
+
+    impl SummaryStoreEnvironment {
+        fn configure_shared_store() -> Self {
+            let environment = Self {
+                start_fresh: env::var_os("MIRAI_START_FRESH"),
+                share_persistent_store: env::var_os("MIRAI_SHARE_PERSISTENT_STORE"),
+            };
+            env::remove_var("MIRAI_START_FRESH");
+            env::set_var("MIRAI_SHARE_PERSISTENT_STORE", "true");
+            environment
+        }
+    }
+
+    impl Drop for SummaryStoreEnvironment {
+        fn drop(&mut self) {
+            match &self.start_fresh {
+                Some(value) => env::set_var("MIRAI_START_FRESH", value),
+                None => env::remove_var("MIRAI_START_FRESH"),
+            }
+            match &self.share_persistent_store {
+                Some(value) => env::set_var("MIRAI_SHARE_PERSISTENT_STORE", value),
+                None => env::remove_var("MIRAI_SHARE_PERSISTENT_STORE"),
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "tripwire: shared stores currently skip embedded standard summaries"]
+    fn shared_store_seeds_embedded_standard_summaries() {
+        let _lock = SUMMARY_STORE_ENVIRONMENT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let store_directory = TempDir::new().expect("failed to create temporary summary store");
+        let _environment = SummaryStoreEnvironment::configure_shared_store();
+
+        let cache = SummaryCache::new(
+            store_directory
+                .path()
+                .to_str()
+                .expect("temporary path should be valid UTF-8")
+                .to_owned(),
+        );
+
+        let missing_keys: Vec<_> = ["core.result.unwrap_failed", "core.option.unwrap_failed"]
+            .into_iter()
+            .filter(|key| !cache.get_persistent_summary_for(key).is_computed)
+            .collect();
+        assert!(
+            missing_keys.is_empty(),
+            "shared store did not load {}",
+            missing_keys.join(", ")
+        );
+    }
+
+    #[test]
+    fn adapter_closure_specialization_is_replay_resolvable() {
+        let _lock = SUMMARY_STORE_ENVIRONMENT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let store_directory = TempDir::new().expect("failed to create temporary summary store");
+        let _environment = SummaryStoreEnvironment::configure_shared_store();
+        let user_callback_ref = Rc::new(FunctionReference {
+            def_id: Some(DefId::local(DefIndex::from_u32(1))),
+            function_id: Some(1),
+            generic_arguments: vec![],
+            known_name: KnownNames::None,
+            summary_cache_key: "fixture.main.closure".into(),
+            argument_type_key: "_user_callback".into(),
+        });
+        let adapter_ref = Rc::new(FunctionReference {
+            def_id: Some(DefId::local(DefIndex::from_u32(2))),
+            function_id: Some(2),
+            generic_arguments: vec![],
+            known_name: KnownNames::None,
+            summary_cache_key: "fixture.descriptor_table_mut.closure".into(),
+            argument_type_key: "_adapter".into(),
+        });
+        let summary = Summary {
+            is_computed: true,
+            ..Summary::default()
+        };
+        let store_path = store_directory
+            .path()
+            .to_str()
+            .expect("temporary path should be valid UTF-8")
+            .to_owned();
+
+        {
+            let mut cache = SummaryCache::new(store_path.clone());
+            let write_arguments = Some(Rc::new(vec![
+                adapter_ref.clone(),
+                user_callback_ref.clone(),
+            ]));
+            cache.set_summary_for_call_site(&adapter_ref, &write_arguments, &None, summary);
+        }
+
+        let mut reopened_cache = SummaryCache::new(store_path);
+        let replay_arguments = Some(Rc::new(vec![adapter_ref.clone(), user_callback_ref]));
+        assert!(
+            reopened_cache
+                .get_summary_for_call_site(&adapter_ref, &replay_arguments, &None)
+                .is_computed,
+            "adapter closure summary is not reachable through the full replay signature"
+        );
+    }
+}
+
 impl SummariesForLLM {
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(&self).unwrap()

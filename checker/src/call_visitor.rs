@@ -2887,21 +2887,26 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 self.report_unresolvable_callback();
                 continue;
             };
-            let mut callback_summary = self
-                .block_visitor
-                .bv
-                .cv
-                .summary_cache
-                .get_summary_for_call_site(&callback_ref, &None, &None)
-                .clone();
+            let function_constant_args = self.function_constant_args.to_vec();
+            let callback_args =
+                self.get_function_constant_signature(function_constant_args.as_slice());
+            let mut callback_summary = if callback_args.is_some() {
+                self.block_visitor
+                    .bv
+                    .cv
+                    .summary_cache
+                    .get_summary_for_call_site(&callback_ref, &callback_args, &None)
+                    .clone()
+            } else {
+                Summary::default()
+            };
             if !callback_summary.is_computed {
-                let callback_args = Some(Rc::new(vec![callback_ref.clone()]));
                 callback_summary = self
                     .block_visitor
                     .bv
                     .cv
                     .summary_cache
-                    .get_summary_for_call_site(&callback_ref, &callback_args, &None)
+                    .get_summary_for_call_site(&callback_ref, &None, &None)
                     .clone();
             }
             trace!("callback summary {:?}", callback_summary);
@@ -3173,7 +3178,10 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                             .or(promotable_condition)
                     }
                     (Some(promotable_entry_condition), None) => {
-                        if self.block_visitor.bv.cv.options.diag_level == DiagLevel::Default {
+                        if self.block_visitor.bv.cv.options.diag_level == DiagLevel::Default
+                            && !(self.is_indirect_function_call
+                                && refined_precondition_as_bool == Some(false))
+                        {
                             // If refined condition cannot be promoted, it may not be reasonable
                             // to require our caller to prove that this call can't be reached.
                             // Hence, we'll just leave the precondition un-promoted.

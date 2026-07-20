@@ -26,6 +26,7 @@ The fixtures are independent binaries:
 | `array_indices` | silent; constant indices `locks[0]` and `locks[1]` remain distinct |
 | `array_same_index` | `write requires no live readers`; repeated `locks[0]` is the same instance |
 | `callback_inline_closure` | `write requires no live writer` |
+| `callback_accessor_violation` | `read requires no live writer`; callback pre-state survives a `&`-returning accessor |
 | `callback_hof_annotated` | `write requires no live writer` |
 | `callback_hof_invoke_twice` | `annotated callback requires no live writer` |
 | `callback_hof_direct_control` | `annotated callback requires no live writer` |
@@ -43,6 +44,8 @@ The fixtures are independent binaries:
 | `callback_unresolvable` | visible `callback invocation could not be resolved` diagnostic |
 | `callback_loop_clean` | silent; asymmetric fixed-point summary retains a clean invocation |
 | `callback_loop_violation` | summary-only `read requires no live writer`; union-retained asymmetric invocation |
+| `callback_nested_hof_clean` | silent negative control: callback passes through an adapter HOF and runs after the writer is released |
+| `callback_nested_hof_violation` | `read requires no live writer`; callback passes through an adapter HOF while the writer remains held |
 | `callback_fnptr_specialization_clean` | silent; bare function-pointer control |
 | `callback_fnptr_specialization_violation` | `read requires no live writer`; same-typed `clean`/`read` pointers stay isolated |
 | `nested_field_double_write` | `write requires no live writer` |
@@ -109,6 +112,30 @@ Run the former limitation probe explicitly as a focused regression:
 ```powershell
 .\examples\rwlock_annotation_detection\run_examples.ps1 -KnownLimitations
 ```
+
+The shared-store standard-summary load gate has a separate ignored tripwire:
+
+```powershell
+cargo test -p mirai --lib --no-default-features summaries::tests::shared_store_seeds_embedded_standard_summaries -- --ignored --exact
+```
+
+It is intentionally red until an empty shared store is seeded from the embedded standard-summary
+archive. The paired `callback_nested_hof_{clean,violation}` examples isolate MIRAI's
+HOF-through-HOF mechanism, while LiteBox's `real_path_incomplete_summary` remains the real-path
+integration oracle. Both nested examples invoke the callback through the same adapter boundary; the
+clean control releases its writer before invocation, while the violation keeps its writer live.
+Replay resolves the adapter with its full function-constant signature and overlays the recorded
+invocation-site model state, so the clean callback stays silent while the violation reports
+`read requires no live writer`.
+
+Adapter-closure specialization lookup has a focused unit regression:
+
+```powershell
+cargo test -p mirai --lib --no-default-features summaries::tests::adapter_closure_specialization_is_replay_resolvable -- --exact
+```
+
+It mirrors layer 2: summarization and replay both key the adapter with
+`[adapter, user callback]`, preserving the concrete callback specialization across the shared store.
 
 Callback effects are checked at each recorded snapshot. Replay does not accumulate effects between
 snapshots, which prevents double-applying arithmetic model fields such as `read_count`.
