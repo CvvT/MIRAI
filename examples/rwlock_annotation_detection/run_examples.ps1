@@ -6,10 +6,6 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-if ($KnownLimitations) {
-    $SummaryOnly = $true
-}
-
 $expectations = [ordered]@{
     "alias_same_instance"          = "write requires no live readers"
     "arc_alias_double_write"       = "write requires no live writer"
@@ -37,10 +33,12 @@ $expectations = [ordered]@{
     "callback_inline_closure"      = "write requires no live writer"
     "callback_loop_clean"          = $null
     "callback_loop_violation"      = "read requires no live writer"
+    "callback_local_guard_false"   = $null
     "callback_multi_hop_clean"     = $null
     "callback_multi_hop_violation" = "read requires no live writer"
     "callback_nested_hof_clean"    = $null
     "callback_nested_hof_violation" = "read requires no live writer"
+    "callback_non_model_pre_state" = $null
     "callback_reentrant"           = "write requires no live writer"
     "callback_sequential_counter_clean" = $null
     "callback_sequential_counter_violation" = "second callback incorrectly requires two readers"
@@ -59,6 +57,8 @@ $expectations = [ordered]@{
     "read_then_write"              = "write requires no live readers"
     "rc_alias_double_write"        = "write requires no live writer"
     "rc_instances_independent"     = $null
+    "runtime_selected_indices_clean" = $null
+    "runtime_selected_indices_violation" = "write requires no live readers"
     "seeded_writer_other_instance" = $null
     "struct_field_double_write"    = "write requires no live writer"
     "struct_fields_independent"    = $null
@@ -100,11 +100,11 @@ $summaryOnlyBins = @(
     "write_then_read"
 )
 
-$resolvedKnownLimitationBins = @(
-    "callback_fnptr_specialization_violation"
+$knownLimitationBins = @(
+    "callback_local_guard_false",
+    "callback_non_model_pre_state",
+    "runtime_selected_indices_violation"
 )
-
-$knownLimitationBins = @()
 
 $summaryOnlyOnlyBins = @(
     "callback_loop_violation",
@@ -145,6 +145,7 @@ $manifestPath = Join-Path $scriptRoot "Cargo.toml"
 $miraiPath = Join-Path $repositoryRoot "target\debug\mirai.exe"
 $sweepTarget = Join-Path $repositoryRoot "target\rwlock-example-sweep"
 $summarySweepTarget = Join-Path $repositoryRoot "target\rwlock-summary-sweep"
+$knownLimitationSweepTarget = Join-Path $repositoryRoot "target\rwlock-known-limitation-sweep"
 $originalLocation = Get-Location
 $originalPath = $env:PATH
 $originalWrapper = $env:RUSTC_WORKSPACE_WRAPPER
@@ -270,6 +271,11 @@ try {
             $restoreResult.Output | ForEach-Object { Write-Host $_ }
             throw "Failed to restore provider artifacts (exit $($restoreResult.ExitCode))."
         }
+    } elseif ($KnownLimitations) {
+        $env:CARGO_TARGET_DIR = $knownLimitationSweepTarget
+        if (Test-Path $knownLimitationSweepTarget) {
+            Remove-DirectoryWithRetry $knownLimitationSweepTarget
+        }
     } else {
         $env:CARGO_TARGET_DIR = $sweepTarget
         if (Test-Path $sweepTarget) {
@@ -288,11 +294,11 @@ try {
         }
         $bins = @($Filter)
     } elseif ($KnownLimitations) {
-        $bins = $knownLimitationBins + $resolvedKnownLimitationBins
+        $bins = $knownLimitationBins
     } elseif ($SummaryOnly) {
         $bins = $summaryOnlyBins
     }
-    $supportedSummaryBins = $summaryOnlyBins + $knownLimitationBins + $resolvedKnownLimitationBins
+    $supportedSummaryBins = $summaryOnlyBins
     if ($SummaryOnly -and @($bins | Where-Object { $_ -notin $supportedSummaryBins }).Count -gt 0) {
         Write-Error "-SummaryOnly supports: $($supportedSummaryBins -join ', ')"
         exit 2
@@ -300,6 +306,13 @@ try {
 
     $passed = 0
     foreach ($bin in $bins) {
+        if ($KnownLimitations) {
+            $binTarget = Join-Path $knownLimitationSweepTarget $bin
+            if (Test-Path $binTarget) {
+                Remove-DirectoryWithRetry $binTarget
+            }
+            $env:CARGO_TARGET_DIR = $binTarget
+        }
         $env:MIRAI_FLAGS = if ($bin -in $verifyBins) { "--diag verify" } else { $null }
         if ($SummaryOnly) {
             $env:MIRAI_START_FRESH = $null

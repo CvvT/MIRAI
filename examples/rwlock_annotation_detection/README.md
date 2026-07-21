@@ -44,12 +44,15 @@ The fixtures are independent binaries:
 | `callback_unresolvable` | visible `callback invocation could not be resolved` diagnostic |
 | `callback_loop_clean` | silent; asymmetric fixed-point summary retains a clean invocation |
 | `callback_loop_violation` | summary-only `read requires no live writer`; union-retained asymmetric invocation |
+| `callback_captured_ambiguous` | visible unresolved-callback diagnostic; duplicate captured function values are not mapped arbitrarily |
 | `callback_captured_nested_clean` | silent; a captured inner callback runs after the modeled writer is released |
 | `callback_captured_nested_violation` | `read requires no live writer`; nested replay preserves the captured lock identity |
+| `callback_local_guard_false` | known limitation: false helper-local guard is treated as unconditional |
 | `callback_multi_hop_clean` | silent; transitive closure specialization survives three HOF layers |
 | `callback_multi_hop_violation` | `read requires no live writer`; transitive closure specialization survives three HOF layers |
 | `callback_nested_hof_clean` | silent negative control: callback passes through an adapter HOF and runs after the writer is released |
 | `callback_nested_hof_violation` | `read requires no live writer`; callback passes through an adapter HOF while the writer remains held |
+| `callback_non_model_pre_state` | known limitation: callback replay does not see an ordinary field prepared inside the helper |
 | `callback_fnptr_specialization_clean` | silent; bare function-pointer control |
 | `callback_fnptr_specialization_violation` | `read requires no live writer`; same-typed `clean`/`read` pointers stay isolated |
 | `nested_field_double_write` | `write requires no live writer` |
@@ -65,6 +68,8 @@ The fixtures are independent binaries:
 | `arc_instances_independent` | no MIRAI diagnostics |
 | `rc_alias_double_write` | `write requires no live writer`; cloned handles share one pointee |
 | `rc_instances_independent` | no MIRAI diagnostics |
+| `runtime_selected_indices_clean` | silent; assumed-distinct computed indices remain independent |
+| `runtime_selected_indices_violation` | known limitation: assumed-equal computed indices miss `write requires no live readers` |
 
 Unpatched stock MIRAI considers the continuation after `acquire_write` unreachable because it
 promotes the stale `writer == 0` precondition into a postcondition. The checker fix excludes
@@ -74,8 +79,10 @@ acquisition is now reached and rejected.
 Model fields are qualified by the receiver path, not keyed only by type or acquisition site.
 `handle_get_model_field` and `handle_set_model_field` build and canonicalize
 `receiver.model_field(name)` paths. This distinguishes separate locals and constant array elements
-while canonicalizing a direct reference alias back to the same instance. Runtime-selected or
-imprecisely indexed collections are not covered by these fixtures.
+while canonicalizing a direct reference alias back to the same instance. The
+`runtime_selected_indices_*` pair records the remaining computed-index boundary: assumed-distinct
+indices stay silent, but separately represented indices that are constrained equal do not recover
+the same-instance violation.
 
 The wrapper models sequential acquisition discipline, not thread interleavings or the behavior of
 `std::sync::RwLock`. The clean result refers to MIRAI's default diagnostic policy; paranoid mode
@@ -111,13 +118,22 @@ Direct bare function-pointer calls are recorded from their ordinary indirect MIR
 concrete callback identity remains specialized at each consumer call site. The clean/violation pair
 uses same-typed function pointers to ensure their obligations do not contaminate each other.
 
-Run the former limitation probe explicitly as a focused regression:
+The bare function-pointer specialization case is a normal passing regression:
+
+```powershell
+.\examples\rwlock_annotation_detection\run_examples.ps1 -Filter callback_fnptr_specialization_violation
+```
+
+Run the unresolved limitation tripwires separately:
 
 ```powershell
 .\examples\rwlock_annotation_detection\run_examples.ps1 -KnownLimitations
 ```
 
-The shared-store standard-summary load gate has a separate ignored tripwire:
+This command intentionally exits nonzero while the limitations remain. It compares each fixture
+against the desired result rather than accepting the current unresolved, over-reporting, or
+under-reporting behavior as success. Each fixture uses a clean per-bin target so its diagnostics do
+not depend on run order. The shared-store standard-summary load gate has a separate ignored tripwire:
 
 ```powershell
 cargo test -p mirai --lib --no-default-features summaries::tests::shared_store_seeds_embedded_standard_summaries -- --ignored --exact
