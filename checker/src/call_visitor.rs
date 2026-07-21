@@ -1439,6 +1439,20 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             if let Some(summary) = summary {
                 if summary.is_computed {
                     if recorded_callback_invocation {
+                        let specialized_callee = indirect_call_visitor.callee_func_ref.clone();
+                        let function_constants = indirect_call_visitor
+                            .get_function_constant_signature(&function_constant_args)
+                            .map(|constants| constants.as_ref().clone())
+                            .unwrap_or_default();
+                        if let Some(invocation) = indirect_call_visitor
+                            .block_visitor
+                            .bv
+                            .callback_invocations
+                            .last_mut()
+                        {
+                            invocation.specialized_callee = specialized_callee;
+                            invocation.function_constants = function_constants;
+                        }
                         indirect_call_visitor
                             .block_visitor
                             .bv
@@ -2887,19 +2901,30 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 self.report_unresolvable_callback();
                 continue;
             };
-            let function_constant_args = self.function_constant_args.to_vec();
-            let callback_args =
-                self.get_function_constant_signature(function_constant_args.as_slice());
-            let mut callback_summary = if callback_args.is_some() {
-                self.block_visitor
-                    .bv
-                    .cv
-                    .summary_cache
-                    .get_summary_for_call_site(&callback_ref, &callback_args, &None)
-                    .clone()
+            let callback_args = if invocation.function_constants.is_empty() {
+                let function_constant_args = self.function_constant_args.to_vec();
+                self.get_function_constant_signature(function_constant_args.as_slice())
             } else {
-                Summary::default()
+                Some(Rc::new(invocation.function_constants.clone()))
             };
+            let mut callback_summary =
+                if let Some(specialized_callee) = &invocation.specialized_callee {
+                    self.block_visitor
+                        .bv
+                        .cv
+                        .summary_cache
+                        .get_persistent_summary_for_call_site(specialized_callee, &callback_args)
+                        .unwrap_or_default()
+                } else if callback_args.is_some() {
+                    self.block_visitor
+                        .bv
+                        .cv
+                        .summary_cache
+                        .get_summary_for_call_site(&callback_ref, &callback_args, &None)
+                        .clone()
+                } else {
+                    Summary::default()
+                };
             if !callback_summary.is_computed {
                 callback_summary = self
                     .block_visitor

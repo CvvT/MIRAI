@@ -34,6 +34,8 @@ $expectations = [ordered]@{
     "callback_inline_closure"      = "write requires no live writer"
     "callback_loop_clean"          = $null
     "callback_loop_violation"      = "read requires no live writer"
+    "callback_multi_hop_clean"     = $null
+    "callback_multi_hop_violation" = "read requires no live writer"
     "callback_nested_hof_clean"    = $null
     "callback_nested_hof_violation" = "read requires no live writer"
     "callback_reentrant"           = "write requires no live writer"
@@ -79,6 +81,8 @@ $summaryOnlyBins = @(
     "callback_hof_invoke_twice",
     "callback_loop_clean",
     "callback_loop_violation",
+    "callback_multi_hop_clean",
+    "callback_multi_hop_violation",
     "callback_sequential_counter_clean",
     "callback_sequential_counter_violation",
     "callback_specialization_clean",
@@ -115,6 +119,8 @@ $summaryOnlyHofBins = @(
     "callback_hof_invoke_twice",
     "callback_loop_clean",
     "callback_loop_violation",
+    "callback_multi_hop_clean",
+    "callback_multi_hop_violation",
     "callback_nested_hof_violation",
     "callback_sequential_counter_clean",
     "callback_sequential_counter_violation",

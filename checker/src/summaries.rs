@@ -127,10 +127,22 @@ pub struct CallbackInvocation {
     pub pre_state: Vec<(Rc<Path>, Rc<AbstractValue>)>,
     /// The path condition under which the callback is invoked.
     pub guard: Rc<AbstractValue>,
+    /// The resolved callback specialization, when one was available while summarizing the call.
+    pub specialized_callee: Option<Rc<FunctionReference>>,
+    /// Transitive function constants used to specialize the callback summary.
+    pub function_constants: Vec<Rc<FunctionReference>>,
 }
 
 #[derive(Deserialize)]
 struct PreviousCallbackInvocation {
+    callee: Rc<Path>,
+    arguments: Vec<(Rc<Path>, Rc<AbstractValue>)>,
+    pre_state: Vec<(Rc<Path>, Rc<AbstractValue>)>,
+    guard: Rc<AbstractValue>,
+}
+
+#[derive(Deserialize)]
+struct OlderCallbackInvocation {
     callee: Rc<Path>,
     arguments: Vec<(Rc<Path>, Rc<AbstractValue>)>,
     pre_state: Vec<(Rc<Path>, Rc<AbstractValue>)>,
@@ -164,6 +176,47 @@ impl From<PreviousSummary> for Summary {
                 .into_iter()
                 .map(|invocation| CallbackInvocation {
                     callee: invocation.callee,
+                    specialized_callee: None,
+                    function_constants: Vec::new(),
+                    arguments: invocation.arguments,
+                    pre_state: invocation.pre_state,
+                    guard: invocation.guard,
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct OlderSummary {
+    is_computed: bool,
+    is_incomplete: bool,
+    preconditions: Vec<Precondition>,
+    assumed_aliases: Vec<(Rc<Path>, Rc<Path>)>,
+    guarded_aliases: Vec<(Rc<Path>, Rc<Path>, Rc<AbstractValue>)>,
+    side_effects: Vec<(Rc<Path>, Rc<AbstractValue>)>,
+    post_condition: Option<Rc<AbstractValue>>,
+    callback_invocations: Vec<OlderCallbackInvocation>,
+}
+
+impl From<OlderSummary> for Summary {
+    fn from(summary: OlderSummary) -> Self {
+        Summary {
+            is_computed: summary.is_computed,
+            is_incomplete: summary.is_incomplete,
+            preconditions: summary.preconditions,
+            assumed_aliases: summary.assumed_aliases,
+            guarded_aliases: summary.guarded_aliases,
+            side_effects: summary.side_effects,
+            post_condition: summary.post_condition,
+            return_type_index: 0,
+            callback_invocations: summary
+                .callback_invocations
+                .into_iter()
+                .map(|invocation| CallbackInvocation {
+                    callee: invocation.callee,
+                    specialized_callee: None,
+                    function_constants: Vec::new(),
                     arguments: invocation.arguments,
                     pre_state: invocation.pre_state,
                     guard: Rc::new(abstract_value::TRUE),
@@ -861,6 +914,17 @@ impl<'tcx> SummaryCache<'tcx> {
         Self::get_persistent_summary_for_db(&self.db, persistent_key).unwrap_or_default()
     }
 
+    pub fn get_persistent_summary_for_call_site(
+        &self,
+        func_ref: &FunctionReference,
+        func_args: &Option<Rc<Vec<Rc<FunctionReference>>>>,
+    ) -> Option<Summary> {
+        Self::get_persistent_summary_for_db(
+            &self.db,
+            &Self::persistent_call_site_key(func_ref, func_args),
+        )
+    }
+
     /// Helper for get_summary_for and get_persistent_summary_for.
     #[logfn(TRACE)]
     fn get_persistent_summary_for_db(db: &Db, persistent_key: &str) -> Option<Summary> {
@@ -869,6 +933,7 @@ impl<'tcx> SummaryCache<'tcx> {
             Some(
                 bincode::deserialize(bytes)
                     .or_else(|_| bincode::deserialize::<PreviousSummary>(bytes).map(Into::into))
+                    .or_else(|_| bincode::deserialize::<OlderSummary>(bytes).map(Into::into))
                     .or_else(|_| bincode::deserialize::<LegacySummary>(bytes).map(Into::into))
                     .unwrap(),
             )

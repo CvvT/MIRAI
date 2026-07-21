@@ -44,6 +44,8 @@ The fixtures are independent binaries:
 | `callback_unresolvable` | visible `callback invocation could not be resolved` diagnostic |
 | `callback_loop_clean` | silent; asymmetric fixed-point summary retains a clean invocation |
 | `callback_loop_violation` | summary-only `read requires no live writer`; union-retained asymmetric invocation |
+| `callback_multi_hop_clean` | silent; transitive closure specialization survives three HOF layers |
+| `callback_multi_hop_violation` | `read requires no live writer`; transitive closure specialization survives three HOF layers |
 | `callback_nested_hof_clean` | silent negative control: callback passes through an adapter HOF and runs after the writer is released |
 | `callback_nested_hof_violation` | `read requires no live writer`; callback passes through an adapter HOF while the writer remains held |
 | `callback_fnptr_specialization_clean` | silent; bare function-pointer control |

@@ -849,6 +849,8 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
             .collect();
         self.bv.callback_invocations.push(CallbackInvocation {
             callee: callee_parameter,
+            specialized_callee: None,
+            function_constants: Vec::new(),
             arguments: actual_args.to_vec(),
             pre_state,
             guard: self
