@@ -21,6 +21,8 @@ $expectations = [ordered]@{
     "array_same_index"             = "write requires no live readers"
     "callback_accessor_violation" = "read requires no live writer"
     "callback_captured_ambiguous"  = "callback invocation could not be resolved"
+    "callback_captured_nested_clean" = $null
+    "callback_captured_nested_violation" = "read requires no live writer"
     "callback_clean"               = $null
     "callback_conditional_false"   = $null
     "callback_conditional_true"    = "conditional callback requires no live writer"
@@ -70,6 +72,8 @@ $expectations = [ordered]@{
 $summaryOnlyBins = @(
     "callback_accessor_violation",
     "callback_captured_ambiguous",
+    "callback_captured_nested_clean",
+    "callback_captured_nested_violation",
     "callback_nested_hof_clean",
     "callback_nested_hof_violation",
     "callback_clean",
