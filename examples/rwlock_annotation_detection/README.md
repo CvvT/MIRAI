@@ -69,7 +69,7 @@ The fixtures are independent binaries:
 | `rc_alias_double_write` | `write requires no live writer`; cloned handles share one pointee |
 | `rc_instances_independent` | no MIRAI diagnostics |
 | `runtime_selected_indices_clean` | silent; assumed-distinct computed indices remain independent |
-| `runtime_selected_indices_violation` | known limitation: assumed-equal computed indices miss `write requires no live readers` |
+| `runtime_selected_indices_violation` | `write requires no live readers`; assumed-equal computed indices alias |
 
 Unpatched stock MIRAI considers the continuation after `acquire_write` unreachable because it
 promotes the stale `writer == 0` precondition into a postcondition. The checker fix excludes
@@ -80,9 +80,9 @@ Model fields are qualified by the receiver path, not keyed only by type or acqui
 `handle_get_model_field` and `handle_set_model_field` build and canonicalize
 `receiver.model_field(name)` paths. This distinguishes separate locals and constant array elements
 while canonicalizing a direct reference alias back to the same instance. The
-`runtime_selected_indices_*` pair records the remaining computed-index boundary: assumed-distinct
-indices stay silent, but separately represented indices that are constrained equal do not recover
-the same-instance violation.
+`runtime_selected_indices_*` pair exercises alias-aware model-field lookup: assumed-distinct
+indices stay silent, while separately represented indices constrained equal recover the
+same-instance violation.
 
 The wrapper models sequential acquisition discipline, not thread interleavings or the behavior of
 `std::sync::RwLock`. The clean result refers to MIRAI's default diagnostic policy; paranoid mode

@@ -90,6 +90,70 @@ impl Environment {
         self.value_map.get(path)
     }
 
+    /// Looks up a model field while accounting for computed indices that may alias.
+    pub fn value_at_computed_index_model_field(
+        &self,
+        path: &Rc<Path>,
+        default: Rc<AbstractValue>,
+    ) -> Option<Rc<AbstractValue>> {
+        if let Some(value) = self.value_map.get(path) {
+            return Some(value.clone());
+        }
+
+        let (source_collection, source_field) = Self::computed_index_model_field_parts(path)?;
+        let candidates = self.value_map.iter().filter_map(|(candidate_path, value)| {
+            let (candidate_collection, candidate_field) =
+                Self::computed_index_model_field_parts(candidate_path)?;
+            (candidate_collection == source_collection && candidate_field == source_field)
+                .then(|| (candidate_path, value))
+        });
+
+        let mut proven_value: Option<Rc<AbstractValue>> = None;
+        let mut conditional_values = Vec::new();
+        for (candidate_path, candidate_value) in candidates {
+            let paths_are_equal = candidate_path.equals(path);
+            if self.entry_condition.implies(&paths_are_equal) {
+                proven_value = Some(match proven_value {
+                    Some(value) => value.join(candidate_value.clone()),
+                    None => candidate_value.clone(),
+                });
+            } else if !self.entry_condition.implies(&paths_are_equal.logical_not()) {
+                conditional_values.push((paths_are_equal, candidate_value.clone()));
+            }
+        }
+
+        let found_candidate = proven_value.is_some() || !conditional_values.is_empty();
+        let mut value = proven_value.unwrap_or(default);
+        for (condition, candidate_value) in conditional_values {
+            let aliased_value = value.join(candidate_value);
+            value = condition.conditional_expression(aliased_value, value);
+        }
+        found_candidate.then_some(value)
+    }
+
+    fn computed_index_model_field_parts(path: &Rc<Path>) -> Option<(&Rc<Path>, &Rc<str>)> {
+        let PathEnum::QualifiedPath {
+            qualifier,
+            selector,
+            ..
+        } = &path.value
+        else {
+            return None;
+        };
+        let PathSelector::ModelField(field) = selector.as_ref() else {
+            return None;
+        };
+        let PathEnum::QualifiedPath {
+            qualifier: collection,
+            selector: index,
+            ..
+        } = &qualifier.value
+        else {
+            return None;
+        };
+        matches!(index.as_ref(), PathSelector::Index(_)).then_some((collection, field))
+    }
+
     /// Updates the path to value map so that the given path now points to the given value.
     #[logfn_inputs(TRACE)]
     pub fn strong_update_value_at(&mut self, path: Rc<Path>, value: Rc<AbstractValue>) {
@@ -749,5 +813,73 @@ impl Environment {
             }
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Environment;
+    use crate::abstract_value::{AbstractValue, AbstractValueTrait};
+    use crate::expression::ExpressionType;
+    use crate::path::Path;
+    use std::rc::Rc;
+
+    fn computed_model_field(index_ordinal: usize) -> (Rc<Path>, Rc<AbstractValue>) {
+        let collection = Path::new_local(1, 0);
+        let index = AbstractValue::make_typed_unknown(
+            ExpressionType::Usize,
+            Path::new_local(index_ordinal, 0),
+        );
+        let element = Path::new_index(collection, index.clone());
+        (
+            Path::new_model_field(element, Rc::from("read_count")),
+            index,
+        )
+    }
+
+    #[test]
+    fn computed_index_model_field_lookup_handles_alias_outcomes() {
+        let zero: Rc<AbstractValue> = Rc::new(0_u128.into());
+        let one: Rc<AbstractValue> = Rc::new(1_u128.into());
+        let two: Rc<AbstractValue> = Rc::new(2_u128.into());
+        let (first_path, first_index) = computed_model_field(2);
+        let (second_path, second_index) = computed_model_field(3);
+        let (query_path, query_index) = computed_model_field(4);
+
+        let mut exact = Environment::default();
+        exact.strong_update_value_at(first_path.clone(), one.clone());
+        assert_eq!(
+            exact.value_at_computed_index_model_field(&first_path, zero.clone()),
+            Some(one.clone())
+        );
+
+        let mut equal = exact.clone();
+        equal.entry_condition = first_index.equals(query_index.clone());
+        assert_eq!(
+            equal.value_at_computed_index_model_field(&query_path, zero.clone()),
+            Some(one.clone())
+        );
+
+        let mut distinct = exact.clone();
+        distinct.entry_condition = first_index.not_equals(query_index.clone());
+        assert_eq!(
+            distinct.value_at_computed_index_model_field(&query_path, zero.clone()),
+            None
+        );
+
+        let unknown = exact.value_at_computed_index_model_field(&query_path, zero.clone());
+        assert_ne!(unknown, None);
+        assert_ne!(unknown, Some(zero.clone()));
+        assert_ne!(unknown, Some(one.clone()));
+
+        let mut multiple = exact;
+        multiple.strong_update_value_at(second_path, two.clone());
+        multiple.entry_condition = first_index
+            .equals(query_index.clone())
+            .and(second_index.equals(query_index));
+        let multiple_value = multiple
+            .value_at_computed_index_model_field(&query_path, zero)
+            .unwrap();
+        assert!(multiple_value == one.join(two.clone()) || multiple_value == two.join(one));
     }
 }

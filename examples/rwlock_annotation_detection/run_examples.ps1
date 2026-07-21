@@ -102,8 +102,7 @@ $summaryOnlyBins = @(
 
 $knownLimitationBins = @(
     "callback_local_guard_false",
-    "callback_non_model_pre_state",
-    "runtime_selected_indices_violation"
+    "callback_non_model_pre_state"
 )
 
 $summaryOnlyOnlyBins = @(

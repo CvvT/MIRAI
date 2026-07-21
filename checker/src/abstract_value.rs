@@ -6434,21 +6434,27 @@ impl AbstractValueTrait for Rc<AbstractValue> {
                 let refined_path =
                     path.refine_parameters_and_paths(args, result, pre_env, post_env, fresh);
                 if !matches!(&refined_path.value, PathEnum::Computed { .. }) {
-                    if let Some(val) = post_env.value_at(&refined_path) {
-                        // This environment has a value for the model field.
-                        val.clone()
-                    } else if refined_path.is_rooted_by_parameter() {
+                    let fallback = if refined_path.is_rooted_by_parameter() {
                         // Keep passing the buck to the next caller.
                         AbstractValue::make_from(
                             Expression::UnknownModelField {
-                                path: refined_path,
+                                path: refined_path.clone(),
                                 default: default.clone(),
                             },
                             default.expression_size.saturating_add(1),
                         )
                     } else {
-                        // The buck stops here and the environment does not have a value for model field.
                         default.clone()
+                    };
+                    if let Some(val) = post_env.value_at(&refined_path) {
+                        // This environment has a value for the model field.
+                        val.clone()
+                    } else if let Some(val) = post_env
+                        .value_at_computed_index_model_field(&refined_path, fallback.clone())
+                    {
+                        val
+                    } else {
+                        fallback
                     }
                 } else {
                     AbstractValue::make_from(
