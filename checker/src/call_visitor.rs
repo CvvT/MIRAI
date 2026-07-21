@@ -2891,11 +2891,40 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 self.report_unresolvable_callback();
                 continue;
             };
-            let Some((_, callback_value)) = self.actual_args.get(argument_index) else {
+            let Some((root_callback_path, root_callback_value)) =
+                self.actual_args.get(argument_index)
+            else {
                 self.report_unresolvable_callback();
                 continue;
             };
-            let callback_value = callback_value.clone();
+            let captured_field = matches!(
+                invocation.callee.value,
+                PathEnum::QualifiedPath { ref selector, .. }
+                    if matches!(**selector, PathSelector::Field(_))
+            );
+            let (callback_path, callback_value) = if !captured_field {
+                (root_callback_path.clone(), root_callback_value.clone())
+            } else {
+                let refined_callee = invocation.callee.refine_parameters_and_paths(
+                    &self.actual_args,
+                    &no_result,
+                    &self.environment_before_call,
+                    &outer_environment,
+                    self.block_visitor.bv.fresh_variable_offset,
+                );
+                let function_path = Path::new_function(refined_callee.clone());
+                let value = outer_environment
+                    .value_at(&function_path)
+                    .or_else(|| self.environment_before_call.value_at(&function_path))
+                    .or_else(|| outer_environment.value_at(&refined_callee))
+                    .or_else(|| self.environment_before_call.value_at(&refined_callee));
+                let Some(value) = value else {
+                    trace!("captured callback path did not resolve to a function");
+                    self.report_unresolvable_callback();
+                    continue;
+                };
+                (refined_callee, value.clone())
+            };
             let Some(callback_ref) = self.block_visitor.get_func_ref(&callback_value) else {
                 trace!("callback argument did not resolve to a function");
                 self.report_unresolvable_callback();
@@ -2944,7 +2973,7 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 continue;
             }
 
-            let callback_arguments: Vec<(Rc<Path>, Rc<AbstractValue>)> = invocation
+            let mut callback_arguments: Vec<(Rc<Path>, Rc<AbstractValue>)> = invocation
                 .arguments
                 .iter()
                 .map(|(path, value)| {
@@ -2966,6 +2995,11 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                     )
                 })
                 .collect();
+            if let Some((path, value)) = callback_arguments.first_mut() {
+                if value.is_function() {
+                    *path = callback_path;
+                }
+            }
             let mut callback_environment = outer_environment.clone();
             let refined_guard = invocation.guard.refine_parameters_and_paths(
                 &self.actual_args,
@@ -3012,6 +3046,17 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 callback_visitor.callee_fun_val = callback_value;
                 callback_visitor.is_indirect_function_call = true;
                 callback_visitor.check_preconditions_if_necessary(&callback_summary);
+                let mut captured_summary = callback_summary.clone();
+                captured_summary.callback_invocations.retain(|invocation| {
+                    matches!(
+                        invocation.callee.value,
+                        PathEnum::QualifiedPath { ref selector, .. }
+                            if matches!(**selector, PathSelector::Field(_))
+                    )
+                });
+                if !captured_summary.callback_invocations.is_empty() {
+                    callback_visitor.replay_callback_invocations(&captured_summary);
+                }
 
                 for (index, (target_path, _)) in callback_visitor.actual_args.iter().enumerate() {
                     callback_visitor.block_visitor.bv.transfer_and_refine(

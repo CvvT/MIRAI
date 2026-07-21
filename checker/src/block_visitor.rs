@@ -44,6 +44,23 @@ use crate::tag_domain::Tag;
 use crate::type_visitor::TypeVisitor;
 use crate::utils;
 
+enum Candidate<T> {
+    None,
+    One(T),
+    Multiple,
+}
+
+fn unique_candidate<T>(mut candidates: impl Iterator<Item = T>) -> Candidate<T> {
+    let Some(candidate) = candidates.next() else {
+        return Candidate::None;
+    };
+    if candidates.next().is_some() {
+        Candidate::Multiple
+    } else {
+        Candidate::One(candidate)
+    }
+}
+
 /// Holds the state for the basic block visitor
 pub struct BlockVisitor<'block, 'analysis, 'compilation, 'tcx> {
     pub bv: &'block mut BodyVisitor<'analysis, 'compilation, 'tcx>,
@@ -814,24 +831,104 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
         let callee_parameter = if callee_path.is_rooted_by_parameter() {
             Some(callee_path)
         } else {
+            let mut ambiguous_value_match = false;
+            let captured_parameter = if !self.bv.treat_as_foreign {
+                None
+            } else if let PathEnum::Computed {
+                value: callee_value,
+            } = &callee_path.value
+            {
+                let matches =
+                    self.bv
+                        .current_environment
+                        .value_map
+                        .iter()
+                        .filter_map(|(path, value)| {
+                            (path.is_rooted_by_parameter()
+                                && value.eq(callee_value)
+                                && matches!(
+                                    path.value,
+                                    PathEnum::QualifiedPath { ref selector, .. }
+                                        if matches!(**selector, PathSelector::Function)
+                                ))
+                            .then(|| path.remove_selector(Rc::new(PathSelector::Function)))
+                        });
+                match unique_candidate(matches) {
+                    Candidate::None => None,
+                    Candidate::One(captured) => Some(captured),
+                    Candidate::Multiple => {
+                        ambiguous_value_match = true;
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some(captured_parameter) = captured_parameter {
+                return self.push_callback_invocation(captured_parameter, actual_args);
+            }
             let callee_ty = self.type_visitor().get_dereferenced_type(callee_ty);
-            (1..=self.bv.mir.arg_count).find_map(|ordinal| {
+            let mut matching_parameters = Vec::new();
+            for ordinal in 1..=self.bv.mir.arg_count {
                 let parameter_ty = self.bv.mir.local_decls[mir::Local::from(ordinal)].ty;
                 let parameter_ty = self
                     .type_visitor()
                     .specialize_type(parameter_ty, &self.type_visitor().generic_argument_map);
                 let parameter_ty = self.type_visitor().get_dereferenced_type(parameter_ty);
-                (parameter_ty == callee_ty
+                if parameter_ty == callee_ty
                     || matches!(
                         (parameter_ty.kind(), callee_ty.kind()),
                         (TyKind::FnPtr(..), TyKind::FnDef(..))
-                    ))
-                .then(|| Path::new_parameter(ordinal))
-            })
+                    )
+                {
+                    matching_parameters.push(Path::new_parameter(ordinal));
+                    continue;
+                }
+                let TyKind::Closure(_, args) = parameter_ty.kind() else {
+                    continue;
+                };
+                if !self.bv.treat_as_foreign {
+                    continue;
+                }
+                for (field, _) in
+                    args.as_closure()
+                        .upvar_tys()
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, ty)| {
+                            let field_ty = self.type_visitor().get_dereferenced_type(*ty);
+                            field_ty == callee_ty
+                                || matches!(
+                                    (field_ty.kind(), callee_ty.kind()),
+                                    (TyKind::FnPtr(..), TyKind::FnDef(..))
+                                )
+                        })
+                {
+                    matching_parameters.push(Path::new_field(Path::new_parameter(ordinal), field));
+                }
+            }
+            let (captured_parameter, ambiguous_type_match) =
+                match unique_candidate(matching_parameters.into_iter()) {
+                    Candidate::None => (None, false),
+                    Candidate::One(captured) => (Some(captured), false),
+                    Candidate::Multiple => (None, true),
+                };
+            if captured_parameter.is_none() && (ambiguous_value_match || ambiguous_type_match) {
+                self.bv.analysis_is_incomplete = true;
+            }
+            captured_parameter
         };
         let Some(callee_parameter) = callee_parameter else {
             return false;
         };
+        self.push_callback_invocation(callee_parameter, actual_args)
+    }
+
+    fn push_callback_invocation(
+        &mut self,
+        callee_parameter: Rc<Path>,
+        actual_args: &[(Rc<Path>, Rc<AbstractValue>)],
+    ) -> bool {
         let pre_state = self
             .bv
             .current_environment
@@ -4315,5 +4412,26 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                 PathSelector::Deref
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{unique_candidate, Candidate};
+
+    #[test]
+    fn captured_callback_selection_rejects_ambiguity() {
+        assert!(matches!(
+            unique_candidate(std::iter::empty::<usize>()),
+            Candidate::None
+        ));
+        assert!(matches!(
+            unique_candidate([7].into_iter()),
+            Candidate::One(7)
+        ));
+        assert!(matches!(
+            unique_candidate([7, 7].into_iter()),
+            Candidate::Multiple
+        ));
     }
 }
