@@ -123,7 +123,7 @@ pub struct CallbackInvocation {
     pub callee: Rc<Path>,
     /// Callback arguments expressed in terms of the summarized function's parameters.
     pub arguments: Vec<(Rc<Path>, Rc<AbstractValue>)>,
-    /// Model-field values visible at the callback invocation point.
+    /// Parameter-rooted field values visible at the callback invocation point.
     pub pre_state: Vec<(Rc<Path>, Rc<AbstractValue>)>,
     /// The path condition under which the callback is invoked.
     pub guard: Rc<AbstractValue>,

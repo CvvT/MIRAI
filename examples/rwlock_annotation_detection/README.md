@@ -52,7 +52,7 @@ The fixtures are independent binaries:
 | `callback_multi_hop_violation` | `read requires no live writer`; transitive closure specialization survives three HOF layers |
 | `callback_nested_hof_clean` | silent negative control: callback passes through an adapter HOF and runs after the writer is released |
 | `callback_nested_hof_violation` | `read requires no live writer`; callback passes through an adapter HOF while the writer remains held |
-| `callback_non_model_pre_state` | known limitation: callback replay does not see an ordinary field prepared inside the helper |
+| `callback_non_model_pre_state` | silent; callback replay sees an ordinary field prepared inside the helper |
 | `callback_fnptr_specialization_clean` | silent; bare function-pointer control |
 | `callback_fnptr_specialization_violation` | `read requires no live writer`; same-typed `clean`/`read` pointers stay isolated |
 | `nested_field_double_write` | `write requires no live writer` |

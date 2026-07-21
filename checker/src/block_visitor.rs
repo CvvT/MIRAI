@@ -939,7 +939,10 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                     && matches!(
                         path.value,
                         PathEnum::QualifiedPath { ref selector, .. }
-                            if matches!(**selector, PathSelector::ModelField(_))
+                            if matches!(
+                                **selector,
+                                PathSelector::Field(_) | PathSelector::ModelField(_)
+                            )
                     )
             })
             .map(|(path, value)| (path.clone(), value.clone()))

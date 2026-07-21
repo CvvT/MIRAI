@@ -76,6 +76,7 @@ $summaryOnlyBins = @(
     "callback_captured_nested_violation",
     "callback_nested_hof_clean",
     "callback_nested_hof_violation",
+    "callback_non_model_pre_state",
     "callback_clean",
     "callback_conditional_false",
     "callback_conditional_true",
@@ -101,8 +102,7 @@ $summaryOnlyBins = @(
 )
 
 $knownLimitationBins = @(
-    "callback_local_guard_false",
-    "callback_non_model_pre_state"
+    "callback_local_guard_false"
 )
 
 $summaryOnlyOnlyBins = @(
@@ -127,6 +127,7 @@ $summaryOnlyHofBins = @(
     "callback_multi_hop_clean",
     "callback_multi_hop_violation",
     "callback_nested_hof_violation",
+    "callback_non_model_pre_state",
     "callback_sequential_counter_clean",
     "callback_sequential_counter_violation",
     "callback_specialization_clean",
