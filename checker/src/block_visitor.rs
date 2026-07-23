@@ -827,12 +827,362 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
         if !self.bv.check_for_errors {
             return false;
         }
+        let allow_captured_parameter =
+            self.bv.treat_as_foreign || self.bv.tcx.is_closure_like(self.bv.def_id);
+        let Some(callee_parameter) =
+            self.find_callback_parameter(callee_path, callee_ty, allow_captured_parameter)
+        else {
+            return false;
+        };
+        self.push_callback_invocation(callee_parameter, actual_args, true)
+    }
+
+    pub fn record_transitive_callback_invocation(
+        &mut self,
+        callee_path: Rc<Path>,
+        callee_ty: Ty<'tcx>,
+        actual_args: &[(Rc<Path>, Rc<AbstractValue>)],
+        specialized_callee: Option<Rc<FunctionReference>>,
+        function_constants: &[Rc<FunctionReference>],
+        is_local: bool,
+        allow_new_local: bool,
+        enclosing_capture_rekeys: &[(Rc<Path>, Rc<AbstractValue>)],
+        local_callback_anchor: Option<Rc<Path>>,
+    ) -> bool {
+        if !self.bv.check_for_errors {
+            return false;
+        }
+        let (callee_parameter, capture_aliases, is_local, newly_local) =
+            if let Some(callee_parameter) = local_callback_anchor {
+                let Some(ordinal) = callee_parameter.get_parameter_root_ordinal() else {
+                    return false;
+                };
+                let parameter_ty = self.bv.mir.local_decls[mir::Local::from(ordinal)].ty;
+                let parameter_ty = self
+                    .type_visitor()
+                    .specialize_type(parameter_ty, &self.type_visitor().generic_argument_map);
+                if !utils::contains_function(parameter_ty, self.bv.tcx) {
+                    return false;
+                }
+                let capture_aliases = self
+                    .find_local_callback_parameter(
+                        actual_args,
+                        callee_ty,
+                        enclosing_capture_rekeys,
+                        Some(callee_parameter.clone()),
+                    )
+                    .map(|(_, capture_aliases)| capture_aliases)
+                    .unwrap_or_default();
+                (callee_parameter, capture_aliases, true, false)
+            } else if let Some(callee_parameter) =
+                self.find_callback_parameter(callee_path, callee_ty, true)
+            {
+                (callee_parameter, Vec::new(), is_local, false)
+            } else if specialized_callee.is_some() && allow_new_local {
+                let Some((callee_parameter, capture_aliases)) = self.find_local_callback_parameter(
+                    actual_args,
+                    callee_ty,
+                    enclosing_capture_rekeys,
+                    local_callback_anchor,
+                ) else {
+                    return false;
+                };
+                (callee_parameter, capture_aliases, true, true)
+            } else {
+                return false;
+            };
+        if capture_aliases.is_empty() && newly_local {
+            return false;
+        };
+        if self.bv.callback_invocations.len() >= k_limits::MAX_INFERRED_PRECONDITIONS {
+            self.bv.analysis_is_incomplete = true;
+            return true;
+        }
+
+        let mut arguments_complete = true;
+        let boundary_args = actual_args
+            .iter()
+            .enumerate()
+            .map(|(index, (path, value))| {
+                if index == 0 && value.is_function() {
+                    return (callee_parameter.clone(), value.clone());
+                }
+                if !path.contains_local_variable(false)
+                    && !value.expression.contains_local_variable(false)
+                {
+                    return (path.clone(), value.clone());
+                }
+                arguments_complete = false;
+                (Path::new_computed(Rc::new(BOTTOM)), Rc::new(BOTTOM))
+            })
+            .collect::<Vec<_>>();
+        self.push_callback_invocation(callee_parameter, &boundary_args, arguments_complete);
+        let capture_model_rekeys = capture_aliases
+            .iter()
+            .filter_map(|(boundary_path, source_value)| {
+                let source_path = Path::get_as_path(source_value.clone())
+                    .remove_initial_value_wrapper()
+                    .canonicalize(&self.bv.current_environment);
+                if source_path.contains_local_variable(false) || source_path == *boundary_path {
+                    return None;
+                }
+                let boundary_value = AbstractValue::make_typed_unknown(
+                    source_value.expression.infer_type(),
+                    boundary_path.clone(),
+                );
+                Some((source_path, boundary_value))
+            })
+            .collect::<Vec<_>>();
+        let invocation = self
+            .bv
+            .callback_invocations
+            .last_mut()
+            .expect("push_callback_invocation must append an invocation");
+        invocation.pre_state.extend(
+            self.bv
+                .current_environment
+                .value_map
+                .iter()
+                .filter(|(path, _)| {
+                    path.contains_local_variable(false)
+                        && matches!(
+                            path.value,
+                            PathEnum::QualifiedPath { ref selector, .. }
+                                if matches!(**selector, PathSelector::ModelField(_))
+                        )
+                })
+                .filter_map(|(path, value)| {
+                    let (path, value) = enclosing_capture_rekeys
+                        .iter()
+                        .chain(&capture_model_rekeys)
+                        .fold(
+                            (path.clone(), value.clone()),
+                            |(path, value), (local_path, replacement)| {
+                                let replacement = Path::get_as_path(replacement.clone())
+                                    .canonicalize(&self.bv.current_environment);
+                                (
+                                    path.replace_root(local_path, replacement.clone()),
+                                    value.replace_embedded_path_root(local_path, replacement),
+                                )
+                            },
+                        );
+                    (!path.contains_local_variable(false)
+                        && !value.expression.contains_local_variable(false))
+                    .then_some((path, value))
+                }),
+        );
+        invocation.pre_state.extend(capture_aliases);
+        invocation.specialized_callee = specialized_callee;
+        invocation.function_constants = function_constants.to_vec();
+        invocation.is_local = is_local;
+        true
+    }
+
+    fn find_local_callback_parameter(
+        &mut self,
+        actual_args: &[(Rc<Path>, Rc<AbstractValue>)],
+        callee_ty: Ty<'tcx>,
+        enclosing_capture_rekeys: &[(Rc<Path>, Rc<AbstractValue>)],
+        local_callback_anchor: Option<Rc<Path>>,
+    ) -> Option<(Rc<Path>, Vec<(Rc<Path>, Rc<AbstractValue>)>)> {
+        fn field_suffix(path: &Rc<Path>, receiver: &Rc<Path>) -> Option<Vec<usize>> {
+            let mut current = path;
+            let mut fields = Vec::new();
+            while current != receiver {
+                let PathEnum::QualifiedPath {
+                    qualifier,
+                    selector,
+                    ..
+                } = &current.value
+                else {
+                    return None;
+                };
+                let PathSelector::Field(field) = **selector else {
+                    return None;
+                };
+                fields.push(field);
+                current = qualifier;
+            }
+            fields.reverse();
+            (!fields.is_empty()).then_some(fields)
+        }
+
+        let receiver = &actual_args.first()?.0;
+        let captures = self
+            .bv
+            .current_environment
+            .value_map
+            .iter()
+            .filter_map(|(path, value)| {
+                let fields = field_suffix(path, receiver)?;
+                if value.expression.contains_local_variable(false) {
+                    return None;
+                }
+                let captured_path =
+                    Path::get_as_path(value.clone()).canonicalize(&self.bv.current_environment);
+                let PathEnum::Parameter { ordinal } = captured_path.get_path_root().value else {
+                    return None;
+                };
+                let parameter_ty = self.bv.mir.local_decls[mir::Local::from(ordinal)].ty;
+                let parameter_ty = self
+                    .type_visitor()
+                    .specialize_type(parameter_ty, &self.type_visitor().generic_argument_map);
+                let parameter_ty = self.type_visitor().get_dereferenced_type(parameter_ty);
+                (!matches!(
+                    parameter_ty.kind(),
+                    TyKind::Closure(..) | TyKind::FnDef(..) | TyKind::FnPtr(..)
+                ))
+                .then_some((fields, captured_path, value.clone()))
+            })
+            .collect::<Vec<_>>();
+        if let Some((_, captured_path, _)) = captures.first() {
+            let anchor = local_callback_anchor
+                .clone()
+                .unwrap_or_else(|| captured_path.get_path_root().clone());
+            let mut aliases = captures
+                .into_iter()
+                .map(|(fields, _, value)| {
+                    let path = fields.into_iter().fold(anchor.clone(), Path::new_field);
+                    (path, value)
+                })
+                .collect::<Vec<_>>();
+            let callee_ty = self.type_visitor().get_dereferenced_type(callee_ty);
+            if let TyKind::Closure(_, args) = callee_ty.kind() {
+                for (field, _) in args.as_closure().upvar_tys().iter().enumerate() {
+                    let boundary_path = Path::new_field(anchor.clone(), field);
+                    if aliases.iter().any(|(path, _)| *path == boundary_path) {
+                        continue;
+                    }
+                    let local_capture = Path::new_field(receiver.clone(), field);
+                    let Some(local_value) = self
+                        .bv
+                        .current_environment
+                        .value_map
+                        .get(&local_capture)
+                        .cloned()
+                    else {
+                        continue;
+                    };
+                    let boundary_value = enclosing_capture_rekeys.iter().fold(
+                        local_value,
+                        |value, (local_path, replacement)| {
+                            let replacement = Path::get_as_path(replacement.clone())
+                                .canonicalize(&self.bv.current_environment);
+                            value.replace_embedded_path_root(local_path, replacement)
+                        },
+                    );
+                    if !boundary_value.expression.contains_local_variable(false) {
+                        aliases.push((boundary_path, boundary_value));
+                    }
+                }
+            }
+            return Some((anchor, aliases));
+        }
+        if let Some(anchor) = local_callback_anchor {
+            return Some((anchor, Vec::new()));
+        }
+
+        let callee_ty = self.type_visitor().get_dereferenced_type(callee_ty);
+        let TyKind::Closure(_, args) = callee_ty.kind() else {
+            return None;
+        };
+        let mut captures = Vec::new();
+        for (field, upvar_ty) in args.as_closure().upvar_tys().iter().enumerate() {
+            let upvar_ty = self.type_visitor().get_dereferenced_type(upvar_ty);
+            if matches!(
+                upvar_ty.kind(),
+                TyKind::Closure(..) | TyKind::FnDef(..) | TyKind::FnPtr(..)
+            ) {
+                return None;
+            }
+            let matching_parameters = (1..=self.bv.mir.arg_count)
+                .filter_map(|ordinal| {
+                    let parameter_ty = self.bv.mir.local_decls[mir::Local::from(ordinal)].ty;
+                    let parameter_ty = self
+                        .type_visitor()
+                        .specialize_type(parameter_ty, &self.type_visitor().generic_argument_map);
+                    let parameter_ty = self.type_visitor().get_dereferenced_type(parameter_ty);
+                    (parameter_ty == upvar_ty).then(|| {
+                        let path = Path::new_parameter(ordinal);
+                        let value = self
+                            .bv
+                            .current_environment
+                            .value_map
+                            .get(&path)
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                AbstractValue::make_typed_unknown(
+                                    ExpressionType::from(
+                                        self.bv.mir.local_decls[mir::Local::from(ordinal)]
+                                            .ty
+                                            .kind(),
+                                    ),
+                                    path.clone(),
+                                )
+                            });
+                        (path, value)
+                    })
+                })
+                .collect::<Vec<_>>();
+            if matching_parameters.len() != 1 {
+                return None;
+            }
+            let (path, value) = matching_parameters.into_iter().next()?;
+            captures.push((field, path, value));
+        }
+        let anchor = captures.first()?.1.get_path_root().clone();
+        let aliases = captures
+            .into_iter()
+            .map(|(field, _, value)| (Path::new_field(anchor.clone(), field), value))
+            .collect();
+        Some((anchor, aliases))
+    }
+
+    pub fn get_local_closure_capture_rekeys(
+        &self,
+        actual_args: &[(Rc<Path>, Rc<AbstractValue>)],
+        actual_argument_types: &[Ty<'tcx>],
+    ) -> Vec<(Rc<Path>, Rc<AbstractValue>)> {
+        actual_args
+            .iter()
+            .zip(actual_argument_types)
+            .enumerate()
+            .filter_map(|(index, ((path, _), ty))| {
+                let ty = self.type_visitor().get_dereferenced_type(*ty);
+                let TyKind::Closure(_, args) = ty.kind() else {
+                    return None;
+                };
+                path.contains_local_variable(false).then_some((
+                    index,
+                    path,
+                    args.as_closure().upvar_tys(),
+                ))
+            })
+            .flat_map(|(index, receiver, upvar_tys)| {
+                upvar_tys.iter().enumerate().map(move |(field, upvar_ty)| {
+                    let boundary_path = Path::new_field(Path::new_parameter(index + 1), field);
+                    let boundary_value = AbstractValue::make_typed_unknown(
+                        ExpressionType::from(upvar_ty.kind()),
+                        boundary_path,
+                    );
+                    (Path::new_field(receiver.clone(), field), boundary_value)
+                })
+            })
+            .collect()
+    }
+
+    fn find_callback_parameter(
+        &mut self,
+        callee_path: Rc<Path>,
+        callee_ty: Ty<'tcx>,
+        allow_captured_parameter: bool,
+    ) -> Option<Rc<Path>> {
         let callee_path = callee_path.canonicalize(&self.bv.current_environment);
         let callee_parameter = if callee_path.is_rooted_by_parameter() {
             Some(callee_path)
         } else {
             let mut ambiguous_value_match = false;
-            let captured_parameter = if !self.bv.treat_as_foreign {
+            let captured_parameter = if !allow_captured_parameter {
                 None
             } else if let PathEnum::Computed {
                 value: callee_value,
@@ -865,7 +1215,7 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                 None
             };
             if let Some(captured_parameter) = captured_parameter {
-                return self.push_callback_invocation(captured_parameter, actual_args);
+                return Some(captured_parameter);
             }
             let callee_ty = self.type_visitor().get_dereferenced_type(callee_ty);
             let mut matching_parameters = Vec::new();
@@ -887,7 +1237,7 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                 let TyKind::Closure(_, args) = parameter_ty.kind() else {
                     continue;
                 };
-                if !self.bv.treat_as_foreign {
+                if !allow_captured_parameter {
                     continue;
                 }
                 for (field, _) in
@@ -918,16 +1268,14 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
             }
             captured_parameter
         };
-        let Some(callee_parameter) = callee_parameter else {
-            return false;
-        };
-        self.push_callback_invocation(callee_parameter, actual_args)
+        callee_parameter
     }
 
     fn push_callback_invocation(
         &mut self,
         callee_parameter: Rc<Path>,
         actual_args: &[(Rc<Path>, Rc<AbstractValue>)],
+        arguments_complete: bool,
     ) -> bool {
         let pre_state = self
             .bv
@@ -935,14 +1283,14 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
             .value_map
             .iter()
             .filter(|(path, _)| {
-                path.is_rooted_by_parameter()
+                !path.contains_local_variable(false)
                     && matches!(
                         path.value,
                         PathEnum::QualifiedPath { ref selector, .. }
                             if matches!(
                                 **selector,
-                                PathSelector::Field(_) | PathSelector::ModelField(_)
-                            )
+                            PathSelector::Field(_) | PathSelector::ModelField(_)
+                        )
                     )
             })
             .map(|(path, value)| (path.clone(), value.clone()))
@@ -951,7 +1299,9 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
             callee: callee_parameter,
             specialized_callee: None,
             function_constants: Vec::new(),
+            is_local: false,
             arguments: actual_args.to_vec(),
+            arguments_complete,
             pre_state,
             guard: self
                 .bv

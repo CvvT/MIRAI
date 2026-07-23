@@ -37,6 +37,18 @@ The fixtures are independent binaries:
 | `callback_conditional_true` | `conditional callback requires no live writer` |
 | `callback_generic_fnonce_clean` | silent; generic `FnOnce` summary resolution |
 | `callback_generic_fnonce_violation` | `read requires no live writer` |
+| `callback_returned_guard_adapted_violation` | `read requires no live writer`; an adapter may forward an unavailable callback argument that the eventual callback ignores |
+| `callback_returned_guard_clean` | silent; a callback invoked through a returned `DerefMut` guard reads an unrelated owner |
+| `callback_returned_guard_conditional_clean` | silent; the callback runs on the branch that does not acquire the returned guard |
+| `callback_returned_guard_conditional_violation` | `read requires no live writer`; the callback runs on the branch that acquires the returned guard |
+| `callback_returned_guard_direct_violation` | `read requires no live writer`; direct callback invocation through a returned `DerefMut` guard preserves sibling-owner state |
+| `callback_returned_guard_nested_clean` | silent; two forwarding boundaries preserve an unrelated captured owner |
+| `callback_returned_guard_nested_violation` | `read requires no live writer`; callback state survives two forwarding boundaries |
+| `callback_returned_guard_non_root_violation` | `read requires no live writer`; deferred callback state survives a non-root persisted summary |
+| `callback_returned_guard_released_clean` | silent; releasing the returned guard before forwarding clears the writer state |
+| `callback_returned_guard_unavailable_argument` | visible incomplete-analysis diagnostic; a used guard-local callback argument is not serialized as a reusable path |
+| `callback_returned_guard_unavailable_independent_violation` | `read requires no live writer`; an unavailable side effect does not hide an independent lock violation |
+| `callback_returned_guard_violation` | `read requires no live writer`; forwarding preserves the captured sibling owner's writer state |
 | `callback_sequential_counter_clean` | silent; second callback observes `read_count == 1` |
 | `callback_sequential_counter_violation` | second callback's incorrect `read_count == 2` requirement fires |
 | `callback_specialization_clean` | silent; two closure specializations stay isolated |

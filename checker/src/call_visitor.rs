@@ -28,7 +28,7 @@ use crate::k_limits;
 use crate::known_names::KnownNames;
 use crate::options::DiagLevel;
 use crate::path::{Path, PathEnum, PathRefinement, PathRoot, PathSelector};
-use crate::summaries::{Precondition, Summary};
+use crate::summaries::{CallbackInvocation, Precondition, Summary};
 use crate::tag_domain::Tag;
 use crate::type_visitor::TypeVisitor;
 use crate::{abstract_value, utils};
@@ -2875,9 +2875,19 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
     }
 
     fn replay_callback_invocations(&mut self, function_summary: &Summary) {
+        self.replay_callback_invocations_with_anchor(function_summary, None);
+    }
+
+    fn replay_callback_invocations_with_anchor(
+        &mut self,
+        function_summary: &Summary,
+        parent_callback_anchor: Option<Rc<Path>>,
+    ) {
         if function_summary.callback_invocations.is_empty() {
             return;
         }
+        let diagnostics_before_replay = self.block_visitor.bv.buffered_diagnostics.len();
+        let mut callback_analysis_is_incomplete = false;
         let outer_environment = self.block_visitor.bv.current_environment.clone();
         let no_result = None;
         for invocation in &function_summary.callback_invocations {
@@ -2897,12 +2907,13 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 self.report_unresolvable_callback();
                 continue;
             };
-            let captured_field = matches!(
-                invocation.callee.value,
-                PathEnum::QualifiedPath { ref selector, .. }
-                    if matches!(**selector, PathSelector::Field(_))
-            );
-            let (callback_path, callback_value) = if !captured_field {
+            let derived_callee = invocation.is_local
+                || matches!(
+                    invocation.callee.value,
+                    PathEnum::QualifiedPath { ref selector, .. }
+                        if matches!(**selector, PathSelector::Field(_))
+                );
+            let (callback_path, callback_value) = if !derived_callee {
                 (root_callback_path.clone(), root_callback_value.clone())
             } else {
                 let refined_callee = invocation.callee.refine_parameters_and_paths(
@@ -2918,18 +2929,43 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                     .or_else(|| self.environment_before_call.value_at(&function_path))
                     .or_else(|| outer_environment.value_at(&refined_callee))
                     .or_else(|| self.environment_before_call.value_at(&refined_callee));
-                let Some(value) = value else {
+                let value = if let Some(value) = value {
+                    value.clone()
+                } else if let Some(specialized_callee) = &invocation.specialized_callee {
+                    if self.callee_func_ref.as_ref().is_some_and(|callee| {
+                        callee.summary_cache_key == specialized_callee.summary_cache_key
+                    }) {
+                        trace!("ignoring unresolved self-specialized captured callback");
+                        continue;
+                    }
+                    Rc::new(ConstantDomain::Function(specialized_callee.clone()).into())
+                } else {
                     trace!("captured callback path did not resolve to a function");
                     self.report_unresolvable_callback();
                     continue;
                 };
-                (refined_callee, value.clone())
+                (refined_callee, value)
             };
-            let Some(callback_ref) = self.block_visitor.get_func_ref(&callback_value) else {
+            let callback_ref = if invocation.is_local {
+                invocation.specialized_callee.clone()
+            } else {
+                self.block_visitor
+                    .get_func_ref(&callback_value)
+                    .or_else(|| invocation.specialized_callee.clone())
+            };
+            let Some(callback_ref) = callback_ref else {
                 trace!("callback argument did not resolve to a function");
                 self.report_unresolvable_callback();
                 continue;
             };
+            if invocation.is_local
+                && self.callee_func_ref.as_ref().is_some_and(|callee| {
+                    callee.summary_cache_key == callback_ref.summary_cache_key
+                })
+            {
+                trace!("ignoring self-specialized local callback");
+                continue;
+            }
             let callback_args = if invocation.function_constants.is_empty() {
                 let function_constant_args = self.function_constant_args.to_vec();
                 self.get_function_constant_signature(function_constant_args.as_slice())
@@ -2972,11 +3008,31 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 self.report_unresolvable_callback();
                 continue;
             }
+            if !invocation.arguments_complete
+                && Self::remove_unavailable_argument_dependencies(invocation, &mut callback_summary)
+            {
+                if self.block_visitor.bv.check_for_errors {
+                    callback_analysis_is_incomplete = true;
+                }
+            }
 
             let mut callback_arguments: Vec<(Rc<Path>, Rc<AbstractValue>)> = invocation
                 .arguments
                 .iter()
-                .map(|(path, value)| {
+                .enumerate()
+                .map(|(index, (path, value))| {
+                    if value.is_bottom()
+                        || matches!(
+                            &path.value,
+                            PathEnum::Computed { value } if value.is_bottom()
+                        )
+                    {
+                        let marker = Path::new_local(999_998, index);
+                        return (
+                            marker.clone(),
+                            AbstractValue::make_typed_unknown(ExpressionType::NonPrimitive, marker),
+                        );
+                    }
                     (
                         path.refine_parameters_and_paths(
                             &self.actual_args,
@@ -2997,7 +3053,7 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 .collect();
             if let Some((path, value)) = callback_arguments.first_mut() {
                 if value.is_function() {
-                    *path = callback_path;
+                    *path = callback_path.clone();
                 }
             }
             let mut callback_environment = outer_environment.clone();
@@ -3030,9 +3086,108 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 );
                 callback_environment.strong_update_value_at(refined_path, refined_value);
             }
+            if self.block_visitor.bv.check_for_errors {
+                callback_summary
+                    .preconditions
+                    .retain(|callback_precondition| {
+                        let refined_callback_condition =
+                            callback_precondition.condition.refine_parameters_and_paths(
+                                &callback_arguments,
+                                &no_result,
+                                &callback_environment,
+                                &callback_environment,
+                                self.block_visitor.bv.fresh_variable_offset,
+                            );
+                        !function_summary
+                            .preconditions
+                            .iter()
+                            .any(|outer_precondition| {
+                                outer_precondition.message == callback_precondition.message
+                                    && outer_precondition.condition.refine_parameters_and_paths(
+                                        &self.actual_args,
+                                        &no_result,
+                                        &self.environment_before_call,
+                                        &outer_environment,
+                                        self.block_visitor.bv.fresh_variable_offset,
+                                    ) == refined_callback_condition
+                            })
+                    });
+            }
 
             self.block_visitor.bv.current_environment = callback_environment.clone();
+            let callback_count_before_lift = self.block_visitor.bv.callback_invocations.len();
+            let mut enclosing_capture_rekeys = self
+                .block_visitor
+                .get_local_closure_capture_rekeys(&self.actual_args, &self.actual_argument_types);
+            if let Some(parent_callback_anchor) = &parent_callback_anchor {
+                enclosing_capture_rekeys.extend(invocation.pre_state.iter().filter_map(
+                    |(captured_path, source_value)| {
+                        if !captured_path.is_rooted_by(&invocation.callee) {
+                            return None;
+                        }
+                        let source_path = Path::get_as_path(source_value.clone())
+                            .remove_initial_value_wrapper()
+                            .canonicalize(&callback_environment);
+                        if source_path.contains_local_variable(false) {
+                            return None;
+                        }
+                        let boundary_path = captured_path
+                            .replace_root(&invocation.callee, parent_callback_anchor.clone());
+                        let boundary_value = AbstractValue::make_typed_unknown(
+                            source_value.expression.infer_type(),
+                            boundary_path,
+                        );
+                        Some((source_path, boundary_value))
+                    },
+                ));
+            }
+            let callback_type = self.actual_argument_types.get(argument_index).copied();
+            let requires_local_lift =
+                parent_callback_anchor.is_some() || callback_path.contains_local_variable(false);
+            let mut lifted_callback = !requires_local_lift
+                && callback_type.is_some_and(|callback_type| {
+                    self.block_visitor.record_transitive_callback_invocation(
+                        callback_path.clone(),
+                        callback_type,
+                        &callback_arguments,
+                        invocation.specialized_callee.clone(),
+                        &invocation.function_constants,
+                        invocation.is_local,
+                        false,
+                        &enclosing_capture_rekeys,
+                        None,
+                    )
+                });
+            if !lifted_callback
+                && (parent_callback_anchor.is_some()
+                    || derived_callee
+                    || callback_path.contains_local_variable(false))
             {
+                let callback_type = callback_type.unwrap_or_else(|| {
+                    self.type_visitor()
+                        .get_path_rustc_type(&callback_path, self.block_visitor.bv.current_span)
+                });
+                lifted_callback = self.block_visitor.record_transitive_callback_invocation(
+                    callback_path.clone(),
+                    callback_type,
+                    &callback_arguments,
+                    invocation.specialized_callee.clone(),
+                    &invocation.function_constants,
+                    invocation.is_local,
+                    true,
+                    &enclosing_capture_rekeys,
+                    parent_callback_anchor.clone(),
+                );
+            }
+            let callback_count_after_lift = self.block_visitor.bv.callback_invocations.len();
+            {
+                let callback_argument_types = callback_arguments
+                    .iter()
+                    .map(|(path, _)| {
+                        self.type_visitor()
+                            .get_path_rustc_type(path, self.block_visitor.bv.current_span)
+                    })
+                    .collect();
                 let mut block_visitor = BlockVisitor::new(self.block_visitor.bv);
                 let mut callback_visitor = CallVisitor::new(
                     &mut block_visitor,
@@ -3043,19 +3198,37 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                     ConstantDomain::Function(callback_ref),
                 );
                 callback_visitor.actual_args = callback_arguments;
+                callback_visitor.actual_argument_types = callback_argument_types;
                 callback_visitor.callee_fun_val = callback_value;
                 callback_visitor.is_indirect_function_call = true;
-                callback_visitor.check_preconditions_if_necessary(&callback_summary);
                 let mut captured_summary = callback_summary.clone();
                 captured_summary.callback_invocations.retain(|invocation| {
-                    matches!(
-                        invocation.callee.value,
-                        PathEnum::QualifiedPath { ref selector, .. }
-                            if matches!(**selector, PathSelector::Field(_))
-                    )
+                    invocation.is_local
+                        || matches!(
+                            invocation.callee.value,
+                            PathEnum::QualifiedPath { ref selector, .. }
+                                if matches!(**selector, PathSelector::Field(_))
+                        )
                 });
                 if !captured_summary.callback_invocations.is_empty() {
-                    callback_visitor.replay_callback_invocations(&captured_summary);
+                    callback_visitor.replay_callback_invocations_with_anchor(
+                        &captured_summary,
+                        Some(invocation.callee.clone()),
+                    );
+                }
+                let nested_callback_lifted =
+                    callback_visitor.block_visitor.bv.callback_invocations.len()
+                        > callback_count_after_lift;
+                if nested_callback_lifted && callback_count_after_lift > callback_count_before_lift
+                {
+                    callback_visitor
+                        .block_visitor
+                        .bv
+                        .callback_invocations
+                        .remove(callback_count_before_lift);
+                }
+                if !lifted_callback && !nested_callback_lifted {
+                    callback_visitor.check_preconditions_if_necessary(&callback_summary);
                 }
 
                 for (index, (target_path, _)) in callback_visitor.actual_args.iter().enumerate() {
@@ -3071,6 +3244,230 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             }
             self.block_visitor.bv.current_environment = outer_environment.clone();
         }
+        if callback_analysis_is_incomplete {
+            self.block_visitor.bv.analysis_is_incomplete = true;
+            if self.block_visitor.bv.buffered_diagnostics.len() == diagnostics_before_replay {
+                self.report_unrepresentable_callback_argument();
+            }
+        }
+    }
+
+    fn remove_unavailable_argument_dependencies(
+        invocation: &CallbackInvocation,
+        callback_summary: &mut Summary,
+    ) -> bool {
+        let mut removed = false;
+        callback_summary.preconditions.retain(|precondition| {
+            let uses_unavailable = Self::callback_component_uses_unavailable_argument(
+                invocation,
+                None,
+                Some(&precondition.condition),
+            );
+            if !uses_unavailable {
+                return true;
+            }
+            removed = true;
+            Self::callback_component_uses_available_argument(
+                invocation,
+                None,
+                Some(&precondition.condition),
+            )
+        });
+        callback_summary.assumed_aliases.retain(|(alias, source)| {
+            let keep =
+                !Self::callback_component_uses_unavailable_argument(invocation, Some(alias), None)
+                    && !Self::callback_component_uses_unavailable_argument(
+                        invocation,
+                        Some(source),
+                        None,
+                    );
+            removed |= !keep;
+            keep
+        });
+        callback_summary
+            .guarded_aliases
+            .retain(|(alias, source, condition)| {
+                let keep = !Self::callback_component_uses_unavailable_argument(
+                    invocation,
+                    Some(alias),
+                    None,
+                ) && !Self::callback_component_uses_unavailable_argument(
+                    invocation,
+                    Some(source),
+                    None,
+                ) && !Self::callback_component_uses_unavailable_argument(
+                    invocation,
+                    None,
+                    Some(condition),
+                );
+                removed |= !keep;
+                keep
+            });
+        callback_summary.side_effects.retain(|(path, value)| {
+            let keep = !Self::callback_component_uses_unavailable_argument(
+                invocation,
+                Some(path),
+                Some(value),
+            );
+            removed |= !keep;
+            keep
+        });
+        if callback_summary
+            .post_condition
+            .as_ref()
+            .is_some_and(|value| {
+                Self::callback_component_uses_unavailable_argument(invocation, None, Some(value))
+            })
+        {
+            callback_summary.post_condition = None;
+            removed = true;
+        }
+        callback_summary
+            .callback_invocations
+            .retain_mut(|callback_invocation| {
+                if Self::callback_component_uses_unavailable_argument(
+                    invocation,
+                    Some(&callback_invocation.callee),
+                    None,
+                ) {
+                    removed = true;
+                    return false;
+                }
+                if Self::callback_component_uses_unavailable_argument(
+                    invocation,
+                    None,
+                    Some(&callback_invocation.guard),
+                ) {
+                    callback_invocation.guard = Rc::new(abstract_value::TRUE);
+                    removed = true;
+                }
+                for (path, value) in &mut callback_invocation.arguments {
+                    if Self::callback_component_uses_unavailable_argument(
+                        invocation,
+                        Some(path),
+                        Some(value),
+                    ) {
+                        *path = Path::new_computed(Rc::new(abstract_value::BOTTOM));
+                        *value = Rc::new(abstract_value::BOTTOM);
+                        callback_invocation.arguments_complete = false;
+                    }
+                }
+                callback_invocation.pre_state.retain(|(path, value)| {
+                    let keep = !Self::callback_component_uses_unavailable_argument(
+                        invocation,
+                        Some(path),
+                        Some(value),
+                    );
+                    removed |= !keep;
+                    keep
+                });
+                true
+            });
+        removed
+    }
+
+    fn callback_component_uses_unavailable_argument(
+        invocation: &CallbackInvocation,
+        path: Option<&Rc<Path>>,
+        value: Option<&Rc<AbstractValue>>,
+    ) -> bool {
+        Self::callback_component_uses_matching_argument(invocation, path, value, |path, value| {
+            value.is_bottom()
+                || matches!(
+                    &path.value,
+                    PathEnum::Computed { value } if value.is_bottom()
+                )
+        })
+    }
+
+    fn callback_component_uses_available_argument(
+        invocation: &CallbackInvocation,
+        path: Option<&Rc<Path>>,
+        value: Option<&Rc<AbstractValue>>,
+    ) -> bool {
+        Self::callback_component_uses_matching_argument(invocation, path, value, |path, value| {
+            !value.is_bottom()
+                && !matches!(
+                    &path.value,
+                    PathEnum::Computed { value } if value.is_bottom()
+                )
+        })
+    }
+
+    fn callback_component_uses_matching_argument(
+        invocation: &CallbackInvocation,
+        path: Option<&Rc<Path>>,
+        value: Option<&Rc<AbstractValue>>,
+        matches_argument: impl Fn(&Rc<Path>, &Rc<AbstractValue>) -> bool,
+    ) -> bool {
+        invocation
+            .arguments
+            .iter()
+            .enumerate()
+            .filter(|(_, (path, value))| matches_argument(path, value))
+            .any(|(index, _)| {
+                let marker = Path::new_local(999_999, 0);
+                let identity_args = (0..invocation.arguments.len())
+                    .map(|argument_index| {
+                        let path = Path::new_parameter(argument_index + 1);
+                        let value = AbstractValue::make_typed_unknown(
+                            ExpressionType::NonPrimitive,
+                            path.clone(),
+                        );
+                        (path, value)
+                    })
+                    .collect::<Vec<_>>();
+                let marker_args = identity_args
+                    .iter()
+                    .enumerate()
+                    .map(|(argument_index, (path, value))| {
+                        if argument_index == index {
+                            (
+                                marker.clone(),
+                                AbstractValue::make_typed_unknown(
+                                    ExpressionType::NonPrimitive,
+                                    marker.clone(),
+                                ),
+                            )
+                        } else {
+                            (path.clone(), value.clone())
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let environment = Environment::default();
+                let result = Some(Path::new_result());
+                let path_uses_parameter = path.is_some_and(|path| {
+                    path.refine_parameters_and_paths(
+                        &identity_args,
+                        &result,
+                        &environment,
+                        &environment,
+                        0,
+                    ) != path.refine_parameters_and_paths(
+                        &marker_args,
+                        &result,
+                        &environment,
+                        &environment,
+                        0,
+                    )
+                });
+                let value_uses_parameter = value.is_some_and(|value| {
+                    value.refine_parameters_and_paths(
+                        &identity_args,
+                        &result,
+                        &environment,
+                        &environment,
+                        0,
+                    ) != value.refine_parameters_and_paths(
+                        &marker_args,
+                        &result,
+                        &environment,
+                        &environment,
+                        0,
+                    )
+                });
+                path_uses_parameter || value_uses_parameter
+            })
     }
 
     fn report_unresolvable_callback(&mut self) {
@@ -3078,6 +3475,15 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
         let warning = self.block_visitor.bv.cv.session.dcx().struct_span_warn(
             self.block_visitor.bv.current_span,
             "[MIRAI] callback invocation could not be resolved",
+        );
+        self.block_visitor.bv.emit_diagnostic(warning);
+    }
+
+    fn report_unrepresentable_callback_argument(&mut self) {
+        self.block_visitor.bv.analysis_is_incomplete = true;
+        let warning = self.block_visitor.bv.cv.session.dcx().struct_span_warn(
+            self.block_visitor.bv.current_span,
+            "[MIRAI] callback argument could not be represented in summary",
         );
         self.block_visitor.bv.emit_diagnostic(warning);
     }

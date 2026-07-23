@@ -121,9 +121,13 @@ pub struct Summary {
 pub struct CallbackInvocation {
     /// The function-typed parameter invoked by the summarized function.
     pub callee: Rc<Path>,
-    /// Callback arguments expressed in terms of the summarized function's parameters.
+    /// Callback arguments expressed in terms of the summarized function's parameters. An
+    /// unavailable argument is represented by BOTTOM and marks the invocation incomplete.
     pub arguments: Vec<(Rc<Path>, Rc<AbstractValue>)>,
-    /// Parameter-rooted field values visible at the callback invocation point.
+    /// False if any callback argument could not be expressed in the summary's path namespace.
+    #[serde(default = "complete_callback_arguments")]
+    pub arguments_complete: bool,
+    /// Boundary-refinable field values visible at the callback invocation point.
     pub pre_state: Vec<(Rc<Path>, Rc<AbstractValue>)>,
     /// The path condition under which the callback is invoked.
     pub guard: Rc<AbstractValue>,
@@ -131,6 +135,14 @@ pub struct CallbackInvocation {
     pub specialized_callee: Option<Rc<FunctionReference>>,
     /// Transitive function constants used to specialize the callback summary.
     pub function_constants: Vec<Rc<FunctionReference>>,
+    /// True when the invoked closure is local to the summarized function and is anchored to one
+    /// of its captured parameters for serialization.
+    #[serde(default)]
+    pub is_local: bool,
+}
+
+fn complete_callback_arguments() -> bool {
+    true
 }
 
 #[derive(Deserialize)]
@@ -179,8 +191,10 @@ impl From<PreviousSummary> for Summary {
                     specialized_callee: None,
                     function_constants: Vec::new(),
                     arguments: invocation.arguments,
+                    arguments_complete: true,
                     pre_state: invocation.pre_state,
                     guard: invocation.guard,
+                    is_local: false,
                 })
                 .collect(),
         }
@@ -218,8 +232,10 @@ impl From<OlderSummary> for Summary {
                     specialized_callee: None,
                     function_constants: Vec::new(),
                     arguments: invocation.arguments,
+                    arguments_complete: true,
                     pre_state: invocation.pre_state,
                     guard: Rc::new(abstract_value::TRUE),
+                    is_local: false,
                 })
                 .collect(),
         }
@@ -691,9 +707,11 @@ impl<'tcx> SummaryCache<'tcx> {
     #[logfn_inputs(TRACE)]
     fn create_summary_store_if_needed(summary_store_directory_str: &str) -> std::path::PathBuf {
         use std::env;
-        use std::fs::File;
-        use std::io::Write;
+        use std::fs::OpenOptions;
+        use std::io::Cursor;
         use std::path::Path;
+
+        use fs2::FileExt;
         use tar::Archive;
 
         let directory_path = Path::new(summary_store_directory_str);
@@ -701,15 +719,19 @@ impl<'tcx> SummaryCache<'tcx> {
         if env::var("MIRAI_START_FRESH").is_ok() {
             std::fs::remove_dir_all(directory_path).unwrap();
             std::fs::create_dir_all(directory_path).unwrap();
-        } else if env::var("MIRAI_SHARE_PERSISTENT_STORE").is_err() {
-            info!("creating a new summary store from the embedded tar file");
-            {
-                let tar_path = directory_path.join(".summary_store.tar");
-                let mut tar_file = File::create(tar_path.clone()).unwrap();
+        } else if !store_path.exists() {
+            std::fs::create_dir_all(directory_path).unwrap();
+            let initialization_lock = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .open(directory_path.join(".summary_store.init.lock"))
+                .unwrap();
+            initialization_lock.lock_exclusive().unwrap();
+            if !store_path.exists() {
+                info!("creating a new summary store from the embedded tar file");
                 let bytes = include_bytes!("../../binaries/summary_store.tar");
-                tar_file.write_all(bytes).unwrap();
-                let tar_file = File::open(tar_path).unwrap();
-                let mut ar = Archive::new(tar_file);
+                let mut ar = Archive::new(Cursor::new(bytes));
                 ar.unpack(directory_path).unwrap();
             }
         }
@@ -1073,7 +1095,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "tripwire: shared stores currently skip embedded standard summaries"]
     fn shared_store_seeds_embedded_standard_summaries() {
         let _lock = SUMMARY_STORE_ENVIRONMENT_LOCK
             .lock()

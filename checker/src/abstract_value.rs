@@ -6890,9 +6890,18 @@ impl AbstractValueTrait for Rc<AbstractValue> {
             Expression::Offset { left, right } => left
                 .replace_embedded_path_root(old_root, new_root)
                 .offset(right.clone()),
+            Expression::Rem { left, right } => left
+                .replace_embedded_path_root(old_root, new_root)
+                .remainder(right.clone()),
             Expression::Reference(path) => {
                 AbstractValue::make_reference(path.replace_root(old_root, new_root))
             }
+            Expression::Transmute {
+                operand,
+                target_type,
+            } => operand
+                .replace_embedded_path_root(old_root, new_root)
+                .transmute(*target_type),
             Expression::Variable { path, var_type } => {
                 AbstractValue::make_typed_unknown(*var_type, path.replace_root(old_root, new_root))
             }
