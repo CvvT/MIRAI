@@ -40,6 +40,8 @@ $expectations = [ordered]@{
     "callback_nested_hof_violation" = "read requires no live writer"
     "callback_non_model_pre_state" = $null
     "callback_reentrant"           = "write requires no live writer"
+    "callback_returned_field_guard_alias_violation" = "read requires no live writer"
+    "callback_returned_field_guard_violation" = "read requires no live writer"
     "callback_returned_guard_adapted_violation" = "read requires no live writer"
     "callback_returned_guard_clean" = $null
     "callback_returned_guard_conditional_clean" = $null
@@ -89,6 +91,8 @@ $summaryOnlyBins = @(
     "callback_nested_hof_clean",
     "callback_nested_hof_violation",
     "callback_non_model_pre_state",
+    "callback_returned_field_guard_alias_violation",
+    "callback_returned_field_guard_violation",
     "callback_returned_guard_adapted_violation",
     "callback_returned_guard_clean",
     "callback_returned_guard_direct_violation",
@@ -121,6 +125,11 @@ $knownLimitationBins = @(
     "callback_local_guard_false"
 )
 
+$returnedFieldGuardBins = @(
+    "callback_returned_field_guard_alias_violation",
+    "callback_returned_field_guard_violation"
+)
+
 $summaryOnlyOnlyBins = @(
     "callback_loop_violation",
     "callback_unresolvable"
@@ -145,6 +154,8 @@ $summaryOnlyHofBins = @(
     "callback_multi_hop_violation",
     "callback_nested_hof_violation",
     "callback_non_model_pre_state",
+    "callback_returned_field_guard_alias_violation",
+    "callback_returned_field_guard_violation",
     "callback_returned_guard_adapted_violation",
     "callback_returned_guard_clean",
     "callback_returned_guard_direct_violation",
@@ -163,7 +174,8 @@ $verifyBins = @(
 $scriptRoot = $PSScriptRoot
 $repositoryRoot = (Resolve-Path (Join-Path $scriptRoot "..\..")).Path
 $manifestPath = Join-Path $scriptRoot "Cargo.toml"
-$miraiPath = Join-Path $repositoryRoot "target\debug\mirai.exe"
+$miraiExecutable = if ($IsWindows) { "mirai.exe" } else { "mirai" }
+$miraiPath = Join-Path $repositoryRoot "target\debug\$miraiExecutable"
 $sweepTarget = Join-Path $repositoryRoot "target\rwlock-example-sweep"
 $summarySweepTarget = Join-Path $repositoryRoot "target\rwlock-summary-sweep"
 $knownLimitationSweepTarget = Join-Path $repositoryRoot "target\rwlock-known-limitation-sweep"
@@ -247,7 +259,7 @@ try {
         throw "Failed to locate the Rust sysroot (exit $LASTEXITCODE)."
     }
 
-    $env:PATH = "$(Join-Path $sysroot "bin");$originalPath"
+    $env:PATH = "$(Join-Path $sysroot "bin")$([System.IO.Path]::PathSeparator)$originalPath"
     $env:RUSTC_WORKSPACE_WRAPPER = (Resolve-Path $miraiPath).Path
     # MIRAI_START_FRESH recreates the shared summary directory, so wrapped rustc jobs must serialize.
     $env:CARGO_BUILD_JOBS = "1"
@@ -394,10 +406,26 @@ try {
                 $_ -match "get_persistent_summary_for_db\(\) => Some\(Summary"
             }
         )
+        $completeCallbackSummaries = @(
+            $persistentSummaryLoads | Where-Object {
+                $_ -match "is_incomplete: false" -and
+                $_ -match "callback_invocations: \[CallbackInvocation"
+            }
+        )
+        $populatedWriteHeldPreState = @(
+            $completeCallbackSummaries | Where-Object {
+                $_ -match 'pre_state: \[\(.*"write_held", 1u\)\]'
+            }
+        )
         if ($SummaryOnly) {
             $passedExpectation = $passedExpectation -and
                 $providerBodyEntries.Count -eq 0 -and
                 $persistentSummaryLoads.Count -gt 0
+            if ($bin -in $returnedFieldGuardBins) {
+                $passedExpectation = $passedExpectation -and
+                    $completeCallbackSummaries.Count -gt 0 -and
+                    $populatedWriteHeldPreState.Count -gt 0
+            }
         }
 
         $actualText = if ($miraiDiagnostics.Count -eq 0) {
@@ -409,6 +437,9 @@ try {
         }
         if ($SummaryOnly) {
             $actualText += "; persistent loads: $($persistentSummaryLoads.Count); provider body entries: $($providerBodyEntries.Count)"
+            if ($bin -in $returnedFieldGuardBins) {
+                $actualText += "; complete callback summaries: $($completeCallbackSummaries.Count); populated write_held pre-state: $($populatedWriteHeldPreState.Count)"
+            }
         }
         if ($bin -in $verifyBins) {
             $actualText += "; diag: verify"

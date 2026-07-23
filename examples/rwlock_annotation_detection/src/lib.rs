@@ -3,6 +3,7 @@
 use mirai_annotations::*;
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
 
 pub struct ModeledRwLock<T> {
     _value: PhantomData<T>,
@@ -102,6 +103,19 @@ pub struct DescriptorTableGuard<'a> {
     table: DescriptorTable,
 }
 
+pub struct FieldDescriptorOwner {
+    x: Arc<FieldDescriptorOwnerInner>,
+}
+
+struct FieldDescriptorOwnerInner {
+    descriptors: ModeledRwLock<DescriptorTable>,
+}
+
+pub struct FieldDescriptorTableGuard<'a> {
+    _guard: WriteGuard<'a, DescriptorTable>,
+    table: DescriptorTable,
+}
+
 impl DescriptorOwner {
     pub fn descriptor_table_mut(&self) -> DescriptorTableGuard<'_> {
         precondition!(
@@ -128,6 +142,45 @@ impl DescriptorOwner {
             get_model_field!(self, write_held, 0usize) == 0,
             "read requires no live writer"
         );
+    }
+}
+
+impl FieldDescriptorOwner {
+    pub fn new() -> Self {
+        Self {
+            x: Arc::new(FieldDescriptorOwnerInner {
+                descriptors: ModeledRwLock::new(DescriptorTable::new()),
+            }),
+        }
+    }
+
+    pub fn descriptor_table_mut(&self) -> FieldDescriptorTableGuard<'_> {
+        FieldDescriptorTableGuard {
+            _guard: self.x.descriptors.write(),
+            table: DescriptorTable::new(),
+        }
+    }
+
+    pub fn clone_handle(&self) -> Self {
+        let result = Self {
+            x: Arc::clone(&self.x),
+        };
+        assumed_alias!(&result.x, &self.x);
+        result
+    }
+
+    pub fn assume_alias(&self, source: &Self) {
+        assumed_alias!(&self.x, &source.x);
+    }
+
+    pub fn read(&self) {
+        let _guard = self.x.descriptors.read();
+    }
+}
+
+impl Default for FieldDescriptorOwner {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -161,6 +214,20 @@ impl Deref for DescriptorTableGuard<'_> {
 }
 
 impl DerefMut for DescriptorTableGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.table
+    }
+}
+
+impl Deref for FieldDescriptorTableGuard<'_> {
+    type Target = DescriptorTable;
+
+    fn deref(&self) -> &Self::Target {
+        &self.table
+    }
+}
+
+impl DerefMut for FieldDescriptorTableGuard<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.table
     }

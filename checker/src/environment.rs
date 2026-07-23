@@ -7,7 +7,7 @@ use crate::abstract_value;
 use crate::abstract_value::AbstractValue;
 use crate::abstract_value::AbstractValueTrait;
 use crate::expression::{Expression, ExpressionType};
-use crate::path::{Path, PathEnum, PathRoot, PathSelector};
+use crate::path::{Path, PathEnum, PathRefinement, PathRoot, PathSelector};
 
 use crate::body_visitor::BodyVisitor;
 use crate::constant_domain::ConstantDomain;
@@ -54,6 +54,92 @@ impl Debug for Environment {
 
 /// Methods
 impl Environment {
+    /// True when `path` has not been reassigned in this environment, so `old(path)` and the
+    /// current `path` denote the same pointer. This holds when there is no binding (still the
+    /// entry value), when it binds to the dummy self-referential `old(path)` (the same
+    /// loop-invariance oracle used in `Path::canonicalize`), or when it binds to a `Reference`,
+    /// i.e. the parameter's own `&p`. A later reassignment lands on a distinct current value that
+    /// never keys the `&p` model field, so a reassigned pointer cannot be collapsed here.
+    fn parameter_is_invariant(&self, path: &Rc<Path>) -> bool {
+        self.value_at(path).is_none_or(|value| {
+            matches!(
+                &value.expression,
+                Expression::InitialParameterValue {
+                    path: initial_path,
+                    ..
+                } if initial_path == path
+            ) || matches!(
+                &value.expression,
+                // Replay stores the current Arc root as &p; reassignment replaces this binding.
+                Expression::Reference(_)
+            )
+        })
+    }
+
+    fn strip_invariant_old_from_pointer_value(
+        &self,
+        value: &Rc<AbstractValue>,
+    ) -> Rc<AbstractValue> {
+        let expression = match &value.expression {
+            Expression::InitialParameterValue { path, var_type }
+                if self.parameter_is_invariant(path) =>
+            {
+                if *var_type == ExpressionType::U128 {
+                    return AbstractValue::make_reference(path.clone());
+                }
+                return AbstractValue::make_typed_unknown(*var_type, path.clone());
+            }
+            Expression::BitAnd { left, right } => Expression::BitAnd {
+                left: self.strip_invariant_old_from_pointer_value(left),
+                right: self.strip_invariant_old_from_pointer_value(right),
+            },
+            Expression::Cast {
+                operand,
+                target_type,
+            } => Expression::Cast {
+                operand: self.strip_invariant_old_from_pointer_value(operand),
+                target_type: *target_type,
+            },
+            Expression::Offset { left, right } => Expression::Offset {
+                left: self.strip_invariant_old_from_pointer_value(left),
+                right: self.strip_invariant_old_from_pointer_value(right),
+            },
+            Expression::Rem { left, right } => Expression::Rem {
+                left: self.strip_invariant_old_from_pointer_value(left),
+                right: self.strip_invariant_old_from_pointer_value(right),
+            },
+            Expression::Transmute {
+                operand,
+                target_type,
+            } => Expression::Transmute {
+                operand: self.strip_invariant_old_from_pointer_value(operand),
+                target_type: *target_type,
+            },
+            _ => return value.clone(),
+        };
+        AbstractValue::make_from(expression, value.expression_size)
+    }
+
+    fn strip_invariant_old_from_pointer_root(&self, path: Rc<Path>) -> Rc<Path> {
+        match &path.value {
+            PathEnum::Computed { value } => {
+                Path::new_computed(self.strip_invariant_old_from_pointer_value(value))
+            }
+            PathEnum::Offset { value } => {
+                Path::get_as_path(self.strip_invariant_old_from_pointer_value(value))
+            }
+            PathEnum::QualifiedPath {
+                qualifier,
+                selector,
+                ..
+            } => Path::new_qualified(
+                self.strip_invariant_old_from_pointer_root(qualifier.clone()),
+                selector.clone(),
+            ),
+            _ => path,
+        }
+    }
+
     /// Records an alias relationship that holds throughout this environment.
     pub fn assume_alias(&mut self, alias: Rc<Path>, source: Rc<Path>) {
         let relationship = (alias, source);
@@ -82,6 +168,95 @@ impl Environment {
                     .or_insert(condition);
             }
         }
+    }
+
+    /// Rewrites aliases in the qualifier of a model-field path to their canonical sources.
+    pub fn canonicalize_model_field_path(&self, path: Rc<Path>) -> Rc<Path> {
+        let PathEnum::QualifiedPath { selector, .. } = &path.value else {
+            return path;
+        };
+        if !matches!(
+            selector.as_ref(),
+            PathSelector::ModelField(_) | PathSelector::TagField
+        ) {
+            return path;
+        }
+
+        let mut result = path;
+        let mut visited = HashSet::new();
+        let mut aliases: Vec<_> = self
+            .assumed_aliases
+            .iter()
+            .filter(|(alias, source)| !source.is_rooted_by(alias))
+            .collect();
+        aliases.sort_by(|(left_alias, left_source), (right_alias, right_source)| {
+            left_alias
+                .cmp(right_alias)
+                .then_with(|| left_source.cmp(right_source))
+        });
+        while visited.insert(result.clone()) {
+            let mut best: Option<(&Rc<Path>, &Rc<Path>)> = None;
+            for (alias, source) in &aliases {
+                if result != *alias && !result.is_rooted_by(alias) {
+                    continue;
+                }
+                if best
+                    .as_ref()
+                    .is_none_or(|(current, _)| alias.is_rooted_by(current))
+                {
+                    best = Some((alias, source));
+                }
+            }
+            let Some((alias, source)) = best else {
+                break;
+            };
+            result = result.replace_root(alias, source.clone());
+        }
+        result
+    }
+
+    /// Looks up a model field through unconditional and guarded alias prefixes.
+    pub fn value_at_aliased_model_field(
+        &self,
+        path: &Rc<Path>,
+        default: Rc<AbstractValue>,
+    ) -> Option<Rc<AbstractValue>> {
+        let canonical_path = self.canonicalize_model_field_path(path.clone());
+        // Lookup-on-miss fallback: a serialized callback pre_state writes the model field through
+        // the current pointer root, while the replayed precondition reads it through `old(ptr)`.
+        // Only when the miss is on an invariant pointer do we retry against the current-root key,
+        // keeping the write side untouched to avoid consuming the seeded obligation prematurely.
+        let direct_value = self.value_map.get(&canonical_path).cloned().or_else(|| {
+            let current_pointer_path =
+                self.strip_invariant_old_from_pointer_root(canonical_path.clone());
+            (current_pointer_path != canonical_path)
+                .then(|| self.value_map.get(&current_pointer_path).cloned())
+                .flatten()
+        });
+        let mut value = direct_value.clone().unwrap_or(default);
+        let mut found = direct_value.is_some();
+
+        let mut aliases: Vec<_> = self.guarded_aliases.iter().collect();
+        aliases.sort_by(
+            |((left_alias, left_source), _), ((right_alias, right_source), _)| {
+                left_alias
+                    .cmp(right_alias)
+                    .then_with(|| left_source.cmp(right_source))
+            },
+        );
+        for ((alias, source), condition) in aliases {
+            if path != alias && !path.is_rooted_by(alias) {
+                continue;
+            }
+            let source_path = path.replace_root(alias, source.clone());
+            let source_path = self.canonicalize_model_field_path(source_path);
+            let Some(source_value) = self.value_map.get(&source_path) else {
+                continue;
+            };
+            value = condition.conditional_expression(source_value.clone(), value);
+            found = true;
+        }
+        found.then_some(value)
     }
 
     /// Returns a reference to the value associated with the given path, if there is one.
@@ -881,5 +1056,123 @@ mod tests {
             .value_at_computed_index_model_field(&query_path, zero)
             .unwrap();
         assert!(multiple_value == one.join(two.clone()) || multiple_value == two.join(one));
+    }
+
+    #[test]
+    fn model_field_path_canonicalization_rewrites_aliased_prefix() {
+        let source = Path::new_local(1, 0);
+        let alias = Path::new_local(2, 0);
+        let source_field =
+            Path::new_qualified(source.clone(), Rc::new(crate::path::PathSelector::Field(3)));
+        let alias_field =
+            Path::new_qualified(alias.clone(), Rc::new(crate::path::PathSelector::Field(3)));
+        let source_model = Path::new_model_field(source_field, Rc::from("write_held"));
+        let alias_model = Path::new_model_field(alias_field, Rc::from("write_held"));
+
+        let mut environment = Environment::default();
+        environment.assume_alias(alias, source);
+
+        assert_eq!(
+            environment.canonicalize_model_field_path(alias_model),
+            source_model
+        );
+    }
+
+    #[test]
+    fn guarded_model_field_alias_lookup_is_conditional() {
+        let source = Path::new_local(1, 0);
+        let alias = Path::new_local(2, 0);
+        let source_model = Path::new_model_field(source.clone(), Rc::from("write_held"));
+        let alias_model = Path::new_model_field(alias.clone(), Rc::from("write_held"));
+        let condition =
+            AbstractValue::make_typed_unknown(ExpressionType::Bool, Path::new_local(3, 0));
+        let zero: Rc<AbstractValue> = Rc::new(0_u128.into());
+        let one: Rc<AbstractValue> = Rc::new(1_u128.into());
+
+        let mut environment = Environment::default();
+        environment.strong_update_value_at(source_model, one.clone());
+        environment.assume_alias_if(alias, source, condition.clone());
+
+        assert_eq!(
+            environment.value_at_aliased_model_field(&alias_model, zero.clone()),
+            Some(condition.conditional_expression(one, zero))
+        );
+    }
+
+    #[test]
+    fn model_field_path_canonicalization_ignores_expanding_alias() {
+        let alias = Path::new_local(1, 0);
+        let source =
+            Path::new_qualified(alias.clone(), Rc::new(crate::path::PathSelector::Field(2)));
+        let model = Path::new_model_field(alias.clone(), Rc::from("write_held"));
+
+        let mut environment = Environment::default();
+        environment.assume_alias(alias, source);
+
+        assert_eq!(
+            environment.canonicalize_model_field_path(model.clone()),
+            model
+        );
+    }
+
+    fn transmuted_pointer_model_field(pointer: Rc<AbstractValue>) -> Rc<Path> {
+        let modulus: Rc<AbstractValue> = Rc::new((1_u128 << 64).into());
+        let masked = AbstractValue::make_from(
+            crate::expression::Expression::Rem {
+                left: pointer,
+                right: modulus,
+            },
+            1,
+        );
+        let pointer = AbstractValue::make_from(
+            crate::expression::Expression::Transmute {
+                operand: masked,
+                target_type: ExpressionType::ThinPointer,
+            },
+            1,
+        );
+        let pointee = Path::new_qualified(
+            Path::new_computed(pointer),
+            Rc::new(crate::path::PathSelector::Deref),
+        );
+        let lock = Path::new_qualified(pointee, Rc::new(crate::path::PathSelector::Field(0)));
+        Path::new_model_field(lock, Rc::from("write_held"))
+    }
+
+    #[test]
+    fn model_field_lookup_strips_old_from_invariant_transmuted_pointer() {
+        let parameter = Path::new_parameter(1);
+        let current = AbstractValue::make_reference(parameter.clone());
+        let initial =
+            AbstractValue::make_initial_parameter_value(ExpressionType::U128, parameter.clone());
+        let current_model = transmuted_pointer_model_field(current);
+        let initial_model = transmuted_pointer_model_field(initial);
+
+        let expected: Rc<AbstractValue> = Rc::new(1_u128.into());
+        let mut environment = Environment::default();
+        environment.strong_update_value_at(current_model.clone(), expected.clone());
+
+        assert_eq!(
+            environment.value_at_aliased_model_field(&initial_model, Rc::new(0_u128.into())),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn model_field_lookup_keeps_old_for_reassigned_transmuted_pointer() {
+        let parameter = Path::new_parameter(1);
+        let current = AbstractValue::make_reference(parameter.clone());
+        let initial =
+            AbstractValue::make_initial_parameter_value(ExpressionType::U128, parameter.clone());
+        let current_model = transmuted_pointer_model_field(current);
+        let initial_model = transmuted_pointer_model_field(initial);
+        let mut environment = Environment::default();
+        environment.strong_update_value_at(parameter, Rc::new(2_u128.into()));
+        environment.strong_update_value_at(current_model, Rc::new(1_u128.into()));
+
+        assert_eq!(
+            environment.value_at_aliased_model_field(&initial_model, Rc::new(0_u128.into())),
+            None
+        );
     }
 }

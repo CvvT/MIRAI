@@ -129,6 +129,12 @@ pub struct CallbackInvocation {
     pub arguments_complete: bool,
     /// Boundary-refinable field values visible at the callback invocation point.
     pub pre_state: Vec<(Rc<Path>, Rc<AbstractValue>)>,
+    /// Boundary-visible alias relationships established before the callback invocation.
+    #[serde(default)]
+    pub pre_aliases: Vec<(Rc<Path>, Rc<Path>)>,
+    /// Boundary-visible conditional alias relationships established before the callback invocation.
+    #[serde(default)]
+    pub pre_guarded_aliases: Vec<(Rc<Path>, Rc<Path>, Rc<AbstractValue>)>,
     /// The path condition under which the callback is invoked.
     pub guard: Rc<AbstractValue>,
     /// The resolved callback specialization, when one was available while summarizing the call.
@@ -143,6 +149,61 @@ pub struct CallbackInvocation {
 
 fn complete_callback_arguments() -> bool {
     true
+}
+
+#[derive(Serialize, Deserialize)]
+struct PreAliasCallbackInvocation {
+    callee: Rc<Path>,
+    arguments: Vec<(Rc<Path>, Rc<AbstractValue>)>,
+    arguments_complete: bool,
+    pre_state: Vec<(Rc<Path>, Rc<AbstractValue>)>,
+    guard: Rc<AbstractValue>,
+    specialized_callee: Option<Rc<FunctionReference>>,
+    function_constants: Vec<Rc<FunctionReference>>,
+    is_local: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PreAliasSummary {
+    is_computed: bool,
+    is_incomplete: bool,
+    preconditions: Vec<Precondition>,
+    assumed_aliases: Vec<(Rc<Path>, Rc<Path>)>,
+    guarded_aliases: Vec<(Rc<Path>, Rc<Path>, Rc<AbstractValue>)>,
+    side_effects: Vec<(Rc<Path>, Rc<AbstractValue>)>,
+    post_condition: Option<Rc<AbstractValue>>,
+    callback_invocations: Vec<PreAliasCallbackInvocation>,
+}
+
+impl From<PreAliasSummary> for Summary {
+    fn from(summary: PreAliasSummary) -> Self {
+        Summary {
+            is_computed: summary.is_computed,
+            is_incomplete: summary.is_incomplete,
+            preconditions: summary.preconditions,
+            assumed_aliases: summary.assumed_aliases,
+            guarded_aliases: summary.guarded_aliases,
+            side_effects: summary.side_effects,
+            post_condition: summary.post_condition,
+            return_type_index: 0,
+            callback_invocations: summary
+                .callback_invocations
+                .into_iter()
+                .map(|invocation| CallbackInvocation {
+                    callee: invocation.callee,
+                    specialized_callee: invocation.specialized_callee,
+                    function_constants: invocation.function_constants,
+                    arguments: invocation.arguments,
+                    arguments_complete: invocation.arguments_complete,
+                    pre_state: invocation.pre_state,
+                    pre_aliases: Vec::new(),
+                    pre_guarded_aliases: Vec::new(),
+                    guard: invocation.guard,
+                    is_local: invocation.is_local,
+                })
+                .collect(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -193,6 +254,8 @@ impl From<PreviousSummary> for Summary {
                     arguments: invocation.arguments,
                     arguments_complete: true,
                     pre_state: invocation.pre_state,
+                    pre_aliases: Vec::new(),
+                    pre_guarded_aliases: Vec::new(),
                     guard: invocation.guard,
                     is_local: false,
                 })
@@ -234,6 +297,8 @@ impl From<OlderSummary> for Summary {
                     arguments: invocation.arguments,
                     arguments_complete: true,
                     pre_state: invocation.pre_state,
+                    pre_aliases: Vec::new(),
+                    pre_guarded_aliases: Vec::new(),
                     guard: Rc::new(abstract_value::TRUE),
                     is_local: false,
                 })
@@ -267,6 +332,14 @@ impl From<LegacySummary> for Summary {
             callback_invocations: Vec::new(),
         }
     }
+}
+
+fn deserialize_summary(bytes: &[u8]) -> bincode::Result<Summary> {
+    bincode::deserialize(bytes)
+        .or_else(|_| bincode::deserialize::<PreAliasSummary>(bytes).map(Into::into))
+        .or_else(|_| bincode::deserialize::<PreviousSummary>(bytes).map(Into::into))
+        .or_else(|_| bincode::deserialize::<OlderSummary>(bytes).map(Into::into))
+        .or_else(|_| bincode::deserialize::<LegacySummary>(bytes).map(Into::into))
 }
 
 /// Bundles together the condition of a precondition with the provenance (place where defined) of
@@ -952,13 +1025,7 @@ impl<'tcx> SummaryCache<'tcx> {
     fn get_persistent_summary_for_db(db: &Db, persistent_key: &str) -> Option<Summary> {
         if let Ok(Some(pinned_value)) = db.get(persistent_key.as_bytes()) {
             let bytes = pinned_value.deref();
-            Some(
-                bincode::deserialize(bytes)
-                    .or_else(|_| bincode::deserialize::<PreviousSummary>(bytes).map(Into::into))
-                    .or_else(|_| bincode::deserialize::<OlderSummary>(bytes).map(Into::into))
-                    .or_else(|_| bincode::deserialize::<LegacySummary>(bytes).map(Into::into))
-                    .unwrap(),
-            )
+            Some(deserialize_summary(bytes).unwrap())
         } else {
             None
         }
@@ -1052,9 +1119,13 @@ pub struct SummariesForLLM {
 
 #[cfg(test)]
 mod tests {
-    use super::{Summary, SummaryCache};
+    use super::{
+        deserialize_summary, PreAliasCallbackInvocation, PreAliasSummary, Summary, SummaryCache,
+    };
+    use crate::abstract_value;
     use crate::constant_domain::FunctionReference;
     use crate::known_names::KnownNames;
+    use crate::path::Path;
     use rustc_hir::def_id::{DefId, DefIndex};
     use std::env;
     use std::ffi::OsString;
@@ -1063,6 +1134,38 @@ mod tests {
     use tempfile::TempDir;
 
     static SUMMARY_STORE_ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn pre_alias_callback_summary_remains_deserializable() {
+        let callee = Path::new_parameter(1);
+        let old_summary = PreAliasSummary {
+            is_computed: true,
+            is_incomplete: false,
+            preconditions: Vec::new(),
+            assumed_aliases: Vec::new(),
+            guarded_aliases: Vec::new(),
+            side_effects: Vec::new(),
+            post_condition: None,
+            callback_invocations: vec![PreAliasCallbackInvocation {
+                callee: callee.clone(),
+                arguments: Vec::new(),
+                arguments_complete: true,
+                pre_state: Vec::new(),
+                guard: Rc::new(abstract_value::TRUE),
+                specialized_callee: None,
+                function_constants: Vec::new(),
+                is_local: false,
+            }],
+        };
+
+        let bytes = bincode::serialize(&old_summary).unwrap();
+        let summary = deserialize_summary(&bytes).unwrap();
+        let invocation = summary.callback_invocations.first().unwrap();
+
+        assert_eq!(invocation.callee, callee);
+        assert!(invocation.pre_aliases.is_empty());
+        assert!(invocation.pre_guarded_aliases.is_empty());
+    }
 
     struct SummaryStoreEnvironment {
         start_fresh: Option<OsString>,

@@ -1942,17 +1942,25 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             qualifier = Path::new_deref(qualifier, target_type);
         }
         let field_name = self.coerce_to_string(&self.actual_args[1].0.clone());
-        let source_path = Path::new_model_field(qualifier, field_name)
-            .canonicalize(&self.block_visitor.bv.current_environment);
-
         let target_path = self.block_visitor.visit_rh_place(&self.destination);
-        if self
-            .block_visitor
-            .bv
-            .current_environment
-            .value_at(&source_path)
-            .is_some()
+        let environment = &self.block_visitor.bv.current_environment;
+        let source_path = environment.canonicalize_model_field_path(
+            Path::new_model_field(qualifier, field_name).canonicalize(environment),
+        );
+
+        let has_guarded_alias = environment
+            .guarded_aliases
+            .keys()
+            .any(|(alias, _)| source_path == *alias || source_path.is_rooted_by(alias));
+        if let Some(value) = has_guarded_alias
+            .then(|| {
+                environment
+                    .value_at_aliased_model_field(&source_path, self.actual_args[2].1.clone())
+            })
+            .flatten()
         {
+            self.block_visitor.bv.update_value_at(target_path, value);
+        } else if environment.value_at(&source_path).is_some() {
             // Move the model field (path, val) pairs to the target (i.e. the place where
             // the return value of call to the mirai_get_model_field function would go if
             // it were a normal call.
@@ -2090,8 +2098,10 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             qualifier = Path::new_deref(qualifier, target_type);
         }
         let field_name = self.coerce_to_string(&self.actual_args[1].0.clone());
-        let target_path = Path::new_model_field(qualifier, field_name)
-            .canonicalize(&self.block_visitor.bv.current_environment);
+        let environment = &self.block_visitor.bv.current_environment;
+        let target_path = environment.canonicalize_model_field_path(
+            Path::new_model_field(qualifier, field_name).canonicalize(environment),
+        );
         let source_path = self.actual_args[2].0.clone();
         let target_type = self.actual_argument_types[2];
         self.block_visitor
@@ -3069,6 +3079,51 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             }
             callback_environment.entry_condition =
                 callback_environment.entry_condition.and(refined_guard);
+            for (alias, source) in &invocation.pre_aliases {
+                let refined_alias = alias.refine_parameters_and_paths(
+                    &self.actual_args,
+                    &no_result,
+                    &self.environment_before_call,
+                    &outer_environment,
+                    self.block_visitor.bv.fresh_variable_offset,
+                );
+                let refined_source = source.refine_parameters_and_paths(
+                    &self.actual_args,
+                    &no_result,
+                    &self.environment_before_call,
+                    &outer_environment,
+                    self.block_visitor.bv.fresh_variable_offset,
+                );
+                callback_environment.assume_alias(refined_alias, refined_source);
+            }
+            for (alias, source, condition) in &invocation.pre_guarded_aliases {
+                let refined_alias = alias.refine_parameters_and_paths(
+                    &self.actual_args,
+                    &no_result,
+                    &self.environment_before_call,
+                    &outer_environment,
+                    self.block_visitor.bv.fresh_variable_offset,
+                );
+                let refined_source = source.refine_parameters_and_paths(
+                    &self.actual_args,
+                    &no_result,
+                    &self.environment_before_call,
+                    &outer_environment,
+                    self.block_visitor.bv.fresh_variable_offset,
+                );
+                let refined_condition = condition.refine_parameters_and_paths(
+                    &self.actual_args,
+                    &no_result,
+                    &self.environment_before_call,
+                    &outer_environment,
+                    self.block_visitor.bv.fresh_variable_offset,
+                );
+                callback_environment.assume_alias_if(
+                    refined_alias,
+                    refined_source,
+                    refined_condition,
+                );
+            }
             for (path, value) in &invocation.pre_state {
                 let refined_path = path.refine_parameters_and_paths(
                     &self.actual_args,
@@ -3361,6 +3416,38 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                     removed |= !keep;
                     keep
                 });
+                callback_invocation.pre_aliases.retain(|(alias, source)| {
+                    let keep = !Self::callback_component_uses_unavailable_argument(
+                        invocation,
+                        Some(alias),
+                        None,
+                    ) && !Self::callback_component_uses_unavailable_argument(
+                        invocation,
+                        Some(source),
+                        None,
+                    );
+                    removed |= !keep;
+                    keep
+                });
+                callback_invocation
+                    .pre_guarded_aliases
+                    .retain(|(alias, source, condition)| {
+                        let keep = !Self::callback_component_uses_unavailable_argument(
+                            invocation,
+                            Some(alias),
+                            None,
+                        ) && !Self::callback_component_uses_unavailable_argument(
+                            invocation,
+                            Some(source),
+                            None,
+                        ) && !Self::callback_component_uses_unavailable_argument(
+                            invocation,
+                            None,
+                            Some(condition),
+                        );
+                        removed |= !keep;
+                        keep
+                    });
                 true
             });
         removed

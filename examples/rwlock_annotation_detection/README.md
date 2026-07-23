@@ -37,6 +37,8 @@ The fixtures are independent binaries:
 | `callback_conditional_true` | `conditional callback requires no live writer` |
 | `callback_generic_fnonce_clean` | silent; generic `FnOnce` summary resolution |
 | `callback_generic_fnonce_violation` | `read requires no live writer` |
+| `callback_returned_field_guard_alias_violation` | summary-only `read requires no live writer`; a complete callback summary has populated `write_held` pre-state and write/read owners share an `Arc` recorded with `assumed_alias!` |
+| `callback_returned_field_guard_violation` | summary-only `read requires no live writer`; a complete callback summary has populated `write_held` pre-state rooted at an owner's lock field |
 | `callback_returned_guard_adapted_violation` | `read requires no live writer`; an adapter may forward an unavailable callback argument that the eventual callback ignores |
 | `callback_returned_guard_clean` | silent; a callback invoked through a returned `DerefMut` guard reads an unrelated owner |
 | `callback_returned_guard_conditional_clean` | silent; the callback runs on the branch that does not acquire the returned guard |

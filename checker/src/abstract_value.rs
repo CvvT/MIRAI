@@ -6433,6 +6433,7 @@ impl AbstractValueTrait for Rc<AbstractValue> {
             Expression::UnknownModelField { path, default } => {
                 let refined_path =
                     path.refine_parameters_and_paths(args, result, pre_env, post_env, fresh);
+                let refined_path = post_env.canonicalize_model_field_path(refined_path);
                 if !matches!(&refined_path.value, PathEnum::Computed { .. }) {
                     let fallback = if refined_path.is_rooted_by_parameter() {
                         // Keep passing the buck to the next caller.
@@ -6446,16 +6447,12 @@ impl AbstractValueTrait for Rc<AbstractValue> {
                     } else {
                         default.clone()
                     };
-                    if let Some(val) = post_env.value_at(&refined_path) {
-                        // This environment has a value for the model field.
-                        val.clone()
-                    } else if let Some(val) = post_env
+                    let fallback = post_env
                         .value_at_computed_index_model_field(&refined_path, fallback.clone())
-                    {
-                        val
-                    } else {
-                        fallback
-                    }
+                        .unwrap_or(fallback);
+                    post_env
+                        .value_at_aliased_model_field(&refined_path, fallback.clone())
+                        .unwrap_or(fallback)
                 } else {
                     AbstractValue::make_from(
                         Expression::UnknownModelField {

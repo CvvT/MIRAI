@@ -1295,6 +1295,30 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
             })
             .map(|(path, value)| (path.clone(), value.clone()))
             .collect();
+        let mut pre_aliases: Vec<_> = self
+            .bv
+            .current_environment
+            .assumed_aliases
+            .iter()
+            .filter(|(alias, source)| {
+                !alias.contains_local_variable(false) && !source.contains_local_variable(false)
+            })
+            .cloned()
+            .collect();
+        pre_aliases.sort();
+        let mut pre_guarded_aliases: Vec<_> = self
+            .bv
+            .current_environment
+            .guarded_aliases
+            .iter()
+            .filter(|((alias, source), condition)| {
+                !alias.contains_local_variable(false)
+                    && !source.contains_local_variable(false)
+                    && !condition.expression.contains_local_variable(false)
+            })
+            .map(|((alias, source), condition)| (alias.clone(), source.clone(), condition.clone()))
+            .collect();
+        pre_guarded_aliases.sort();
         self.bv.callback_invocations.push(CallbackInvocation {
             callee: callee_parameter,
             specialized_callee: None,
@@ -1303,6 +1327,8 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
             arguments: actual_args.to_vec(),
             arguments_complete,
             pre_state,
+            pre_aliases,
+            pre_guarded_aliases,
             guard: self
                 .bv
                 .current_environment
