@@ -181,6 +181,7 @@ impl Environment {
         ) {
             return path;
         }
+        let path = path.normalize_reference_projections();
 
         let mut result = path;
         let mut visited = HashSet::new();
@@ -1173,6 +1174,50 @@ mod tests {
         assert_eq!(
             environment.value_at_aliased_model_field(&initial_model, Rc::new(0_u128.into())),
             None
+        );
+    }
+
+    #[test]
+    fn model_field_lookup_unifies_refined_reference_projection() {
+        use crate::path::PathSelector;
+
+        let parameter = Path::new_parameter(1);
+        let dereferenced = Path::new_qualified(parameter, Rc::new(PathSelector::Deref));
+        let prefix = Path::new_qualified(dereferenced, Rc::new(PathSelector::Field(0)));
+        let referenced_prefix = Path::new_computed(AbstractValue::make_reference(prefix.clone()));
+        let mut projected = Path::new_qualified(referenced_prefix, Rc::new(PathSelector::Deref));
+        for _ in 0..3 {
+            projected = Path::new_qualified(projected, Rc::new(PathSelector::Field(0)));
+        }
+        let mut fully_projected = prefix;
+        for _ in 0..3 {
+            fully_projected = Path::new_qualified(fully_projected, Rc::new(PathSelector::Field(0)));
+        }
+
+        let ordinary_u128 =
+            AbstractValue::make_typed_unknown(ExpressionType::U128, projected.clone());
+        assert_eq!(
+            ordinary_u128.normalize_reference_projections(),
+            ordinary_u128
+        );
+
+        let write_pointer = AbstractValue::make_typed_unknown(ExpressionType::U128, projected);
+        let write_model = transmuted_pointer_model_field(write_pointer);
+        let canonical_write = Environment::default().canonicalize_model_field_path(write_model);
+        let expected_pointer = AbstractValue::make_reference(fully_projected.clone());
+        let expected_write = transmuted_pointer_model_field(expected_pointer);
+        assert_eq!(canonical_write, expected_write);
+
+        let read_model = transmuted_pointer_model_field(
+            AbstractValue::make_initial_parameter_value(ExpressionType::U128, fully_projected),
+        );
+        let expected: Rc<AbstractValue> = Rc::new(1_u128.into());
+        let mut environment = Environment::default();
+        environment.strong_update_value_at(canonical_write, expected.clone());
+
+        assert_eq!(
+            environment.value_at_aliased_model_field(&read_model, Rc::new(0_u128.into())),
+            Some(expected)
         );
     }
 }

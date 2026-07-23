@@ -947,6 +947,8 @@ pub trait AbstractValueTrait: Sized {
     #[must_use]
     fn refine_with(&self, path_condition: &Self, depth: usize) -> Self;
     #[must_use]
+    fn normalize_reference_projections(&self) -> Self;
+    #[must_use]
     fn replace_embedded_path_root(&self, old_root: &Rc<Path>, new_root: Rc<Path>) -> Self;
     #[must_use]
     fn transmute(&self, target_type: ExpressionType) -> Self;
@@ -968,6 +970,49 @@ pub trait AbstractValueTrait: Sized {
     fn uses(&self, variables: &HashSet<Rc<Path>>) -> bool;
     #[must_use]
     fn widen(&self, path: &Rc<Path>) -> Self;
+}
+
+fn normalize_thin_pointer_operand(value: &Rc<AbstractValue>) -> Rc<AbstractValue> {
+    let expression = match &value.expression {
+        Expression::BitAnd { left, right } => Expression::BitAnd {
+            left: normalize_thin_pointer_operand(left),
+            right: normalize_thin_pointer_operand(right),
+        },
+        Expression::Cast {
+            operand,
+            target_type,
+        } => Expression::Cast {
+            operand: normalize_thin_pointer_operand(operand),
+            target_type: *target_type,
+        },
+        Expression::Offset { left, right } => Expression::Offset {
+            left: normalize_thin_pointer_operand(left),
+            right: normalize_thin_pointer_operand(right),
+        },
+        Expression::Reference(path) => {
+            return AbstractValue::make_reference(path.normalize_reference_projections());
+        }
+        Expression::Rem { left, right } => Expression::Rem {
+            left: normalize_thin_pointer_operand(left),
+            right: normalize_thin_pointer_operand(right),
+        },
+        Expression::Transmute {
+            operand,
+            target_type,
+        } => Expression::Transmute {
+            operand: normalize_thin_pointer_operand(operand),
+            target_type: *target_type,
+        },
+        Expression::Variable { path, var_type } => {
+            let normalized = path.normalize_reference_projections();
+            if *var_type == ExpressionType::U128 && normalized != *path {
+                return AbstractValue::make_reference(normalized);
+            }
+            return value.clone();
+        }
+        _ => return value.clone(),
+    };
+    AbstractValue::make_from(expression, value.expression_size)
 }
 
 impl AbstractValueTrait for Rc<AbstractValue> {
@@ -6915,6 +6960,28 @@ impl AbstractValueTrait for Rc<AbstractValue> {
                 );
                 self.clone()
             }
+        }
+    }
+
+    fn normalize_reference_projections(&self) -> Rc<AbstractValue> {
+        match &self.expression {
+            Expression::Reference(path) => {
+                AbstractValue::make_reference(path.normalize_reference_projections())
+            }
+            Expression::Transmute {
+                operand,
+                target_type,
+            } if *target_type == ExpressionType::ThinPointer => {
+                let operand = normalize_thin_pointer_operand(operand);
+                AbstractValue::make_from(
+                    Expression::Transmute {
+                        operand,
+                        target_type: *target_type,
+                    },
+                    self.expression_size,
+                )
+            }
+            _ => self.clone(),
         }
     }
 

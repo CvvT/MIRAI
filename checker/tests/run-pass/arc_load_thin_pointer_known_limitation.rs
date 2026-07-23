@@ -3,16 +3,16 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root directory of this source tree.
 
-// Known false-negative (XFAIL): Arc-load thin-pointer canonicalization.
+// Regression coverage for model fields reached through an Arc-loaded returned reference.
 //
 // This is a genuine double-lock: `acquire_write` sets the `writer` model field to 1 on the
 // descriptor lock, and the callback then calls `require_unlocked` while that writer is still
-// held. A sound analysis must report the precondition violation, but MIRAI does not surface it.
+// held. MIRAI must report the precondition violation.
 //
 // The lock is reached by loading through `Arc<Inner>` and returning `&self.inner.lock` from
 // `lock()`. The model-field write happens behind the `acquire_write` summary boundary, so its
-// receiver is that returned `&Lock`. At the consuming call site, the root is canonicalized from
-// the Arc load into a fresh thin-pointer heap abstraction that is not parameter-rooted.
+// receiver is that returned `&Lock`. Callback replay must canonicalize the U128 pointer variable's
+// embedded reference projections to the same key used by the precondition.
 //
 // Positive control: model_field_wrapper_field_double_lock.rs applies the write to a directly
 // parameter-rooted `&Lock` across the same Arc and wrapper-field hop, and does report the violation.
@@ -60,8 +60,7 @@ impl Wrapper {
 
     pub fn trigger(&self) {
         self.with_write_held(|owner| {
-            // A fixed checker should report an unsatisfied precondition here.
-            owner.require_unlocked();
+            owner.require_unlocked(); //~ unsatisfied precondition
         });
     }
 }

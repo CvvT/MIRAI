@@ -841,6 +841,33 @@ impl Path {
         )
     }
 
+    /// Eliminates reference/dereference projection chains without consulting an environment.
+    pub(crate) fn normalize_reference_projections(&self) -> Rc<Path> {
+        if let PathEnum::Computed { value } | PathEnum::Offset { value } = &self.value {
+            let value = value.normalize_reference_projections();
+            return Path::get_as_path(value);
+        }
+        let PathEnum::QualifiedPath {
+            qualifier,
+            selector,
+            ..
+        } = &self.value
+        else {
+            return Rc::new(self.clone());
+        };
+        let qualifier = qualifier.normalize_reference_projections();
+        if let PathEnum::Computed { value } = &qualifier.value {
+            if let Expression::Reference(path) = &value.expression {
+                let path = path.normalize_reference_projections();
+                if **selector == PathSelector::Deref {
+                    return path;
+                }
+                return Path::new_qualified(path, selector.clone());
+            }
+        }
+        Path::new_qualified(qualifier, selector.clone())
+    }
+
     /// Adds any heap blocks and string values found in embedded values to the given set.
     #[logfn_inputs(TRACE)]
     pub fn record_heap_blocks_and_strings(&self, result: &mut HashSet<Rc<AbstractValue>>) {

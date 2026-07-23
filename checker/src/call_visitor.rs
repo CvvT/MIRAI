@@ -3139,6 +3139,7 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                     &outer_environment,
                     self.block_visitor.bv.fresh_variable_offset,
                 );
+                let refined_path = callback_environment.canonicalize_model_field_path(refined_path);
                 callback_environment.strong_update_value_at(refined_path, refined_value);
             }
             if self.block_visitor.bv.check_for_errors {
