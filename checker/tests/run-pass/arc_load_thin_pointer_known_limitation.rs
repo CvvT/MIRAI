@@ -3,49 +3,29 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root directory of this source tree.
 
-// Known false-negative (XFAIL): Arc-load thin-pointer canonicalization loses the lock's precise
-// model-field identity across the returned-guard callback summary, so default diagnostics are silent.
+// Known false-negative (XFAIL): Arc-load thin-pointer canonicalization.
+//
+// This is a genuine double-lock: `acquire_write` sets the `writer` model field to 1 on the
+// descriptor lock, and the callback then calls `require_unlocked` while that writer is still
+// held. A sound analysis must report the precondition violation, but MIRAI does not surface it.
+//
+// The lock is reached by loading through `Arc<Inner>` and returning `&self.inner.lock` from
+// `lock()`. The model-field write happens behind the `acquire_write` summary boundary, so its
+// receiver is that returned `&Lock`. At the consuming call site, the root is canonicalized from
+// the Arc load into a fresh thin-pointer heap abstraction that is not parameter-rooted.
+//
+// Positive control: model_field_wrapper_field_double_lock.rs applies the write to a directly
+// parameter-rooted `&Lock` across the same Arc and wrapper-field hop, and does report the violation.
 
 // MIRAI_FLAGS --diag=default
 
 use mirai_annotations::*;
-use std::ops::Deref;
 use std::sync::Arc;
 
-struct Lock<T> {
-    data: T,
-}
-
-impl<T> Lock<T> {
-    fn write(&self) -> WriteGuard<'_, T> {
-        precondition!(get_model_field!(self, writer, 0usize) == 0);
-        set_model_field!(self, writer, 1usize);
-        WriteGuard { lock: self }
-    }
-}
-
-struct WriteGuard<'a, T> {
-    lock: &'a Lock<T>,
-}
-
-impl<T> Deref for WriteGuard<'_, T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        &self.lock.data
-    }
-}
-
-struct Data;
-
-impl Data {
-    fn with_ref(&self, callback: impl FnOnce(&Data)) {
-        callback(self);
-    }
-}
+pub struct Lock;
 
 struct Inner {
-    lock: Lock<Data>,
+    lock: Lock,
 }
 
 pub struct Owner {
@@ -53,22 +33,35 @@ pub struct Owner {
 }
 
 impl Owner {
-    fn lock(&self) -> &Lock<Data> {
+    fn lock(&self) -> &Lock {
         &self.inner.lock
     }
 
-    fn data(&self) -> impl Deref<Target = Data> + '_ {
-        self.lock().write()
+    fn acquire_write(&self) {
+        let lock = self.lock();
+        set_model_field!(lock, writer, 1usize);
     }
 
-    fn with_data(&self, callback: impl FnOnce(&Data)) {
-        self.data().with_ref(callback);
+    fn require_unlocked(&self) {
+        let lock = self.lock();
+        precondition!(get_model_field!(lock, writer, 0usize) == 0);
+    }
+}
+
+pub struct Wrapper {
+    owner: Owner,
+}
+
+impl Wrapper {
+    fn with_write_held(&self, callback: impl FnOnce(&Owner)) {
+        self.owner.acquire_write();
+        callback(&self.owner);
     }
 
     pub fn trigger(&self) {
-        self.with_data(|_data| {
+        self.with_write_held(|owner| {
             // A fixed checker should report an unsatisfied precondition here.
-            precondition!(get_model_field!(self.lock(), writer, 0usize) == 0);
+            owner.require_unlocked();
         });
     }
 }
