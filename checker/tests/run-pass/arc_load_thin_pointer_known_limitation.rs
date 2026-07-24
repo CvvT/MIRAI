@@ -3,7 +3,7 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root directory of this source tree.
 
-// Known false-negative (XFAIL): lifted-callback capture-argument reconstruction.
+// Known false-negative (XFAIL): Arc-load thin-pointer capture-state loss.
 //
 // This is a genuine double-lock: `acquire_write` sets the `writer` model field to 1 on the
 // Arc-loaded socket-options lock, and the terminal callback calls `require_unlocked` while that

@@ -71,4 +71,4 @@ if grep -q 'warning: \[MIRAI\] unsatisfied precondition' <<<"$known_limit_output
     exit 1
 fi
 
-echo "MIRAI test suite passed; positive control fired and capture-reconstruction XFAIL stayed silent."
+echo "MIRAI test suite passed; positive control fired and Arc-load capture-state-loss XFAIL stayed silent."
