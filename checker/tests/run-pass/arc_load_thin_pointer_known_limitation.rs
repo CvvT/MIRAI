@@ -3,26 +3,30 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root directory of this source tree.
 
-// Regression coverage for model fields reached through an Arc-loaded returned reference.
+// Known false-negative (XFAIL): lifted-callback capture-argument reconstruction.
 //
 // This is a genuine double-lock: `acquire_write` sets the `writer` model field to 1 on the
-// descriptor lock, and the callback then calls `require_unlocked` while that writer is still
-// held. MIRAI must report the precondition violation.
+// Arc-loaded socket-options lock, and the terminal callback calls `require_unlocked` while that
+// writer is still held. MIRAI should report the precondition violation, but is currently silent.
 //
-// The lock is reached by loading through `Arc<Inner>` and returning `&self.inner.lock` from
-// `lock()`. The model-field write happens behind the `acquire_write` summary boundary, so its
-// receiver is that returned `&Lock`. Callback replay must canonicalize the U128 pointer variable's
-// embedded reference projections to the same key used by the precondition.
+// Root-only lifted-callback discharge reaches the nested `Option::map` re-wrap, but the terminal
+// callback's captured `self` argument is recorded as BOTTOM and replayed as an unknown
+// `local_999998`. Its precondition therefore remains rooted at unresolved
+// `param_1...writer` instead of refining to the recorded `writer = 1` key. Fixing this requires
+// capture-argument reconstruction across the lifted callback, not frame-root classification.
 //
-// Positive control: model_field_wrapper_field_double_lock.rs applies the write to a directly
-// parameter-rooted `&Lock` across the same Arc and wrapper-field hop, and does report the violation.
+// Positive control: model_field_wrapper_field_double_lock.rs passes the owner as an explicit
+// callback argument across the same Arc and wrapper-field hop, and does report the violation.
 
 // MIRAI_FLAGS --diag=default
 
 use mirai_annotations::*;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 pub struct Lock;
+
+pub struct SocketOptions;
 
 struct Inner {
     lock: Lock,
@@ -46,23 +50,70 @@ impl Owner {
         let lock = self.lock();
         precondition!(get_model_field!(lock, writer, 0usize) == 0);
     }
-}
 
-pub struct Wrapper {
-    owner: Owner,
-}
+    fn socket_options_mut(&self) -> SocketOptionsGuard<'_> {
+        self.acquire_write();
+        SocketOptionsGuard {
+            owner: self,
+            options: SocketOptions,
+        }
+    }
 
-impl Wrapper {
-    fn with_write_held(&self, callback: impl FnOnce(&Owner)) {
-        self.owner.acquire_write();
-        callback(&self.owner);
+    fn with_socket_options_mut<R>(
+        &self,
+        callback: impl FnOnce(&mut SocketOptions) -> R,
+    ) -> R {
+        self.socket_options_mut()
+            .with_socket_options_mut(|options| callback(options))
     }
 
     pub fn trigger(&self) {
-        self.with_write_held(|owner| {
-            owner.require_unlocked(); //~ unsatisfied precondition
+        self.with_socket_options_mut(|_options| {
+            // A fixed checker reports an unsatisfied precondition here.
+            self.require_unlocked();
         });
     }
+}
+
+struct SocketOptionsGuard<'a> {
+    owner: &'a Owner,
+    options: SocketOptions,
+}
+
+impl SocketOptionsGuard<'_> {
+    fn with_socket_options_mut<R>(
+        &mut self,
+        callback: impl FnOnce(&mut SocketOptions) -> R,
+    ) -> R {
+        map_socket_options_mut(&mut self.options, |options| callback(options))
+    }
+}
+
+impl Deref for SocketOptionsGuard<'_> {
+    type Target = SocketOptions;
+
+    fn deref(&self) -> &SocketOptions {
+        &self.options
+    }
+}
+
+impl DerefMut for SocketOptionsGuard<'_> {
+    fn deref_mut(&mut self) -> &mut SocketOptions {
+        &mut self.options
+    }
+}
+
+impl Drop for SocketOptionsGuard<'_> {
+    fn drop(&mut self) {
+        set_model_field!(self.owner.lock(), writer, 0usize);
+    }
+}
+
+fn map_socket_options_mut<R>(
+    options: &mut SocketOptions,
+    callback: impl FnOnce(&mut SocketOptions) -> R,
+) -> R {
+    Some(options).map(|options| callback(options)).unwrap()
 }
 
 pub fn main() {}
