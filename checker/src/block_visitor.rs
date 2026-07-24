@@ -857,10 +857,7 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                 let Some(ordinal) = callee_parameter.get_parameter_root_ordinal() else {
                     return false;
                 };
-                let parameter_ty = self.bv.mir.local_decls[mir::Local::from(ordinal)].ty;
-                let parameter_ty = self
-                    .type_visitor()
-                    .specialize_type(parameter_ty, &self.type_visitor().generic_argument_map);
+                let parameter_ty = self.type_visitor().get_loc_ty(mir::Local::from(ordinal));
                 if !utils::contains_function(parameter_ty, self.bv.tcx) {
                     return false;
                 }
@@ -1086,8 +1083,9 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
         let TyKind::Closure(_, args) = callee_ty.kind() else {
             return None;
         };
+        let upvar_tys = args.as_closure().upvar_tys();
         let mut captures = Vec::new();
-        for (field, upvar_ty) in args.as_closure().upvar_tys().iter().enumerate() {
+        for (field, upvar_ty) in upvar_tys.iter().enumerate() {
             let upvar_ty = self.type_visitor().get_dereferenced_type(upvar_ty);
             if matches!(
                 upvar_ty.kind(),
@@ -1136,6 +1134,38 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
             .map(|(field, _, value)| (Path::new_field(anchor.clone(), field), value))
             .collect();
         Some((anchor, aliases))
+    }
+
+    pub fn find_single_function_upvar_parameter(
+        &mut self,
+        callee_ty: Ty<'tcx>,
+    ) -> Option<Rc<Path>> {
+        let callee_ty = self.type_visitor().get_dereferenced_type(callee_ty);
+        let TyKind::Closure(_, args) = callee_ty.kind() else {
+            return None;
+        };
+        let upvar_tys = args.as_closure().upvar_tys();
+        if upvar_tys.len() != 1 {
+            return None;
+        }
+        let upvar_ty = self
+            .type_visitor()
+            .specialize_type(upvar_tys[0], &self.type_visitor().generic_argument_map);
+        let upvar_ty = self.type_visitor().get_dereferenced_type(upvar_ty);
+        if !matches!(upvar_ty.kind(), TyKind::Closure(..) | TyKind::FnDef(..)) {
+            return None;
+        }
+        let matching_parameters = (1..=self.bv.mir.arg_count)
+            .filter_map(|ordinal| {
+                let parameter_ty = self.type_visitor().get_loc_ty(mir::Local::from(ordinal));
+                let parameter_ty = self.type_visitor().get_dereferenced_type(parameter_ty);
+                (parameter_ty == upvar_ty).then(|| Path::new_parameter(ordinal))
+            })
+            .collect::<Vec<_>>();
+        let [anchor] = matching_parameters.as_slice() else {
+            return None;
+        };
+        Some(anchor.clone())
     }
 
     pub fn get_local_closure_capture_rekeys(

@@ -3236,6 +3236,23 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 );
             }
             let callback_count_after_lift = self.block_visitor.bv.callback_invocations.len();
+            let lifted_callback_anchor = (callback_count_after_lift > callback_count_before_lift)
+                .then(|| {
+                    self.block_visitor
+                        .bv
+                        .callback_invocations
+                        .last()
+                        .map(|invocation| invocation.callee.clone())
+                })
+                .flatten();
+            let rewrapped_callback_anchor = if lifted_callback_anchor.is_none() {
+                callback_type.and_then(|callback_type| {
+                    self.block_visitor
+                        .find_single_function_upvar_parameter(callback_type)
+                })
+            } else {
+                None
+            };
             {
                 let callback_argument_types = callback_arguments
                     .iter()
@@ -3267,9 +3284,13 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                         )
                 });
                 if !captured_summary.callback_invocations.is_empty() {
+                    let nested_callback_anchor = lifted_callback_anchor
+                        .clone()
+                        .or_else(|| rewrapped_callback_anchor.clone())
+                        .unwrap_or_else(|| invocation.callee.clone());
                     callback_visitor.replay_callback_invocations_with_anchor(
                         &captured_summary,
-                        Some(invocation.callee.clone()),
+                        Some(nested_callback_anchor),
                     );
                 }
                 let nested_callback_lifted =

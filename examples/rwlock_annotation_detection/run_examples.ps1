@@ -54,6 +54,8 @@ $expectations = [ordered]@{
     "callback_returned_guard_unavailable_argument" = "callback argument could not be represented in summary"
     "callback_returned_guard_unavailable_independent_violation" = "read requires no live writer"
     "callback_returned_guard_violation" = "read requires no live writer"
+    "callback_rewrapped_fnonce_clean" = $null
+    "callback_rewrapped_fnonce_violation" = "read requires no live writer"
     "callback_sequential_counter_clean" = $null
     "callback_sequential_counter_violation" = "second callback incorrectly requires two readers"
     "callback_specialization_clean" = $null
@@ -97,6 +99,8 @@ $summaryOnlyBins = @(
     "callback_returned_guard_clean",
     "callback_returned_guard_direct_violation",
     "callback_returned_guard_violation",
+    "callback_rewrapped_fnonce_clean",
+    "callback_rewrapped_fnonce_violation",
     "callback_clean",
     "callback_conditional_false",
     "callback_conditional_true",
@@ -160,6 +164,8 @@ $summaryOnlyHofBins = @(
     "callback_returned_guard_clean",
     "callback_returned_guard_direct_violation",
     "callback_returned_guard_violation",
+    "callback_rewrapped_fnonce_clean",
+    "callback_rewrapped_fnonce_violation",
     "callback_sequential_counter_clean",
     "callback_sequential_counter_violation",
     "callback_specialization_clean",
@@ -398,7 +404,7 @@ try {
         $providerBodyEntries = @(
             $output | Where-Object {
                 $_ -match "entered body of .*rwlock_annotation_detection.*::(read|write|release_read|drop)" -or
-                $_ -match "entered body of .*callback_(accessor|clean|conditional|fnptr_specialization|generic_fnonce|hof_annotated|hof_invoke_twice|loop|nested_hof|returned_guard|sequential_counter|specialization).*::(invoke|invoke_from_non_root|invoke_if|invoke_generic|invoke_in_loop|invoke_twice|through_adapter|forward_metadata_mut|with_metadata_after_release|with_metadata_maybe_locked|with_metadata_mut|without_write_held|with_write_held|descriptor_table_mut|annotated_acquire|acquire_once|increment|require|read|\{closure)"
+                $_ -match "entered body of .*callback_(accessor|clean|conditional|fnptr_specialization|generic_fnonce|hof_annotated|hof_invoke_twice|loop|nested_hof|returned_guard|rewrapped_fnonce|sequential_counter|specialization).*::(invoke|invoke_from_non_root|invoke_if|invoke_generic|invoke_in_loop|invoke_twice|through_adapter|forward_metadata_mut|with_metadata_after_release|with_metadata_maybe_locked|with_metadata_mut|without_write_held|with_write_held|descriptor_table_mut|annotated_acquire|acquire_once|increment|require|read|\{closure)"
             }
         )
         $persistentSummaryLoads = @(
