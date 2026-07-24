@@ -9,11 +9,11 @@
 // Arc-loaded socket-options lock, and the terminal callback calls `require_unlocked` while that
 // writer is still held. MIRAI should report the precondition violation, but is currently silent.
 //
-// Root-only lifted-callback discharge reaches the nested `Option::map` re-wrap, but the terminal
-// callback's captured `self` argument is recorded as BOTTOM and replayed as an unknown
-// `local_999998`. Its precondition therefore remains rooted at unresolved
-// `param_1...writer` instead of refining to the recorded `writer = 1` key. Fixing this requires
-// capture-argument reconstruction across the lifted callback, not frame-root classification.
+// The terminal callback is lifted and replayed through the nested `Option::map` re-wrap, but its
+// captured `self` survives only as an opaque `param_1.0: NonPrimitive`. The Arc-loaded lock's
+// `writer = 1` model field is never reconstructed in the callback's pre-state, so the precondition
+// remains rooted at unresolved `param_1...writer`. Fixing this requires capture-state
+// reconstruction across the lifted callback, not frame-root classification.
 //
 // Positive control: model_field_wrapper_field_double_lock.rs passes the owner as an explicit
 // callback argument across the same Arc and wrapper-field hop, and does report the violation.
