@@ -3076,6 +3076,9 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
         let outer_environment = self.block_visitor.bv.current_environment.clone();
         let no_result = None;
         for invocation in &function_summary.callback_invocations {
+            if parent_callback_anchor.is_none() {
+                model_state_carriers.clear();
+            }
             trace!("replaying callback invocation {:?}", invocation);
             let PathEnum::Parameter { ordinal } = invocation.callee.get_path_root().value else {
                 trace!("callback invocation is not rooted by a parameter");
@@ -3591,10 +3594,11 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                         .clone()
                         .or_else(|| rewrapped_callback_anchor.clone())
                         .unwrap_or_else(|| invocation.callee.clone());
+                    let mut nested_model_state_carriers = model_state_carriers.clone();
                     callback_visitor.replay_callback_invocations_with_anchor(
                         &captured_summary,
                         Some(nested_callback_anchor),
-                        model_state_carriers,
+                        &mut nested_model_state_carriers,
                     );
                 }
                 let nested_callback_lifted =

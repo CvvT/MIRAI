@@ -7,7 +7,8 @@
 
 use mirai_annotations::*;
 
-struct Lock;
+pub struct Lock;
+pub struct Options;
 
 struct Data {
     lock: Lock,
@@ -34,10 +35,17 @@ impl Owner {
         &self.0.0.0.data.lock
     }
 
-    fn invoke(&self, callback: impl FnOnce()) {
+    fn options(&self) -> OptionsGuard<'_> {
         set_model_field!(self.lock(), writer, 1usize);
-        Some(()).map(|_| callback()).unwrap();
-        set_model_field!(self.lock(), writer, 0usize);
+        OptionsGuard {
+            owner: self,
+            options: Options,
+        }
+    }
+
+    fn with_options<R>(&self, callback: impl FnOnce(&mut Options) -> R) -> R {
+        self.options()
+            .with_options(|options| callback(options))
     }
 
     fn require_unlocked(&self) {
@@ -45,22 +53,36 @@ impl Owner {
     }
 }
 
-static FIRST_INNER: LookalikeInner = LookalikeInner {
-    strong: 1,
-    weak: 1,
-    data: Data { lock: Lock },
-};
+struct OptionsGuard<'a> {
+    owner: &'a Owner,
+    options: Options,
+}
 
-static SECOND_INNER: LookalikeInner = LookalikeInner {
+impl OptionsGuard<'_> {
+    fn with_options<R>(&mut self, callback: impl FnOnce(&mut Options) -> R) -> R {
+        map_options(&mut self.options, |options| callback(options))
+    }
+}
+
+impl Drop for OptionsGuard<'_> {
+    fn drop(&mut self) {
+        set_model_field!(self.owner.lock(), writer, 0usize);
+    }
+}
+
+fn map_options<R>(options: &mut Options, callback: impl FnOnce(&mut Options) -> R) -> R {
+    Some(options).map(|options| callback(options)).unwrap()
+}
+
+static INNER: LookalikeInner = LookalikeInner {
     strong: 1,
     weak: 1,
     data: Data { lock: Lock },
 };
 
 pub fn non_arc_layout_does_not_activate_carrier() {
-    let first = Owner(sync::Arc(LookalikePointer(&FIRST_INNER)));
-    let second = Owner(sync::Arc(LookalikePointer(&SECOND_INNER)));
-    first.invoke(|| second.require_unlocked());
+    let owner = Owner(sync::Arc(LookalikePointer(&INNER)));
+    owner.with_options(|_options| owner.require_unlocked());
 }
 
 pub fn main() {}

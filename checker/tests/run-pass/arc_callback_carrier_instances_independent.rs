@@ -8,13 +8,14 @@
 use mirai_annotations::*;
 use std::sync::Arc;
 
-struct Lock;
+pub struct Lock;
+pub struct Options;
 
 struct Inner {
     lock: Lock,
 }
 
-struct Owner {
+pub struct Owner {
     inner: Arc<Inner>,
 }
 
@@ -23,8 +24,20 @@ impl Owner {
         &self.inner.lock
     }
 
-    fn invoke(&self, callback: impl FnOnce()) {
-        Some(()).map(|_| callback()).unwrap();
+    fn options(&self) -> OptionsGuard<'_> {
+        OptionsGuard {
+            owner: self,
+            options: Options,
+        }
+    }
+
+    fn with_options<R>(&self, callback: impl FnOnce(&mut Options) -> R) -> R {
+        self.options().with_options(|options| callback(options))
+    }
+
+    fn with_locked_options<R>(&self, callback: impl FnOnce(&mut Options) -> R) -> R {
+        set_model_field!(self.lock(), writer, 1usize);
+        self.options().with_options(|options| callback(options))
     }
 
     fn require_unlocked(&self) {
@@ -32,18 +45,30 @@ impl Owner {
     }
 }
 
-pub fn repeated_static_site_is_scoped_per_call() {
-    let first = Owner {
-        inner: Arc::new(Inner { lock: Lock }),
-    };
-    let second = Owner {
-        inner: Arc::new(Inner { lock: Lock }),
-    };
+struct OptionsGuard<'a> {
+    owner: &'a Owner,
+    options: Options,
+}
 
-    set_model_field!(first.lock(), writer, 1usize);
-    first.invoke(|| {});
-    set_model_field!(first.lock(), writer, 0usize);
-    second.invoke(|| second.require_unlocked());
+impl OptionsGuard<'_> {
+    fn with_options<R>(&mut self, callback: impl FnOnce(&mut Options) -> R) -> R {
+        map_options(&mut self.options, |options| callback(options))
+    }
+}
+
+impl Drop for OptionsGuard<'_> {
+    fn drop(&mut self) {
+        set_model_field!(self.owner.lock(), writer, 0usize);
+    }
+}
+
+fn map_options<R>(options: &mut Options, callback: impl FnOnce(&mut Options) -> R) -> R {
+    Some(options).map(|options| callback(options)).unwrap()
+}
+
+pub fn repeated_static_site_is_scoped_per_call(first: &Owner, second: &Owner) {
+    first.with_locked_options(|_options| {});
+    second.with_options(|_options| second.require_unlocked());
 }
 
 pub fn main() {}
