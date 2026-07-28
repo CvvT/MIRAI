@@ -41,7 +41,8 @@ impl Owner {
 
     fn require_unlocked(&self) {
         let lock = self.lock();
-        precondition!(get_model_field!(lock, writer, 0usize) == 0);
+        precondition!(get_model_field!(lock, writer, 0usize) == 0); //~ related location
+        //~ related location
     }
 
     fn socket_options_mut(&self) -> SocketOptionsGuard<'_> {
@@ -105,7 +106,7 @@ fn map_socket_options_mut<R>(
     options: &mut SocketOptions,
     callback: impl FnOnce(&mut SocketOptions) -> R,
 ) -> R {
-    Some(options).map(|options| callback(options)).unwrap() //~ callback invocation could not be resolved
+    Some(options).map(|options| callback(options)).unwrap()
 }
 
 pub fn main() {}

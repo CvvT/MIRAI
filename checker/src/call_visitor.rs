@@ -16,7 +16,7 @@ use rustc_abi::{ExternAbi, VariantIdx};
 use rustc_hir::def_id::DefId;
 use rustc_middle::mir;
 use rustc_middle::ty::{AliasTyKind, ConstKind};
-use rustc_middle::ty::{GenericArg, GenericArgKind, GenericArgsRef, Ty, TyKind, UintTy};
+use rustc_middle::ty::{GenericArg, GenericArgKind, GenericArgsRef, Ty, TyCtxt, TyKind, UintTy};
 
 use crate::abstract_value::{AbstractValue, AbstractValueTrait};
 use crate::block_visitor::BlockVisitor;
@@ -126,10 +126,11 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             let baseline_callbacks = if func_args.is_none() {
                 Vec::new()
             } else {
+                let mut baseline_diagnostics = Vec::new();
                 let mut baseline_visitor = BodyVisitor::new(
                     self.block_visitor.bv.cv,
                     self.callee_def_id,
-                    self.block_visitor.bv.buffered_diagnostics,
+                    &mut baseline_diagnostics,
                     self.block_visitor.bv.active_calls_map,
                     self.block_visitor.bv.cv.type_cache.clone(),
                 );
@@ -143,17 +144,26 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                             .set_path_rustc_type(path.clone(), *ty);
                     }
                 }
-                baseline_visitor
+                let callbacks = baseline_visitor
                     .visit_body(&[])
                     .callback_invocations
                     .into_iter()
                     .filter(|invocation| {
-                        invocation
-                            .pre_state
-                            .iter()
-                            .any(|(path, _)| Self::is_arc_projected_model_field(path))
+                        invocation.pre_state.iter().any(|(path, _)| {
+                            Self::is_arc_projected_model_field_with_types(
+                                path,
+                                baseline_visitor.type_visitor(),
+                                tcx,
+                                baseline_visitor.current_span,
+                            )
+                        })
                     })
-                    .collect()
+                    .collect();
+                drop(baseline_visitor);
+                for diagnostic in baseline_diagnostics {
+                    diagnostic.cancel();
+                }
+                callbacks
             };
             let mut body_visitor = BodyVisitor::new(
                 self.block_visitor.bv.cv,
@@ -2168,7 +2178,7 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 condition,
                 message,
                 provenance: None,
-                spans: vec![self.block_visitor.bv.current_span],
+                spans: vec![self.block_visitor.bv.current_span.source_callsite()],
             };
             self.block_visitor.bv.preconditions.push(precondition);
         }
@@ -2976,10 +2986,29 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
     }
 
     fn replay_callback_invocations(&mut self, function_summary: &Summary) {
-        self.replay_callback_invocations_with_anchor(function_summary, None);
+        let mut model_state_carriers = HashMap::new();
+        self.replay_callback_invocations_with_anchor(
+            function_summary,
+            None,
+            &mut model_state_carriers,
+        );
     }
 
-    fn is_arc_projected_model_field(path: &Rc<Path>) -> bool {
+    fn is_arc_projected_model_field(&self, path: &Rc<Path>) -> bool {
+        Self::is_arc_projected_model_field_with_types(
+            path,
+            self.type_visitor(),
+            self.block_visitor.bv.tcx,
+            self.block_visitor.bv.current_span,
+        )
+    }
+
+    fn is_arc_projected_model_field_with_types(
+        path: &Rc<Path>,
+        type_visitor: &TypeVisitor<'tcx>,
+        tcx: TyCtxt<'tcx>,
+        current_span: rustc_span::Span,
+    ) -> bool {
         let PathEnum::QualifiedPath {
             qualifier,
             selector,
@@ -2992,7 +3021,7 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             return false;
         }
         let mut qualifier = qualifier;
-        for expected in [
+        for (index, expected) in [
             PathSelector::Field(0),
             PathSelector::Field(2),
             PathSelector::Deref,
@@ -3000,7 +3029,10 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             PathSelector::Field(0),
             PathSelector::Field(0),
             PathSelector::Deref,
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let PathEnum::QualifiedPath {
                 qualifier: parent,
                 selector,
@@ -3013,6 +3045,16 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 return false;
             }
             qualifier = parent;
+            if index == 4 {
+                let arc_type = type_visitor.get_path_rustc_type(qualifier, current_span);
+                if !matches!(
+                    arc_type.kind(),
+                    TyKind::Adt(def, _)
+                        if tcx.get_diagnostic_item(rustc_span::sym::Arc) == Some(def.did())
+                ) {
+                    return false;
+                }
+            }
         }
         true
     }
@@ -3021,6 +3063,10 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
         &mut self,
         function_summary: &Summary,
         parent_callback_anchor: Option<Rc<Path>>,
+        model_state_carriers: &mut HashMap<
+            u64,
+            Vec<(Rc<AbstractValue>, Vec<(Rc<Path>, Rc<AbstractValue>)>)>,
+        >,
     ) {
         if function_summary.callback_invocations.is_empty() {
             return;
@@ -3233,23 +3279,7 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 &outer_environment,
                 self.block_visitor.bv.fresh_variable_offset,
             );
-            let invocation_has_arc_model_state = invocation
-                .pre_state
-                .iter()
-                .any(|(path, _)| Self::is_arc_projected_model_field(path));
             if refined_guard.as_bool_if_known() == Some(false) {
-                if !invocation_has_arc_model_state {
-                    if let Some(carriers) = invocation.carrier_id.and_then(|carrier_id| {
-                        self.block_visitor
-                            .bv
-                            .callback_model_state_carriers
-                            .get_mut(&carrier_id)
-                    }) {
-                        if !carriers.is_empty() {
-                            carriers.remove(0);
-                        }
-                    }
-                }
                 continue;
             }
             callback_environment.entry_condition = callback_environment
@@ -3326,13 +3356,14 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 }
                 callback_environment.strong_update_value_at(refined_path, refined_value);
             }
+            let invocation_has_arc_model_state = refined_model_state
+                .iter()
+                .any(|(path, _)| self.is_arc_projected_model_field(path));
             if !invocation_has_arc_model_state && !callback_summary.preconditions.is_empty() {
-                if let Some(carriers) = invocation.carrier_id.and_then(|carrier_id| {
-                    self.block_visitor
-                        .bv
-                        .callback_model_state_carriers
-                        .get_mut(&carrier_id)
-                }) {
+                if let Some(carriers) = invocation
+                    .carrier_id
+                    .and_then(|id| model_state_carriers.get_mut(&id))
+                {
                     if !carriers.is_empty() {
                         let (carrier_guard, carrier_state) = carriers.remove(0);
                         for (path, value) in carrier_state {
@@ -3470,7 +3501,7 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             if lifted_callback
                 && refined_model_state
                     .iter()
-                    .any(|(path, _)| Self::is_arc_projected_model_field(path))
+                    .any(|(path, _)| self.is_arc_projected_model_field(path))
             {
                 if let Some(carrier_id) = invocation.carrier_id {
                     let carrier_state = self
@@ -3482,14 +3513,14 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                             let arc_roots: Vec<_> = invocation
                                 .pre_state
                                 .iter()
-                                .filter(|(path, _)| Self::is_arc_projected_model_field(path))
+                                .filter(|(path, _)| self.is_arc_projected_model_field(path))
                                 .map(|(path, _)| path.get_path_root())
                                 .collect();
                             invocation
                                 .pre_state
                                 .iter()
                                 .filter(|(path, value)| {
-                                    Self::is_arc_projected_model_field(path)
+                                    self.is_arc_projected_model_field(path)
                                         || arc_roots.iter().any(|root| {
                                             path.get_path_root() == *root
                                                 || Path::get_as_path(value.clone())
@@ -3502,9 +3533,7 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                                 .collect()
                         })
                         .unwrap_or(refined_model_state);
-                    self.block_visitor
-                        .bv
-                        .callback_model_state_carriers
+                    model_state_carriers
                         .entry(carrier_id)
                         .or_default()
                         .push((refined_guard.clone(), carrier_state));
@@ -3565,6 +3594,7 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                     callback_visitor.replay_callback_invocations_with_anchor(
                         &captured_summary,
                         Some(nested_callback_anchor),
+                        model_state_carriers,
                     );
                 }
                 let nested_callback_lifted =
@@ -3591,21 +3621,6 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                         &callback_visitor.actual_args,
                         &callback_environment,
                     );
-                }
-            }
-            if callback_summary.preconditions.is_empty()
-                && callback_summary.callback_invocations.is_empty()
-                && !invocation_has_arc_model_state
-            {
-                if let Some(carriers) = invocation.carrier_id.and_then(|carrier_id| {
-                    self.block_visitor
-                        .bv
-                        .callback_model_state_carriers
-                        .get_mut(&carrier_id)
-                }) {
-                    if !carriers.is_empty() {
-                        carriers.remove(0);
-                    }
                 }
             }
             self.block_visitor.bv.current_environment = outer_environment.clone();
