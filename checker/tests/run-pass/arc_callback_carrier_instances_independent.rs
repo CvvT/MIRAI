@@ -19,46 +19,44 @@ pub struct Owner {
     inner: Arc<Inner>,
 }
 
+pub struct PlainOwner {
+    lock: Lock,
+}
+
 impl Owner {
     fn lock(&self) -> &Lock {
         &self.inner.lock
     }
 
-    fn options(&self) -> OptionsGuard<'_> {
-        OptionsGuard {
-            owner: self,
-            options: Options,
-        }
-    }
-
-    fn with_options<R>(&self, callback: impl FnOnce(&mut Options) -> R) -> R {
-        self.options().with_options(|options| callback(options))
+    fn options(&self) -> OptionsGuard {
+        OptionsGuard { options: Options }
     }
 
     fn with_locked_options<R>(&self, callback: impl FnOnce(&mut Options) -> R) -> R {
         set_model_field!(self.lock(), writer, 1usize);
-        self.options().with_options(|options| callback(options))
+        let result = self.options().with_options(|options| callback(options));
+        set_model_field!(self.lock(), writer, 0usize);
+        result
+    }
+}
+
+impl PlainOwner {
+    fn with_options<R>(&self, callback: impl FnOnce(&mut Options) -> R) -> R {
+        OptionsGuard { options: Options }.with_options(|options| callback(options))
     }
 
     fn require_unlocked(&self) {
-        precondition!(get_model_field!(self.lock(), writer, 0usize) == 0);
+        precondition!(get_model_field!(&self.lock, writer, 0usize) == 0);
     }
 }
 
-struct OptionsGuard<'a> {
-    owner: &'a Owner,
+struct OptionsGuard {
     options: Options,
 }
 
-impl OptionsGuard<'_> {
+impl OptionsGuard {
     fn with_options<R>(&mut self, callback: impl FnOnce(&mut Options) -> R) -> R {
         map_options(&mut self.options, |options| callback(options))
-    }
-}
-
-impl Drop for OptionsGuard<'_> {
-    fn drop(&mut self) {
-        set_model_field!(self.owner.lock(), writer, 0usize);
     }
 }
 
@@ -66,7 +64,7 @@ fn map_options<R>(options: &mut Options, callback: impl FnOnce(&mut Options) -> 
     Some(options).map(|options| callback(options)).unwrap()
 }
 
-pub fn repeated_static_site_is_scoped_per_call(first: &Owner, second: &Owner) {
+pub fn repeated_static_site_is_scoped_per_call(first: &Owner, second: &PlainOwner) {
     first.with_locked_options(|_options| {});
     second.with_options(|_options| second.require_unlocked());
 }
