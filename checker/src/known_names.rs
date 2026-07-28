@@ -167,6 +167,7 @@ pub enum KnownNames {
     StdPanickingBeginPanicFmt,
     StdPtrSwapNonOverlapping,
     StdSliceCmpMemcmp,
+    StdOpsDerefDeref,
 }
 
 /// An analysis lifetime cache that contains a map from def ids to known names.
@@ -473,6 +474,13 @@ fn known_name_for_ops_namespace(path_segments: &[DisambiguatedDefPathData]) -> O
     // See https://github.com/endorlabs/MIRAI/issues/26#issuecomment-2566638406 for details.
     // See also [`get_known_name_for_sync_namespace`]?
     match path_segments {
+        [current_segment, middle_segment, last_segment]
+            if name_from_type_ns(current_segment)? == "deref" =>
+        {
+            let is_deref = name_from_type_ns(middle_segment)? == "Deref"
+                && name_from_value_ns(last_segment)? == "deref";
+            is_deref.then_some(KnownNames::StdOpsDerefDeref)
+        }
         [current_segment, middle_segment, last_segment] => match_names! (
             (
                 name_from_type_ns(current_segment)?,
@@ -552,6 +560,11 @@ fn known_name_for_slice_namespace(
 
 fn known_name_for_sync_namespace(path_segments: &[DisambiguatedDefPathData]) -> Option<KnownNames> {
     match path_segments {
+        [current_segment, last_segment] => {
+            let is_arc_deref = matches!(current_segment.data, DefPathData::Impl)
+                && name_from_value_ns(last_segment)? == "deref";
+            is_arc_deref.then_some(KnownNames::StdOpsDerefDeref)
+        }
         [current_segment, middle_segment, last_segment] => {
             let current_name = name_from_type_ns(current_segment)?;
             let last_name = name_from_value_ns(last_segment)?;

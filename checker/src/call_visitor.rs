@@ -481,6 +481,16 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             .type_visitor()
             .get_rustc_place_type(&self.destination, self.block_visitor.bv.current_span);
         let target_path = self.block_visitor.visit_rh_place(&self.destination);
+        let structurally_copy_arc = matches!(
+            target_type.kind(),
+            TyKind::Adt(def, _)
+                if self
+                    .block_visitor
+                    .bv
+                    .tcx
+                    .def_path_str(def.did())
+                    .ends_with("::sync::Arc")
+        );
         if !summary.is_computed {
             // Now just do a deep copy and carry on.
             self.block_visitor.bv.copy_or_move_elements(
@@ -509,6 +519,14 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                     .bv
                     .update_value_at(target_path, value.clone());
             }
+            if structurally_copy_arc {
+                self.block_visitor.bv.copy_or_move_elements(
+                    target_path,
+                    source_path,
+                    target_type,
+                    false,
+                );
+            }
         }
         self.use_entry_condition_as_exit_condition();
     }
@@ -522,6 +540,11 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             KnownNames::StdCloneClone => {
                 checked_assume!(self.actual_argument_types.len() == 1);
                 return self.handled_clone();
+            }
+            KnownNames::StdOpsDerefDeref => {
+                if self.handled_arc_deref() {
+                    return true;
+                }
             }
             KnownNames::StdOpsFunctionFnCall
             | KnownNames::StdOpsFunctionFnMutCallMut
@@ -798,6 +821,39 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             }
         }
         false
+    }
+
+    /// Models `Arc<T>::deref` without exposing `Arc`'s raw-pointer implementation.
+    fn handled_arc_deref(&mut self) -> bool {
+        if self.actual_argument_types.len() != 1 {
+            return false;
+        }
+        let TyKind::Ref(_, arc_type, _) = self.actual_argument_types[0].kind() else {
+            return false;
+        };
+        let TyKind::Adt(arc_def, arc_args) = arc_type.kind() else {
+            return false;
+        };
+        let arc_name = self.block_visitor.bv.tcx.def_path_str(arc_def.did());
+        if !arc_name.ends_with("::sync::Arc") {
+            return false;
+        }
+        trace!("modeling Arc::deref as a structural pointee projection");
+
+        if arc_args.types().next().is_none() {
+            return false;
+        }
+        let arc_path = Path::new_deref(self.actual_args[0].0.clone(), ExpressionType::NonPrimitive);
+        let thin_pointer_path = Path::new_field(Path::new_field(arc_path, 0), 0);
+        let arc_inner_path = Path::new_deref(thin_pointer_path, ExpressionType::NonPrimitive);
+        let pointee_path = Path::new_field(arc_inner_path, 2)
+            .canonicalize(&self.block_visitor.bv.current_environment);
+        let target_path = self.block_visitor.visit_lh_place(&self.destination);
+        self.block_visitor
+            .bv
+            .update_value_at(target_path, AbstractValue::make_reference(pointee_path));
+        self.use_entry_condition_as_exit_condition();
+        true
     }
 
     /// Use this for terminators that deterministically transfer control to a single successor block.
