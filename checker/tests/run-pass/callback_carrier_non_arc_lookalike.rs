@@ -4,8 +4,12 @@
 // LICENSE file in the root directory of this source tree.
 
 // MIRAI_FLAGS --diag=default
+//
+// The nested name deliberately ends in `::sync::Arc`, but this user-defined type must not activate
+// callback model-state carrying because it is not Rust's `Arc` diagnostic item.
 
 use mirai_annotations::*;
+use std::ops::{Deref, DerefMut};
 
 pub struct Lock;
 pub struct Options;
@@ -22,21 +26,27 @@ struct LookalikeInner {
 
 struct LookalikePointer(&'static LookalikeInner);
 
-mod sync {
-    use super::LookalikePointer;
+mod lookalike {
+    pub mod sync {
+        use super::super::LookalikePointer;
 
-    pub struct Arc(pub LookalikePointer);
+        pub struct Arc(pub LookalikePointer);
+    }
 }
 
-struct Owner(sync::Arc);
+struct Owner(lookalike::sync::Arc);
 
 impl Owner {
     fn lock(&self) -> &Lock {
         &self.0.0.0.data.lock
     }
 
-    fn options(&self) -> OptionsGuard<'_> {
+    fn acquire_write(&self) {
         set_model_field!(self.lock(), writer, 1usize);
+    }
+
+    fn options(&self) -> OptionsGuard<'_> {
+        self.acquire_write();
         OptionsGuard {
             owner: self,
             options: Options,
@@ -51,6 +61,10 @@ impl Owner {
     fn require_unlocked(&self) {
         precondition!(get_model_field!(self.lock(), writer, 0usize) == 0);
     }
+
+    pub fn trigger(&self) {
+        self.with_options(|_options| self.require_unlocked());
+    }
 }
 
 struct OptionsGuard<'a> {
@@ -64,6 +78,20 @@ impl OptionsGuard<'_> {
     }
 }
 
+impl Deref for OptionsGuard<'_> {
+    type Target = Options;
+
+    fn deref(&self) -> &Options {
+        &self.options
+    }
+}
+
+impl DerefMut for OptionsGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Options {
+        &mut self.options
+    }
+}
+
 impl Drop for OptionsGuard<'_> {
     fn drop(&mut self) {
         set_model_field!(self.owner.lock(), writer, 0usize);
@@ -72,17 +100,6 @@ impl Drop for OptionsGuard<'_> {
 
 fn map_options<R>(options: &mut Options, callback: impl FnOnce(&mut Options) -> R) -> R {
     Some(options).map(|options| callback(options)).unwrap()
-}
-
-static INNER: LookalikeInner = LookalikeInner {
-    strong: 1,
-    weak: 1,
-    data: Data { lock: Lock },
-};
-
-pub fn non_arc_layout_does_not_activate_carrier() {
-    let owner = Owner(sync::Arc(LookalikePointer(&INNER)));
-    owner.with_options(|_options| owner.require_unlocked());
 }
 
 pub fn main() {}

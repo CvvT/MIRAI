@@ -4,6 +4,10 @@
 // LICENSE file in the root directory of this source tree.
 
 // MIRAI_FLAGS --diag=default
+//
+// The unspecialized callback-discovery pass must not leak its diagnostics into the specialized
+// analysis. Carrier replay is defensively scoped as well, but independent roots cannot consume
+// one another's carried state, so that isolation has no constructible behavioral witness here.
 
 use mirai_annotations::*;
 use std::sync::Arc;
