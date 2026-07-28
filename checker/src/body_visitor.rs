@@ -58,6 +58,8 @@ pub struct BodyVisitor<'analysis, 'compilation, 'tcx> {
     pub check_for_errors: bool,
     pub check_for_unconditional_precondition: bool,
     pub callback_invocations: Vec<CallbackInvocation>,
+    pub callback_model_state_carriers:
+        HashMap<u64, Vec<(Rc<AbstractValue>, Vec<(Rc<Path>, Rc<AbstractValue>)>)>>,
     pub current_environment: Environment,
     pub current_location: mir::Location,
     pub current_span: rustc_span::Span,
@@ -132,6 +134,7 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
             check_for_errors: false,
             check_for_unconditional_precondition: false, // logging + new mir code gen breaks this for now
             callback_invocations: Vec::new(),
+            callback_model_state_carriers: HashMap::new(),
             current_environment: Environment::default(),
             current_location: mir::Location::START,
             current_span: rustc_span::DUMMY_SP,
@@ -160,6 +163,7 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
         self.check_for_errors = false;
         self.check_for_unconditional_precondition = false;
         self.callback_invocations = Vec::new();
+        self.callback_model_state_carriers = HashMap::new();
         self.current_environment = Environment::default();
         self.current_location = mir::Location::START;
         self.current_span = rustc_span::DUMMY_SP;

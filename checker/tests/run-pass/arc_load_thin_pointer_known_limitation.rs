@@ -3,17 +3,10 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root directory of this source tree.
 
-// Known false-negative (XFAIL): Arc-load thin-pointer capture-state loss.
-//
 // This is a genuine double-lock: `acquire_write` sets the `writer` model field to 1 on the
 // Arc-loaded socket-options lock, and the terminal callback calls `require_unlocked` while that
-// writer is still held. MIRAI should report the precondition violation, but is currently silent.
-//
-// The terminal callback is lifted and replayed through the nested `Option::map` re-wrap, but its
-// captured `self` survives only as an opaque `param_1.0: NonPrimitive`. The Arc-loaded lock's
-// `writer = 1` model field is never reconstructed in the callback's pre-state, so the precondition
-// remains rooted at unresolved `param_1...writer`. Fixing this requires capture-state
-// reconstruction across the lifted callback, not frame-root classification.
+// writer is still held. Callback lineage carries the guarded model state through the nested
+// `Option::map` re-wrap to the terminal callback.
 //
 // Positive control: model_field_wrapper_field_double_lock.rs passes the owner as an explicit
 // callback argument across the same Arc and wrapper-field hop, and does report the violation.
@@ -69,8 +62,7 @@ impl Owner {
 
     pub fn trigger(&self) {
         self.with_socket_options_mut(|_options| {
-            // A fixed checker reports an unsatisfied precondition here.
-            self.require_unlocked();
+            self.require_unlocked(); //~ unsatisfied precondition
         });
     }
 }
@@ -113,7 +105,7 @@ fn map_socket_options_mut<R>(
     options: &mut SocketOptions,
     callback: impl FnOnce(&mut SocketOptions) -> R,
 ) -> R {
-    Some(options).map(|options| callback(options)).unwrap()
+    Some(options).map(|options| callback(options)).unwrap() //~ callback invocation could not be resolved
 }
 
 pub fn main() {}

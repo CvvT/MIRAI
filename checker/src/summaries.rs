@@ -145,10 +145,70 @@ pub struct CallbackInvocation {
     /// of its captured parameters for serialization.
     #[serde(default)]
     pub is_local: bool,
+    /// Stable identity of the callback chain that produced this invocation.
+    pub carrier_id: Option<u64>,
 }
 
 fn complete_callback_arguments() -> bool {
     true
+}
+
+#[derive(Serialize, Deserialize)]
+struct PreLineageCallbackInvocation {
+    callee: Rc<Path>,
+    arguments: Vec<(Rc<Path>, Rc<AbstractValue>)>,
+    arguments_complete: bool,
+    pre_state: Vec<(Rc<Path>, Rc<AbstractValue>)>,
+    pre_aliases: Vec<(Rc<Path>, Rc<Path>)>,
+    pre_guarded_aliases: Vec<(Rc<Path>, Rc<Path>, Rc<AbstractValue>)>,
+    guard: Rc<AbstractValue>,
+    specialized_callee: Option<Rc<FunctionReference>>,
+    function_constants: Vec<Rc<FunctionReference>>,
+    is_local: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PreLineageSummary {
+    is_computed: bool,
+    is_incomplete: bool,
+    preconditions: Vec<Precondition>,
+    assumed_aliases: Vec<(Rc<Path>, Rc<Path>)>,
+    guarded_aliases: Vec<(Rc<Path>, Rc<Path>, Rc<AbstractValue>)>,
+    side_effects: Vec<(Rc<Path>, Rc<AbstractValue>)>,
+    post_condition: Option<Rc<AbstractValue>>,
+    callback_invocations: Vec<PreLineageCallbackInvocation>,
+}
+
+impl From<PreLineageSummary> for Summary {
+    fn from(summary: PreLineageSummary) -> Self {
+        Summary {
+            is_computed: summary.is_computed,
+            is_incomplete: summary.is_incomplete,
+            preconditions: summary.preconditions,
+            assumed_aliases: summary.assumed_aliases,
+            guarded_aliases: summary.guarded_aliases,
+            side_effects: summary.side_effects,
+            post_condition: summary.post_condition,
+            return_type_index: 0,
+            callback_invocations: summary
+                .callback_invocations
+                .into_iter()
+                .map(|invocation| CallbackInvocation {
+                    callee: invocation.callee,
+                    arguments: invocation.arguments,
+                    arguments_complete: invocation.arguments_complete,
+                    pre_state: invocation.pre_state,
+                    pre_aliases: invocation.pre_aliases,
+                    pre_guarded_aliases: invocation.pre_guarded_aliases,
+                    guard: invocation.guard,
+                    specialized_callee: invocation.specialized_callee,
+                    function_constants: invocation.function_constants,
+                    is_local: invocation.is_local,
+                    carrier_id: None,
+                })
+                .collect(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -200,6 +260,7 @@ impl From<PreAliasSummary> for Summary {
                     pre_guarded_aliases: Vec::new(),
                     guard: invocation.guard,
                     is_local: invocation.is_local,
+                    carrier_id: None,
                 })
                 .collect(),
         }
@@ -258,6 +319,7 @@ impl From<PreviousSummary> for Summary {
                     pre_guarded_aliases: Vec::new(),
                     guard: invocation.guard,
                     is_local: false,
+                    carrier_id: None,
                 })
                 .collect(),
         }
@@ -301,6 +363,7 @@ impl From<OlderSummary> for Summary {
                     pre_guarded_aliases: Vec::new(),
                     guard: Rc::new(abstract_value::TRUE),
                     is_local: false,
+                    carrier_id: None,
                 })
                 .collect(),
         }
@@ -336,6 +399,7 @@ impl From<LegacySummary> for Summary {
 
 fn deserialize_summary(bytes: &[u8]) -> bincode::Result<Summary> {
     bincode::deserialize(bytes)
+        .or_else(|_| bincode::deserialize::<PreLineageSummary>(bytes).map(Into::into))
         .or_else(|_| bincode::deserialize::<PreAliasSummary>(bytes).map(Into::into))
         .or_else(|_| bincode::deserialize::<PreviousSummary>(bytes).map(Into::into))
         .or_else(|_| bincode::deserialize::<OlderSummary>(bytes).map(Into::into))
@@ -1120,7 +1184,8 @@ pub struct SummariesForLLM {
 #[cfg(test)]
 mod tests {
     use super::{
-        deserialize_summary, PreAliasCallbackInvocation, PreAliasSummary, Summary, SummaryCache,
+        deserialize_summary, PreAliasCallbackInvocation, PreAliasSummary,
+        PreLineageCallbackInvocation, PreLineageSummary, Summary, SummaryCache,
     };
     use crate::abstract_value;
     use crate::constant_domain::FunctionReference;
@@ -1134,6 +1199,39 @@ mod tests {
     use tempfile::TempDir;
 
     static SUMMARY_STORE_ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn pre_lineage_callback_summary_remains_deserializable() {
+        let callee = Path::new_parameter(1);
+        let old_summary = PreLineageSummary {
+            is_computed: true,
+            is_incomplete: false,
+            preconditions: Vec::new(),
+            assumed_aliases: Vec::new(),
+            guarded_aliases: Vec::new(),
+            side_effects: Vec::new(),
+            post_condition: None,
+            callback_invocations: vec![PreLineageCallbackInvocation {
+                callee: callee.clone(),
+                arguments: Vec::new(),
+                arguments_complete: true,
+                pre_state: Vec::new(),
+                pre_aliases: Vec::new(),
+                pre_guarded_aliases: Vec::new(),
+                guard: Rc::new(abstract_value::TRUE),
+                specialized_callee: None,
+                function_constants: Vec::new(),
+                is_local: false,
+            }],
+        };
+
+        let bytes = bincode::serialize(&old_summary).unwrap();
+        let summary = deserialize_summary(&bytes).unwrap();
+        let invocation = summary.callback_invocations.first().unwrap();
+
+        assert_eq!(invocation.callee, callee);
+        assert_eq!(invocation.carrier_id, None);
+    }
 
     #[test]
     fn pre_alias_callback_summary_remains_deserializable() {

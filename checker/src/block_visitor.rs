@@ -834,7 +834,7 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
         else {
             return false;
         };
-        self.push_callback_invocation(callee_parameter, actual_args, true)
+        self.push_callback_invocation(callee_parameter, actual_args, true, None)
     }
 
     pub fn record_transitive_callback_invocation(
@@ -848,6 +848,7 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
         allow_new_local: bool,
         enclosing_capture_rekeys: &[(Rc<Path>, Rc<AbstractValue>)],
         local_callback_anchor: Option<Rc<Path>>,
+        carrier_id: Option<u64>,
     ) -> bool {
         if !self.bv.check_for_errors {
             return false;
@@ -913,7 +914,12 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                 (Path::new_computed(Rc::new(BOTTOM)), Rc::new(BOTTOM))
             })
             .collect::<Vec<_>>();
-        self.push_callback_invocation(callee_parameter, &boundary_args, arguments_complete);
+        self.push_callback_invocation(
+            callee_parameter,
+            &boundary_args,
+            arguments_complete,
+            carrier_id,
+        );
         let capture_model_rekeys = capture_aliases
             .iter()
             .filter_map(|(boundary_path, source_value)| {
@@ -1306,6 +1312,7 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
         callee_parameter: Rc<Path>,
         actual_args: &[(Rc<Path>, Rc<AbstractValue>)],
         arguments_complete: bool,
+        carrier_id: Option<u64>,
     ) -> bool {
         let pre_state = self
             .bv
@@ -1349,6 +1356,31 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
             .map(|((alias, source), condition)| (alias.clone(), source.clone(), condition.clone()))
             .collect();
         pre_guarded_aliases.sort();
+        let carrier_id = carrier_id.or_else(|| {
+            let mut hash = 0xcbf29ce484222325_u64;
+            for byte in utils::summary_key_str(self.bv.tcx, self.bv.def_id)
+                .bytes()
+                .chain(
+                    self.bv
+                        .current_location
+                        .block
+                        .as_usize()
+                        .to_le_bytes()
+                        .into_iter(),
+                )
+                .chain(
+                    self.bv
+                        .current_location
+                        .statement_index
+                        .to_le_bytes()
+                        .into_iter(),
+                )
+            {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+            Some(hash)
+        });
         self.bv.callback_invocations.push(CallbackInvocation {
             callee: callee_parameter,
             specialized_callee: None,
@@ -1366,6 +1398,7 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                 .extract_promotable_conjuncts(false)
                 .filter(|guard| !guard.expression.contains_local_variable(false))
                 .unwrap_or_else(|| Rc::new(abstract_value::TRUE)),
+            carrier_id,
         });
         true
     }
