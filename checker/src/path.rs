@@ -868,6 +868,24 @@ impl Path {
         Path::new_qualified(qualifier, selector.clone())
     }
 
+    /// Follows environment-bound pointer provenance until no further reference projection can be
+    /// removed. Function-summary transfer can introduce more than one binding between a local
+    /// result and its caller-visible source, so one canonicalization pass is not always enough.
+    pub(crate) fn canonicalize_reference_projections(&self, environment: &Environment) -> Rc<Path> {
+        let mut path = Rc::new(self.clone());
+        let mut visited = HashSet::new();
+        while visited.insert(path.clone()) {
+            let next = path
+                .canonicalize(environment)
+                .normalize_reference_projections();
+            if next == path {
+                break;
+            }
+            path = next;
+        }
+        path
+    }
+
     /// Adds any heap blocks and string values found in embedded values to the given set.
     #[logfn_inputs(TRACE)]
     pub fn record_heap_blocks_and_strings(&self, result: &mut HashSet<Rc<AbstractValue>>) {

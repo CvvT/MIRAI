@@ -181,7 +181,7 @@ impl Environment {
         ) {
             return path;
         }
-        let path = path.normalize_reference_projections();
+        let path = path.canonicalize_reference_projections(self);
 
         let mut result = path;
         let mut visited = HashSet::new();
@@ -997,7 +997,7 @@ mod tests {
     use super::Environment;
     use crate::abstract_value::{AbstractValue, AbstractValueTrait};
     use crate::expression::ExpressionType;
-    use crate::path::Path;
+    use crate::path::{Path, PathSelector};
     use std::rc::Rc;
 
     fn computed_model_field(index_ordinal: usize) -> (Rc<Path>, Rc<AbstractValue>) {
@@ -1077,6 +1077,29 @@ mod tests {
             environment.canonicalize_model_field_path(alias_model),
             source_model
         );
+    }
+
+    #[test]
+    fn model_field_path_canonicalization_folds_transferred_pointer_chain() {
+        let result = Path::new_local(1, 0);
+        let guard_projection = Path::new_local(2, 0);
+        let receiver = Path::new_parameter(1);
+        let dereferenced_result = Path::new_qualified(result.clone(), Rc::new(PathSelector::Deref));
+        let model = Path::new_model_field(dereferenced_result, Rc::from("write_held"));
+        let expected = Path::new_model_field(receiver.clone(), Rc::from("write_held"));
+
+        let mut environment = Environment::default();
+        environment.strong_update_value_at(
+            result,
+            AbstractValue::make_typed_unknown(
+                ExpressionType::ThinPointer,
+                guard_projection.clone(),
+            ),
+        );
+        environment
+            .strong_update_value_at(guard_projection, AbstractValue::make_reference(receiver));
+
+        assert_eq!(environment.canonicalize_model_field_path(model), expected);
     }
 
     #[test]
