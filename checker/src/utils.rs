@@ -517,6 +517,44 @@ pub fn are_concrete(gen_args: GenericArgsRef<'_>) -> bool {
     true
 }
 
+/// Determines if any generic argument (recursively) carries an associated-type
+/// projection whose own arguments are not fully concrete. `Instance::try_resolve`
+/// can ICE (panic in `resolve_instance_raw`) when asked to devirtualize a callee
+/// whose generic arguments contain such an unnormalizable projection, for example
+/// `<Platform as RawMutexProvider>::RawMutex` where `Platform` is still a type
+/// parameter. Callers use this to skip resolution in that case. A projection whose
+/// arguments are all concrete normalizes fine under a fully monomorphized env, so it
+/// is not flagged; a bare type parameter is likewise not a projection and is left to
+/// `try_resolve` (which returns `Ok(None)` without crashing).
+pub fn contains_unresolvable_projection(gen_args: GenericArgsRef<'_>) -> bool {
+    for gen_arg in gen_args.iter() {
+        if let GenericArgKind::Type(ty) = gen_arg.kind() {
+            if ty_has_unresolvable_projection(ty.kind()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn ty_has_unresolvable_projection(ty: &TyKind<'_>) -> bool {
+    match ty {
+        TyKind::Alias(alias_ty) if matches!(alias_ty.kind, AliasTyKind::Projection { .. }) => {
+            !are_concrete(alias_ty.args)
+        }
+        TyKind::Adt(_, gen_args)
+        | TyKind::Closure(_, gen_args)
+        | TyKind::FnDef(_, gen_args)
+        | TyKind::Coroutine(_, gen_args) => contains_unresolvable_projection(gen_args),
+        TyKind::Alias(alias_ty) => contains_unresolvable_projection(alias_ty.args),
+        TyKind::Tuple(types) => types
+            .iter()
+            .any(|t| ty_has_unresolvable_projection(t.kind())),
+        TyKind::Ref(_, ty, _) => ty_has_unresolvable_projection(ty.kind()),
+        _ => false,
+    }
+}
+
 /// Determines if the given type is fully concrete.
 pub fn is_concrete(ty: &TyKind<'_>) -> bool {
     match ty {
