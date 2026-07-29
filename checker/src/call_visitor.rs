@@ -891,8 +891,13 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
         let TyKind::Adt(arc_def, arc_args) = arc_type.kind() else {
             return false;
         };
-        let arc_name = self.block_visitor.bv.tcx.def_path_str(arc_def.did());
-        if !arc_name.ends_with("::sync::Arc") {
+        if self
+            .block_visitor
+            .bv
+            .tcx
+            .get_diagnostic_item(rustc_span::sym::Arc)
+            != Some(arc_def.did())
+        {
             return false;
         }
         trace!("modeling Arc::deref as a structural pointee projection");
