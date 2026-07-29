@@ -900,7 +900,10 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
         {
             return false;
         }
-        trace!("modeling Arc::deref as a structural pointee projection");
+        trace!(
+            "modeling Arc::deref as a structural pointee projection for {}",
+            self.block_visitor.bv.tcx.def_path_str(arc_def.did())
+        );
 
         if arc_args.types().next().is_none() {
             return false;

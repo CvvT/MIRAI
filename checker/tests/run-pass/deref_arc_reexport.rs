@@ -5,15 +5,13 @@
 
 // MIRAI_FLAGS --diag=default
 
-mod reexport {
-    pub use std::sync::Arc;
-}
+use arc_reexport::Arc;
 
 pub struct Data {
     value: u64,
 }
 
-pub fn read_through_reexport(data: &reexport::Arc<Data>) -> u64 {
+pub fn read_through_reexport(data: &Arc<Data>) -> u64 {
     data.value
 }
 

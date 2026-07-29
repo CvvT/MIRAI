@@ -28,6 +28,7 @@ use std::fs;
 use std::fs::read_to_string;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Mutex;
 
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::ParallelIterator;
@@ -42,6 +43,28 @@ use mirai::callbacks;
 use mirai::options::{DiagLevel, Options};
 use mirai::utils;
 use mirai_annotations::{assume, unrecoverable};
+
+struct ArcModelLogger;
+
+static ARC_MODEL_LOGGER: ArcModelLogger = ArcModelLogger;
+static ARC_MODEL_MESSAGES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+impl log::Log for ArcModelLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.target() == "mirai::call_visitor" && metadata.level() <= log::Level::Trace
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if self.enabled(record.metadata()) {
+            let message = record.args().to_string();
+            if message.starts_with("modeling Arc::deref as a structural pointee projection") {
+                ARC_MODEL_MESSAGES.lock().unwrap().push(message);
+            }
+        }
+    }
+
+    fn flush(&self) {}
+}
 
 // nightly-2026-06-01 changed stdlib MIR in ways that trigger the union-initialization check in
 // body_visitor.rs for otherwise unrelated fixtures. Keep these cases out of the main regression
@@ -137,12 +160,16 @@ const NIGHTLY_CALL_GRAPH_DRIFT: &[&str] = &[
 // Eventually, there will be separate test cases for other directories such as compile-fail.
 #[test]
 fn run_pass() {
+    log::set_logger(&ARC_MODEL_LOGGER).expect("test logger should only be initialized once");
+    log::set_max_level(log::LevelFilter::Trace);
+    let arc_reexport = compile_auxiliary_crate("arc_reexport");
     let extern_deps = vec![
         (
             "mirai_annotations",
             find_extern_library("mirai_annotations"),
         ),
         ("contracts", find_extern_library("contracts")),
+        ("arc_reexport", arc_reexport),
     ];
     let mut run_pass_path = PathBuf::from_str("tests/run-pass").unwrap();
     if !run_pass_path.exists() {
@@ -164,7 +191,51 @@ fn run_pass() {
         &(start_driver as fn(DriverConfig) -> usize),
     );
     assert_eq!(result, 0);
+    assert!(
+        ARC_MODEL_MESSAGES
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|message| message.ends_with(" for arc_reexport::Arc")),
+        "the cross-crate Arc re-export did not use the structural dereference model"
+    );
     run_call_graph_tests();
+}
+
+struct AuxiliaryCallbacks;
+
+impl rustc_driver::Callbacks for AuxiliaryCallbacks {}
+
+fn compile_auxiliary_crate(crate_name: &str) -> String {
+    let mut source_path = PathBuf::from_str("tests/auxiliary").unwrap();
+    if !source_path.exists() {
+        source_path = PathBuf::from_str("checker/tests/auxiliary").unwrap();
+    }
+    source_path.push(format!("{crate_name}.rs"));
+
+    let output_dir = TempDir::new()
+        .expect("failed to create auxiliary crate output directory")
+        .into_path();
+    let arguments = vec![
+        String::from("rustc"),
+        String::from("--crate-name"),
+        crate_name.to_owned(),
+        source_path.into_os_string().into_string().unwrap(),
+        String::from("--crate-type"),
+        String::from("rlib"),
+        String::from("--edition=2021"),
+        String::from("--out-dir"),
+        output_dir.clone().into_os_string().into_string().unwrap(),
+        String::from("--sysroot"),
+        utils::find_sysroot(),
+    ];
+    rustc_driver::run_compiler(&arguments, &mut AuxiliaryCallbacks);
+
+    output_dir
+        .join(format!("lib{crate_name}.rlib"))
+        .into_os_string()
+        .into_string()
+        .unwrap()
 }
 
 // Run the tests in the tests/call_graph directory.
