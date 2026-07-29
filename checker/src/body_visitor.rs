@@ -70,6 +70,8 @@ pub struct BodyVisitor<'analysis, 'compilation, 'tcx> {
     pub post_condition: Option<Rc<AbstractValue>>,
     pub post_condition_block: Option<mir::BasicBlock>,
     pub preconditions: Vec<Precondition>,
+    /// True while revisiting an incomplete analysis to recover diagnostics and summary facts.
+    pub recovering_incomplete_summary: bool,
     pub fresh_variable_offset: usize,
     #[cfg(not(feature = "z3"))]
     pub smt_solver: SolverStub,
@@ -143,6 +145,7 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
             post_condition: None,
             post_condition_block: None,
             preconditions: Vec::new(),
+            recovering_incomplete_summary: false,
             fresh_variable_offset: 0,
             smt_solver: Self::get_solver(),
             block_to_call: HashMap::default(),
@@ -169,6 +172,7 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
         self.post_condition = None;
         self.post_condition_block = None;
         self.preconditions = Vec::new();
+        self.recovering_incomplete_summary = false;
         self.fresh_variable_offset = 1000;
         self.block_to_call = HashMap::default();
         self.type_visitor_mut().reset_visitor_state();
@@ -189,7 +193,6 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
         &mut self,
         function_constant_args: &[(Rc<Path>, Ty<'tcx>, Rc<AbstractValue>)],
     ) -> Summary {
-        let diag_level = self.cv.options.diag_level;
         let max_analysis_time_for_body = self.cv.options.max_analysis_time_for_body;
         if option_env!("PRETTY_PRINT_MIR").is_some() {
             utils::pretty_print_mir(self.tcx, self.def_id);
@@ -224,15 +227,25 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
                 .bv
                 .report_timeout(elapsed_time_in_seconds);
         }
+        let analysis_was_incomplete = fixed_point_visitor.bv.analysis_is_incomplete;
+        let analysis_timed_out = elapsed_time_in_seconds >= max_analysis_time_for_body;
         let mut result = Summary {
             is_computed: true,
             is_incomplete: true,
             ..Summary::default()
         };
-        if !fixed_point_visitor.bv.analysis_is_incomplete
-            || (elapsed_time_in_seconds < max_analysis_time_for_body
-                && diag_level == DiagLevel::Paranoid)
-        {
+        if !analysis_timed_out {
+            // Revisit the analyzed prefix to collect diagnostics, preconditions and callback
+            // invocations. If fixed-point analysis stopped early, this pass stops at the same
+            // unresolved operation. Facts collected before that point are safe to persist.
+            fixed_point_visitor.bv.analysis_is_incomplete = false;
+            fixed_point_visitor.bv.recovering_incomplete_summary = analysis_was_incomplete;
+            if analysis_was_incomplete {
+                fixed_point_visitor
+                    .bv
+                    .already_reported_errors_for_call_to
+                    .clear();
+            }
             // Now traverse the blocks again, doing checks and emitting diagnostics.
             // terminator_state[bb] is now complete for every basic block bb in the body.
             fixed_point_visitor.bv.check_for_errors(
@@ -278,23 +291,23 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
                 };
                 let return_type_index = self.type_visitor().get_index_for(return_type);
 
-                result = summaries::summarize(
-                    self.mir.arg_count,
-                    self.exit_environment.as_ref(),
-                    &self.preconditions,
-                    &self.callback_invocations,
-                    &self.post_condition,
-                    return_type_index,
-                    self.tcx,
-                );
-            }
-        } else if elapsed_time_in_seconds < max_analysis_time_for_body {
-            // Timed-out analyses are removed by report_timeout above.
-            let entry = self.active_calls_map.entry(self.def_id).or_insert(0);
-            if *entry <= 1 {
-                self.active_calls_map.remove(&self.def_id);
-            } else {
-                *entry -= 1;
+                if analysis_was_incomplete || self.analysis_is_incomplete {
+                    result = summaries::summarize_incomplete(
+                        &self.preconditions,
+                        &self.callback_invocations,
+                        self.tcx,
+                    );
+                } else {
+                    result = summaries::summarize(
+                        self.mir.arg_count,
+                        self.exit_environment.as_ref(),
+                        &self.preconditions,
+                        &self.callback_invocations,
+                        &self.post_condition,
+                        return_type_index,
+                        self.tcx,
+                    );
+                }
             }
         }
         self.cv

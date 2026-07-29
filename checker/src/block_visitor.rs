@@ -808,7 +808,7 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                 .already_reported_errors_for_call_to
                 .insert(call_visitor.callee_fun_val.clone())
         {
-            call_visitor.report_incomplete_summary();
+            call_visitor.report_incomplete_summary(&function_summary);
         }
 
         if known_name == KnownNames::StdCloneClone {
@@ -1594,7 +1594,7 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                     // In this mode we suppress any diagnostics about issues that might not be true
                     // positives.
                 }
-                _ => {
+                _ if !self.bv.recovering_incomplete_summary => {
                     // Give a diagnostic about this call, and make it the programmer's problem.
                     let warning = self.bv.cv.session.dcx().struct_span_warn(
                         self.bv.current_span,
@@ -1602,6 +1602,7 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                     );
                     self.bv.emit_diagnostic(warning);
                 }
+                _ => {}
             }
         }
     }
@@ -2343,12 +2344,14 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
     /// Execute a piece of inline Assembly.
     #[logfn_inputs(TRACE)]
     fn visit_inline_asm(&mut self, targets: &[mir::BasicBlock]) {
-        let span = self.bv.current_span;
-        let warning = self.bv.cv.session.dcx().struct_span_warn(
-            span,
-            "[MIRAI] Inline assembly code cannot be analyzed by MIRAI.",
-        );
-        self.bv.emit_diagnostic(warning);
+        if !self.bv.recovering_incomplete_summary {
+            let span = self.bv.current_span;
+            let warning = self.bv.cv.session.dcx().struct_span_warn(
+                span,
+                "[MIRAI] Inline assembly code cannot be analyzed by MIRAI.",
+            );
+            self.bv.emit_diagnostic(warning);
+        }
         // Don't stop the analysis if we are building a call graph.
         self.bv.analysis_is_incomplete = self.bv.cv.options.call_graph_config.is_none();
         if let Some(target) = targets.first() {

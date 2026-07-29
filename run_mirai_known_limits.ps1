@@ -24,9 +24,9 @@ $rows = [ordered]@{
         Fixture = "checker/tests/run-pass/model_field_wrapper_field_double_lock.rs"
         ExpectedDiagnostic = "unsatisfied precondition"
     }
-    "arc_load_thin_pointer_capture_state_loss" = @{
+    "arc_load_thin_pointer_callback_carrier" = @{
         Fixture = "checker/tests/run-pass/arc_load_thin_pointer_known_limitation.rs"
-        ExpectedDiagnostic = $null
+        ExpectedDiagnostic = "unsatisfied precondition"
     }
 }
 

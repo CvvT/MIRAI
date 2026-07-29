@@ -1006,12 +1006,15 @@ impl PathRefinement for Rc<Path> {
                 }
             }
             PathEnum::Result => {
-                if result.is_none() {
-                    unreachable!(
-                        "A summary that references its result should have a path for the result"
-                    );
+                if let Some(result) = result {
+                    result.clone()
                 } else {
-                    result.as_ref().unwrap().clone()
+                    // A result path can be reached while replaying the callback components of an
+                    // incomplete summary, where no concrete result binding is available for this
+                    // call site. Rather than aborting the whole analysis, treat the result as an
+                    // unknown value, mirroring how a missing parameter argument is handled above.
+                    warn!("Summary refers to its result but no result path is available");
+                    Path::new_computed(Rc::new(abstract_value::BOTTOM))
                 }
             }
             PathEnum::StaticVariable { .. }

@@ -448,10 +448,12 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                             self.callee_def_id,
                             self.block_visitor.bv.tcx,
                         ));
-                if self.unresolved_callback_argument {
+                if self.unresolved_callback_argument
+                    && !Self::retained_callbacks_are_specialized(&result)
+                {
                     self.report_unresolvable_callback();
-                    self.unresolved_callback_argument = false;
                 }
+                self.unresolved_callback_argument = false;
                 return Some(result);
             }
             if call_depth < 4 {
@@ -481,10 +483,12 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                             self.callee_def_id,
                             self.block_visitor.bv.tcx,
                         ));
-                if self.unresolved_callback_argument {
+                if self.unresolved_callback_argument
+                    && !Self::retained_callbacks_are_specialized(&summary)
+                {
                     self.report_unresolvable_callback();
-                    self.unresolved_callback_argument = false;
                 }
+                self.unresolved_callback_argument = false;
                 return Some(summary);
             } else {
                 // Probably a statically unbounded self recursive call. Use an empty summary and let
@@ -590,6 +594,9 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             }
             KnownNames::StdOpsDerefDeref => {
                 if self.handled_arc_deref() {
+                    return true;
+                }
+                if self.handled_lock_guard_deref() {
                     return true;
                 }
             }
@@ -768,6 +775,9 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 return true;
             }
             _ => {
+                if self.handled_lock_acquire() {
+                    return true;
+                }
                 let result = self.try_to_inline_special_function();
                 if !result.is_bottom() {
                     let target_path = self.block_visitor.visit_lh_place(&self.destination);
@@ -899,6 +909,205 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
         self.block_visitor
             .bv
             .update_value_at(target_path, AbstractValue::make_reference(pointee_path));
+        self.use_entry_condition_as_exit_condition();
+        true
+    }
+
+    /// Model standard lock-guard dereference using the layouts validated for the pinned toolchain.
+    fn handled_lock_guard_deref(&mut self) -> bool {
+        if self.actual_argument_types.len() != 1 {
+            return false;
+        }
+        let TyKind::Ref(_, guard_type, _) = self.actual_argument_types[0].kind() else {
+            return false;
+        };
+        let TyKind::Adt(guard_def, guard_args) = guard_type.kind() else {
+            return false;
+        };
+        if self
+            .block_visitor
+            .bv
+            .tcx
+            .crate_name(guard_def.did().krate)
+            .as_str()
+            != "std"
+        {
+            return false;
+        }
+        let guard_name = self.block_visitor.bv.tcx.def_path_str(guard_def.did());
+        if !(guard_name.ends_with("::sync::MutexGuard")
+            || guard_name.ends_with("::sync::RwLockReadGuard")
+            || guard_name.ends_with("::sync::RwLockWriteGuard"))
+        {
+            return false;
+        }
+        if guard_args.types().next().is_none() {
+            return false;
+        }
+        trace!("modeling lock-guard deref as a structural inner-data projection");
+
+        let guard_path =
+            Path::new_deref(self.actual_args[0].0.clone(), ExpressionType::NonPrimitive);
+        let guard_field = Path::new_field(guard_path, 0);
+        let pointee_path = if guard_name.ends_with("::sync::RwLockReadGuard") {
+            Path::new_deref(guard_field, ExpressionType::NonPrimitive)
+        } else {
+            let lock_path = Path::new_deref(guard_field, ExpressionType::NonPrimitive);
+            Path::new_field(Path::new_field(lock_path, 2), 0)
+        }
+        .canonicalize(&self.block_visitor.bv.current_environment);
+        let target_path = self.block_visitor.visit_lh_place(&self.destination);
+        self.block_visitor
+            .bv
+            .update_value_at(target_path, AbstractValue::make_reference(pointee_path));
+        self.use_entry_condition_as_exit_condition();
+        true
+    }
+
+    /// Record the receiver of a standard lock acquisition on its successful guard. The result
+    /// discriminant remains unknown so poisoning and non-blocking acquisition failures stay
+    /// reachable.
+    fn handled_lock_acquire(&mut self) -> bool {
+        if self.actual_argument_types.len() != 1 {
+            return false;
+        }
+        let callee_name = self.block_visitor.bv.tcx.def_path_str(self.callee_def_id);
+        if self
+            .block_visitor
+            .bv
+            .tcx
+            .crate_name(self.callee_def_id.krate)
+            .as_str()
+            != "std"
+        {
+            return false;
+        }
+        let is_lock_acquire = callee_name.ends_with("Mutex::<T>::lock")
+            || callee_name.ends_with("Mutex::<T>::try_lock")
+            || callee_name.ends_with("RwLock::<T>::read")
+            || callee_name.ends_with("RwLock::<T>::write")
+            || callee_name.ends_with("RwLock::<T>::try_read")
+            || callee_name.ends_with("RwLock::<T>::try_write")
+            || callee_name.ends_with("Mutex::lock")
+            || callee_name.ends_with("Mutex::try_lock")
+            || callee_name.ends_with("RwLock::read")
+            || callee_name.ends_with("RwLock::write")
+            || callee_name.ends_with("RwLock::try_read")
+            || callee_name.ends_with("RwLock::try_write");
+        if !is_lock_acquire {
+            return false;
+        }
+        // Receiver must be `&Lock<T>`.
+        let TyKind::Ref(_, lock_type, _) = self.actual_argument_types[0].kind() else {
+            return false;
+        };
+        let TyKind::Adt(lock_def, _) = lock_type.kind() else {
+            return false;
+        };
+        if self
+            .block_visitor
+            .bv
+            .tcx
+            .crate_name(lock_def.did().krate)
+            .as_str()
+            != "std"
+        {
+            return false;
+        }
+        let lock_name = self.block_visitor.bv.tcx.def_path_str(lock_def.did());
+        if !(lock_name.ends_with("::sync::Mutex") || lock_name.ends_with("::sync::RwLock")) {
+            return false;
+        }
+        trace!("modeling lock acquisition, binding guard.lock to the receiver");
+
+        let target_path = self.block_visitor.visit_lh_place(&self.destination);
+        let result_ty = self
+            .type_visitor()
+            .get_rustc_place_type(&self.destination, self.block_visitor.bv.current_span);
+        let TyKind::Adt(result_def, result_args) = result_ty.kind() else {
+            return false;
+        };
+        if self
+            .block_visitor
+            .bv
+            .tcx
+            .crate_name(result_def.did().krate)
+            .as_str()
+            != "core"
+            || !self
+                .block_visitor
+                .bv
+                .tcx
+                .def_path_str(result_def.did())
+                .ends_with("::result::Result")
+        {
+            return false;
+        }
+        let Some(guard_type) = result_args.types().next() else {
+            return false;
+        };
+        let TyKind::Adt(guard_def, _) = guard_type.kind() else {
+            return false;
+        };
+        if self
+            .block_visitor
+            .bv
+            .tcx
+            .crate_name(guard_def.did().krate)
+            .as_str()
+            != "std"
+        {
+            return false;
+        }
+        let guard_name = self.block_visitor.bv.tcx.def_path_str(guard_def.did());
+        if !(guard_name.ends_with("::sync::MutexGuard")
+            || guard_name.ends_with("::sync::RwLockReadGuard")
+            || guard_name.ends_with("::sync::RwLockWriteGuard"))
+        {
+            return false;
+        }
+
+        let stale_paths: Vec<Rc<Path>> = self
+            .block_visitor
+            .bv
+            .current_environment
+            .value_map
+            .iter()
+            .filter(|(path, _)| **path == target_path || path.is_rooted_by(&target_path))
+            .map(|(path, _)| path.clone())
+            .collect();
+        for stale_path in stale_paths {
+            self.block_visitor
+                .bv
+                .current_environment
+                .value_map
+                .remove_mut(&stale_path);
+        }
+
+        let discr_ty = result_ty.discriminant_ty(self.block_visitor.bv.tcx);
+        let Some(ok_discr) = result_ty
+            .discriminant_for_variant(self.block_visitor.bv.tcx, VariantIdx::from_usize(0))
+        else {
+            return false;
+        };
+        let ok_discr_val = self.block_visitor.get_int_const_val(ok_discr.val, discr_ty);
+
+        let ok_downcast = Path::new_qualified(
+            target_path.clone(),
+            Rc::new(PathSelector::Downcast(Rc::from("Ok"), 0, ok_discr_val)),
+        );
+        let guard_path = Path::new_field(ok_downcast, 0);
+        let lock_ref_target =
+            Path::new_deref(self.actual_args[0].0.clone(), ExpressionType::NonPrimitive);
+        let guard_origin = if guard_name.ends_with("::sync::RwLockReadGuard") {
+            Path::new_field(Path::new_field(lock_ref_target, 2), 0)
+        } else {
+            lock_ref_target
+        };
+        let guard_origin = AbstractValue::make_reference(guard_origin);
+        self.block_visitor
+            .bv
+            .update_value_at(Path::new_field(guard_path, 0), guard_origin);
         self.use_entry_condition_as_exit_condition();
         true
     }
@@ -1572,7 +1781,7 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 {
                     let saved_callee_def_id = self.callee_def_id;
                     self.callee_def_id = def_id;
-                    self.report_incomplete_summary();
+                    self.report_incomplete_summary(&summary);
                     self.callee_def_id = saved_callee_def_id;
                 }
                 return;
@@ -2873,8 +3082,10 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
 
     /// Give diagnostic depending on self.bv.options.diag_level
     #[logfn_inputs(TRACE)]
-    pub fn report_incomplete_summary(&mut self) {
-        if self.unresolved_callback_argument {
+    pub fn report_incomplete_summary(&mut self, function_summary: &Summary) {
+        if self.unresolved_callback_argument
+            && !Self::retained_callbacks_are_specialized(function_summary)
+        {
             self.report_unresolvable_callback();
             return;
         }
@@ -2905,6 +3116,7 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             // If the callee is local, there will already be a diagnostic about the incomplete summary.
             if !self.callee_def_id.is_local()
                 && self.block_visitor.bv.cv.options.diag_level != DiagLevel::Default
+                && !self.block_visitor.bv.recovering_incomplete_summary
             {
                 let warning = self.block_visitor.bv.cv.session.dcx().struct_span_warn(
                     self.block_visitor.bv.current_span,
@@ -2960,12 +3172,19 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 .into_iter()
                 .zip(self.actual_args.iter().map(|(_, value)| value.clone()))
                 .collect();
-            for (ty, value) in arguments {
+            for (index, (ty, value)) in arguments.into_iter().enumerate() {
                 let ty = self.type_visitor().get_dereferenced_type(ty);
                 if matches!(
                     ty.kind(),
                     TyKind::FnDef(..) | TyKind::FnPtr(..) | TyKind::Closure(..)
                 ) && self.block_visitor.get_func_ref(&value).is_none()
+                    && !function_summary
+                        .callback_invocations
+                        .iter()
+                        .any(|invocation| {
+                            invocation.callee.get_parameter_root_ordinal() == Some(index + 1)
+                                && invocation.specialized_callee.is_some()
+                        })
                 {
                     unresolved_callback = true;
                     break;
@@ -2976,6 +3195,12 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             }
         }
         self.check_preconditions_if_necessary(function_summary);
+        if function_summary.is_incomplete {
+            if !function_summary.callback_invocations.is_empty() {
+                self.replay_callback_invocations(function_summary);
+            }
+            return;
+        }
         check_for_early_return!(self.block_visitor.bv);
         if self.summary_was_cached {
             self.replay_callback_invocations(function_summary);
@@ -3206,8 +3431,9 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                     .clone();
             }
             if !callback_summary.is_computed
-                && resolved_callback_differs
-                && callback_ref.def_id.is_some()
+                && callback_ref
+                    .def_id
+                    .is_some_and(|def_id| resolved_callback_differs || def_id.is_local())
             {
                 let mut block_visitor = BlockVisitor::new(self.block_visitor.bv);
                 let mut callback_visitor = CallVisitor::new(
@@ -3463,6 +3689,33 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 ));
             }
             let callback_type = self.actual_argument_types.get(argument_index).copied();
+            // A closure captured by value (not passed as an explicit argument) has a local-variable
+            // path, so it is normally lifted into this function's summary and its preconditions are
+            // deferred to an outer caller. When the closure's captures are already concretely bound
+            // at this frame (e.g. to parameters of the current function), that deferral drops the
+            // precondition for a root and mis-frames it otherwise. In that case discharge the
+            // precondition here, where the captures resolve, instead of only lifting.
+            let discharge_local_closure = parent_callback_anchor.is_none()
+                && callback_path.contains_local_variable(false)
+                && callback_type.is_some_and(|callback_type| {
+                    let callback_type = self.type_visitor().get_dereferenced_type(callback_type);
+                    if let TyKind::Closure(_, closure_args) = callback_type.kind() {
+                        let upvar_count = closure_args.as_closure().upvar_tys().len();
+                        upvar_count > 0
+                            && (0..upvar_count).all(|field| {
+                                let field_path = Path::new_field(callback_path.clone(), field);
+                                self.block_visitor
+                                    .bv
+                                    .current_environment
+                                    .value_at(&field_path)
+                                    .is_some_and(|value| {
+                                        !value.expression.contains_local_variable(false)
+                                    })
+                            })
+                    } else {
+                        false
+                    }
+                });
             let requires_local_lift =
                 parent_callback_anchor.is_some() || callback_path.contains_local_variable(false);
             let mut lifted_callback = !requires_local_lift
@@ -3614,7 +3867,7 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                         .callback_invocations
                         .remove(callback_count_before_lift);
                 }
-                if !lifted_callback && !nested_callback_lifted {
+                if (!lifted_callback && !nested_callback_lifted) || discharge_local_closure {
                     callback_visitor.check_preconditions_if_necessary(&callback_summary);
                 }
 
@@ -3891,6 +4144,9 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
 
     fn report_unresolvable_callback(&mut self) {
         self.block_visitor.bv.analysis_is_incomplete = true;
+        if self.block_visitor.bv.recovering_incomplete_summary {
+            return;
+        }
         let warning = self.block_visitor.bv.cv.session.dcx().struct_span_warn(
             self.block_visitor.bv.current_span,
             "[MIRAI] callback invocation could not be resolved",
@@ -3898,8 +4154,19 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
         self.block_visitor.bv.emit_diagnostic(warning);
     }
 
+    fn retained_callbacks_are_specialized(function_summary: &Summary) -> bool {
+        !function_summary.callback_invocations.is_empty()
+            && function_summary
+                .callback_invocations
+                .iter()
+                .all(|invocation| invocation.specialized_callee.is_some())
+    }
+
     fn report_unrepresentable_callback_argument(&mut self) {
         self.block_visitor.bv.analysis_is_incomplete = true;
+        if self.block_visitor.bv.recovering_incomplete_summary {
+            return;
+        }
         let warning = self.block_visitor.bv.cv.session.dcx().struct_span_warn(
             self.block_visitor.bv.current_span,
             "[MIRAI] callback argument could not be represented in summary",
@@ -3912,6 +4179,12 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
     /// then check the preconditions and report any conditions that are not known to hold at this point.
     #[logfn_inputs(TRACE)]
     pub fn check_preconditions_if_necessary(&mut self, function_summary: &Summary) {
+        if function_summary.is_incomplete && !function_summary.preconditions.is_empty() {
+            self.block_visitor
+                .bv
+                .already_reported_errors_for_call_to
+                .remove(&self.callee_fun_val);
+        }
         if self.block_visitor.bv.check_for_errors
             && self
                 .block_visitor

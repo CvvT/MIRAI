@@ -162,6 +162,14 @@ Replay resolves the adapter with its full function-constant signature and overla
 invocation-site model state, so the clean callback stays silent while the violation reports
 `read requires no live writer`.
 
+LiteBox's production `setsockopt` path remains an XFAIL when its manual
+`require_no_descriptor_writer` contract is removed. Callback-carrier reconstruction is necessary
+but not sufficient: the LiteBox-level proxy writer state is set only by the synthetic feasibility
+wrapper, not by the production descriptor-table write. Deriving the violation from the real lock
+therefore also requires preserving the descriptor `RwLock` instance identity from its outer write
+guard, through the nested callback boundaries, to the internal read of that same instance. Until
+that cross-callback identity propagation exists, the manual contract remains required.
+
 Adapter-closure specialization lookup has a focused unit regression:
 
 ```powershell

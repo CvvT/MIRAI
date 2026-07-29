@@ -12,8 +12,14 @@ cd "$repository_root"
 cargo build --tests
 cargo test
 
-# Run the checker fixture target explicitly, then invoke the double-lock positive control and
-# capture-reconstruction known limitation directly so both expected outcomes are visible.
+# Run the checker fixture target explicitly, then invoke both synthetic double-lock positive
+# controls directly so their expected outcomes are visible. The Arc-loaded capture fixture was a
+# known limitation before the callback carrier hops landed; the shipped carrier lineage now
+# derives its double-lock, so it is a positive control. The genuine remaining XFAIL is the
+# production `setsockopt` path (LiteBox), which stays silent contract-free and is held behind
+# `require_no_descriptor_writer`. That path's proxy writer state is only set by its synthetic
+# wrapper; deriving directly from the real lock requires carrying the descriptor RwLock's instance
+# identity across nested callbacks. It has no local reproduction here.
 cargo test -p mirai --test integration_tests run_pass -- --exact
 cargo build -p mirai --bin mirai
 
@@ -50,11 +56,11 @@ if ! grep -q 'warning: \[MIRAI\] unsatisfied precondition' <<<"$positive_output"
     exit 1
 fi
 
-known_limit_fixture="checker/tests/run-pass/arc_load_thin_pointer_known_limitation.rs"
-known_limit_output="$(
+carrier_fixture="checker/tests/run-pass/arc_load_thin_pointer_known_limitation.rs"
+carrier_output="$(
     target/debug/mirai \
         --crate-name mirai \
-        "$known_limit_fixture" \
+        "$carrier_fixture" \
         --crate-type lib \
         --edition=2021 \
         -C debuginfo=2 \
@@ -64,11 +70,11 @@ known_limit_output="$(
         --extern "mirai_annotations=$annotations" \
         2>&1
 )"
-printf '%s\n' "$known_limit_output"
+printf '%s\n' "$carrier_output"
 
-if grep -q 'warning: \[MIRAI\] unsatisfied precondition' <<<"$known_limit_output"; then
-    echo "The callback capture-reconstruction known limitation unexpectedly fired." >&2
+if ! grep -q 'warning: \[MIRAI\] unsatisfied precondition' <<<"$carrier_output"; then
+    echo "The Arc-loaded callback carrier positive control did not fire." >&2
     exit 1
 fi
 
-echo "MIRAI test suite passed; positive control fired and Arc-load capture-state-loss XFAIL stayed silent."
+echo "MIRAI test suite passed; both synthetic double-lock positive controls fired (direct-argument and Arc-loaded callback carrier). The production setsockopt path remains a documented XFAIL held behind require_no_descriptor_writer."

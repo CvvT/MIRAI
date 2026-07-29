@@ -624,6 +624,42 @@ pub fn summarize(
     }
 }
 
+/// Constructs the sound subset of a summary after analysis stopped at an unresolved operation.
+/// Preconditions and callback invocations recorded before the failure remain valid requirements,
+/// but partial side effects and postconditions are not safe to expose to callers.
+#[logfn(TRACE)]
+pub fn summarize_incomplete(
+    preconditions: &[Precondition],
+    callback_invocations: &[CallbackInvocation],
+    tcx: TyCtxt<'_>,
+) -> Summary {
+    trace!(
+        "summarize_incomplete input preconditions {:?} callback_invocations {:?}",
+        preconditions,
+        callback_invocations
+    );
+    let mut preconditions = add_provenance(
+        &preconditions
+            .iter()
+            .filter(|precondition| {
+                !precondition
+                    .message
+                    .starts_with("incomplete analysis of call")
+            })
+            .cloned()
+            .collect::<Vec<_>>(),
+        tcx,
+    );
+    preconditions.sort();
+    Summary {
+        is_computed: true,
+        is_incomplete: true,
+        preconditions,
+        callback_invocations: callback_invocations.to_vec(),
+        ..Summary::default()
+    }
+}
+
 /// When a precondition is being serialized into a summary, it needs a provenance that is not
 /// specific to the current (crate) compilation, since the summary may be used to compile a different
 /// crate, or a different version of the current crate.
