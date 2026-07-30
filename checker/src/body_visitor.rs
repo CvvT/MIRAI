@@ -91,12 +91,12 @@ mod existential_precondition_tests {
         collect_replay_input_roots, evaluate_replay_violation, ExistentialPreconditionResult,
         ReplayEvaluation,
     };
-    use crate::abstract_value::{AbstractValue, FALSE, TRUE};
+    use crate::abstract_value::{AbstractValue, AbstractValueTrait, FALSE, TRUE};
     use crate::constant_domain::ConstantDomain;
     #[cfg(feature = "z3")]
     use crate::coverage::CoverageRecord;
     use crate::expression::{Expression, ExpressionType};
-    use crate::path::Path;
+    use crate::path::{Path, PathSelector};
     use crate::smt_solver::{SmtResult, SmtSolver, SolverStub};
     #[cfg(feature = "z3")]
     use crate::z3_solver::Z3Solver;
@@ -236,6 +236,164 @@ mod existential_precondition_tests {
             assert_eq!(value["replay_validation"]["status"], "undecided");
             assert_ne!(value["tier"], "abstract_model");
         }
+    }
+
+    #[cfg(feature = "z3")]
+    fn retained_setsockopt_precondition() -> (Rc<AbstractValue>, Rc<AbstractValue>) {
+        let so = AbstractValue::make_typed_unknown(ExpressionType::U32, Path::new_local(1, 0));
+        let value = AbstractValue::make_typed_unknown(ExpressionType::U32, Path::new_local(2, 0));
+        let write_held =
+            AbstractValue::make_typed_unknown(ExpressionType::U32, Path::new_local(3, 0));
+        let so_is_keepalive = so.equals(Rc::new(ConstantDomain::U128(9).into()));
+        let value_is_u32 = value.equals(Rc::new(ConstantDomain::U128(1).into()));
+        let lock_released = write_held.equals(Rc::new(ConstantDomain::U128(0).into()));
+        (
+            so_is_keepalive
+                .and(value_is_u32)
+                .logical_not()
+                .or(lock_released),
+            write_held,
+        )
+    }
+
+    #[cfg(feature = "z3")]
+    #[test]
+    fn buggy_setsockopt_guard_yields_undecided_abstract_counterexample() {
+        let (precondition, write_held) = retained_setsockopt_precondition();
+        let entry_condition = write_held.equals(Rc::new(ConstantDomain::U128(1).into()));
+        let result = check_existential_precondition_with_solver(
+            Z3Solver::new(),
+            &entry_condition.expression,
+            &precondition.expression,
+        );
+        let ExistentialPreconditionResult::Satisfiable {
+            witness,
+            replay_inputs,
+            ..
+        } = result
+        else {
+            panic!("buggy setsockopt guard must be satisfiable: {result:?}");
+        };
+        assert!(replay_inputs.is_none());
+        let record = CoverageRecord::abstract_counterexample(
+            "src/lib.rs:1:1".to_owned(),
+            "DefId(0:1)".to_owned(),
+            "setsockopt".to_owned(),
+            witness,
+        );
+        let value = serde_json::to_value(record).unwrap();
+        assert_eq!(value["tier"], "abstract_counterexample");
+        assert_eq!(value["replay_validation"]["status"], "undecided");
+    }
+
+    #[cfg(feature = "z3")]
+    #[test]
+    fn fixed_setsockopt_guard_is_refuted_when_lock_released() {
+        let (precondition, write_held) = retained_setsockopt_precondition();
+        let entry_condition = write_held.equals(Rc::new(ConstantDomain::U128(0).into()));
+        assert!(matches!(
+            check_existential_precondition_with_solver(
+                Z3Solver::new(),
+                &entry_condition.expression,
+                &precondition.expression,
+            ),
+            ExistentialPreconditionResult::UnsatisfiableComplete
+        ));
+    }
+
+    fn unknown_model_field(
+        root: Rc<Path>,
+        name: &str,
+        default: Rc<AbstractValue>,
+    ) -> Rc<AbstractValue> {
+        AbstractValue::make_from(
+            Expression::UnknownModelField {
+                path: Path::new_qualified(root, Rc::new(PathSelector::ModelField(Rc::from(name)))),
+                default,
+            },
+            1,
+        )
+    }
+
+    #[cfg(feature = "z3")]
+    #[test]
+    fn primitive_unknown_model_field_is_solver_visible_and_correlated() {
+        let field =
+            unknown_model_field(Path::new_parameter(1), "write_held", Rc::new(0_u128.into()));
+        let is_zero = field.equals(Rc::new(0_u128.into()));
+        assert!(matches!(
+            check_existential_precondition_with_solver(
+                Z3Solver::new(),
+                &is_zero.expression,
+                &is_zero.expression,
+            ),
+            ExistentialPreconditionResult::UnsatisfiableComplete
+        ));
+    }
+
+    #[cfg(feature = "z3")]
+    #[test]
+    fn distinct_unknown_model_fields_remain_independent() {
+        let left =
+            unknown_model_field(Path::new_parameter(1), "write_held", Rc::new(0_u128.into()));
+        let right =
+            unknown_model_field(Path::new_parameter(1), "read_count", Rc::new(0_u128.into()));
+        let equal = left.equals(right);
+        assert!(matches!(
+            check_existential_precondition_with_solver(
+                Z3Solver::new(),
+                &TRUE.expression,
+                &equal.expression,
+            ),
+            ExistentialPreconditionResult::Satisfiable { .. }
+        ));
+    }
+
+    #[test]
+    fn invalid_or_nonprimitive_unknown_model_fields_fail_closed() {
+        let invalid_path = AbstractValue::make_from(
+            Expression::UnknownModelField {
+                path: Path::new_parameter(1),
+                default: Rc::new(0_u128.into()),
+            },
+            1,
+        );
+        let nonprimitive = unknown_model_field(
+            Path::new_parameter(1),
+            "state",
+            AbstractValue::make_typed_unknown(ExpressionType::NonPrimitive, Path::new_parameter(2)),
+        );
+        for expression in [invalid_path, nonprimitive] {
+            assert!(matches!(
+                check_existential_precondition_with_solver(
+                    SolverStub::default(),
+                    &TRUE.expression,
+                    &expression.expression,
+                ),
+                ExistentialPreconditionResult::EncodingIncomplete
+            ));
+        }
+    }
+
+    #[test]
+    fn conflicting_path_types_fail_closed() {
+        let path = Path::new_model_field(Path::new_parameter(1), Rc::from("write_held"));
+        let entry = AbstractValue::make_typed_unknown(ExpressionType::U32, path.clone());
+        let precondition = AbstractValue::make_from(
+            Expression::UnknownModelField {
+                path,
+                default: Rc::new(ConstantDomain::U128(0).into()),
+            },
+            1,
+        );
+        assert!(matches!(
+            check_existential_precondition_with_solver(
+                SolverStub::default(),
+                &entry.expression,
+                &precondition.expression,
+            ),
+            ExistentialPreconditionResult::EncodingIncomplete
+        ));
     }
 
     #[test]
@@ -606,6 +764,17 @@ fn existential_encoding_is_complete(expression: &Expression) -> bool {
                 || *var_type == ExpressionType::Char
                 || var_type.is_integer()
         }
+        Expression::UnknownModelField { path, default } => {
+            let var_type = default.expression.infer_type();
+            (var_type == ExpressionType::Bool
+                || var_type == ExpressionType::Char
+                || var_type.is_integer())
+                && matches!(
+                    &path.value,
+                    PathEnum::QualifiedPath { selector, .. }
+                        if matches!(selector.as_ref(), PathSelector::ModelField(_))
+                )
+        }
         Expression::And { left, right }
         | Expression::Equals { left, right }
         | Expression::GreaterOrEqual { left, right }
@@ -623,6 +792,52 @@ fn existential_encoding_is_complete(expression: &Expression) -> bool {
         }
         Expression::LogicalNot { operand } => existential_encoding_is_complete(&operand.expression),
         _ => false,
+    }
+}
+
+fn model_field_types_are_consistent(
+    expression: &Expression,
+    path_types: &mut HashMap<Rc<Path>, ExpressionType>,
+) -> bool {
+    fn record(
+        path_types: &mut HashMap<Rc<Path>, ExpressionType>,
+        path: &Rc<Path>,
+        var_type: ExpressionType,
+    ) -> bool {
+        path_types
+            .entry(path.clone())
+            .and_modify(|existing| {
+                if *existing != var_type {
+                    *existing = ExpressionType::NonPrimitive;
+                }
+            })
+            .or_insert(var_type);
+        path_types[path] != ExpressionType::NonPrimitive
+    }
+    match expression {
+        Expression::InitialParameterValue { path, var_type }
+        | Expression::Variable { path, var_type } => record(path_types, path, *var_type),
+        Expression::UnknownModelField { path, default } => {
+            record(path_types, path, default.expression.infer_type())
+        }
+        Expression::And { left, right }
+        | Expression::BitAnd { left, right }
+        | Expression::BitOr { left, right }
+        | Expression::BitXor { left, right }
+        | Expression::Equals { left, right }
+        | Expression::GreaterOrEqual { left, right }
+        | Expression::GreaterThan { left, right }
+        | Expression::LessOrEqual { left, right }
+        | Expression::LessThan { left, right }
+        | Expression::Ne { left, right }
+        | Expression::Or { left, right } => {
+            model_field_types_are_consistent(&left.expression, path_types)
+                && model_field_types_are_consistent(&right.expression, path_types)
+        }
+        Expression::LogicalNot { operand } => {
+            model_field_types_are_consistent(&operand.expression, path_types)
+        }
+        _ => true,
     }
 }
 
@@ -684,6 +899,12 @@ fn check_existential_precondition_with_solver<SmtExpressionType>(
 ) -> ExistentialPreconditionResult {
     if !existential_encoding_is_complete(entry_condition)
         || !existential_encoding_is_complete(precondition)
+    {
+        return ExistentialPreconditionResult::EncodingIncomplete;
+    }
+    let mut path_types = HashMap::new();
+    if !model_field_types_are_consistent(entry_condition, &mut path_types)
+        || !model_field_types_are_consistent(precondition, &mut path_types)
     {
         return ExistentialPreconditionResult::EncodingIncomplete;
     }
@@ -939,8 +1160,11 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
 
                 if analysis_was_incomplete || self.analysis_is_incomplete {
                     result = summaries::summarize_incomplete(
+                        self.mir.arg_count,
+                        &self.current_environment,
                         &self.preconditions,
                         &self.callback_invocations,
+                        self.exit_environment.as_ref(),
                         self.tcx,
                     );
                 } else {
@@ -2448,7 +2672,47 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
         root_rustc_type: Ty<'tcx>,
         move_elements: bool,
     ) {
+        self.copy_or_move_elements_internal(
+            target_path,
+            source_path,
+            root_rustc_type,
+            move_elements,
+            true,
+        );
+    }
+
+    pub fn copy_or_move_elements_without_aliases(
+        &mut self,
+        target_path: Rc<Path>,
+        source_path: Rc<Path>,
+        root_rustc_type: Ty<'tcx>,
+        move_elements: bool,
+    ) {
+        self.copy_or_move_elements_internal(
+            target_path,
+            source_path,
+            root_rustc_type,
+            move_elements,
+            false,
+        );
+    }
+
+    fn copy_or_move_elements_internal(
+        &mut self,
+        target_path: Rc<Path>,
+        source_path: Rc<Path>,
+        root_rustc_type: Ty<'tcx>,
+        move_elements: bool,
+        copy_aliases: bool,
+    ) {
         check_for_early_return!(self);
+        if copy_aliases {
+            self.current_environment.copy_aliases_rooted_by(
+                &target_path,
+                &source_path,
+                move_elements,
+            );
+        }
         // Some qualified source_paths are patterns that select one or more values from
         // a collection of values obtained from the qualifier. We need to copy/move those
         // individually, hence we use a helper to call copy_or_move_elements recursively on
@@ -2458,7 +2722,13 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
             &source_path,
             root_rustc_type,
             |_self, target_path, expanded_path, ty| {
-                _self.copy_or_move_elements(target_path, expanded_path, ty, move_elements)
+                _self.copy_or_move_elements_internal(
+                    target_path,
+                    expanded_path,
+                    ty,
+                    move_elements,
+                    copy_aliases,
+                )
             },
         );
         if expanded_source_pattern {
@@ -2512,11 +2782,12 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
             &source_path,
             root_rustc_type,
             |_self, target_path, source_path, root_rustc_type| {
-                _self.copy_or_move_elements(
+                _self.copy_or_move_elements_internal(
                     target_path,
                     source_path,
                     root_rustc_type,
                     move_elements,
+                    copy_aliases,
                 );
             },
         );

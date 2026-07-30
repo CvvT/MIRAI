@@ -898,6 +898,7 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
         }
 
         let mut arguments_complete = true;
+        let mut argument_projection_state = Vec::new();
         let boundary_args = actual_args
             .iter()
             .enumerate()
@@ -910,6 +911,34 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                 {
                     return (path.clone(), value.clone());
                 }
+                if !value.expression.contains_local_variable(false) {
+                    let boundary_path = Path::get_as_path(value.clone())
+                        .remove_initial_value_wrapper()
+                        .canonicalize(&self.bv.current_environment);
+                    if !boundary_path.contains_local_variable(false) {
+                        return (boundary_path, value.clone());
+                    }
+                }
+                if path.contains_local_variable(false) {
+                    let projection_root = Self::callback_argument_projection_root(index);
+                    argument_projection_state.extend(
+                        self.bv
+                            .current_environment
+                            .value_map
+                            .iter()
+                            .filter(|(candidate, projection_value)| {
+                                *candidate != path
+                                    && candidate.is_rooted_by(path)
+                                    && !projection_value.expression.contains_local_variable(false)
+                            })
+                            .map(|(candidate, projection_value)| {
+                                (
+                                    candidate.replace_root(path, projection_root.clone()),
+                                    projection_value.clone(),
+                                )
+                            }),
+                    );
+                }
                 arguments_complete = false;
                 (Path::new_computed(Rc::new(BOTTOM)), Rc::new(BOTTOM))
             })
@@ -920,6 +949,12 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
             arguments_complete,
             carrier_id,
         );
+        self.bv
+            .callback_invocations
+            .last_mut()
+            .expect("push_callback_invocation must append an invocation")
+            .pre_state
+            .extend(argument_projection_state);
         let capture_model_rekeys = capture_aliases
             .iter()
             .filter_map(|(boundary_path, source_value)| {
@@ -936,49 +971,76 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                 Some((source_path, boundary_value))
             })
             .collect::<Vec<_>>();
+        let captured_model_state = self
+            .bv
+            .current_environment
+            .value_map
+            .iter()
+            .filter(|(path, _)| {
+                path.contains_local_variable(false)
+                    && matches!(
+                        path.value,
+                        PathEnum::QualifiedPath { ref selector, .. }
+                            if matches!(**selector, PathSelector::ModelField(_))
+                    )
+            })
+            .filter_map(|(source_path, source_value)| {
+                let (path, value) = enclosing_capture_rekeys
+                    .iter()
+                    .chain(&capture_model_rekeys)
+                    .fold(
+                        (source_path.clone(), source_value.clone()),
+                        |(path, value), (local_path, replacement)| {
+                            let replacement = Path::get_as_path(replacement.clone())
+                                .canonicalize(&self.bv.current_environment);
+                            (
+                                path.replace_root(local_path, replacement.clone()),
+                                value.replace_embedded_path_root(local_path, replacement),
+                            )
+                        },
+                    );
+                (!path.contains_local_variable(false)
+                    && !value.expression.contains_local_variable(false))
+                .then_some((source_path.clone(), path, value))
+            })
+            .collect::<Vec<_>>();
         let invocation = self
             .bv
             .callback_invocations
             .last_mut()
             .expect("push_callback_invocation must append an invocation");
         invocation.pre_state.extend(
-            self.bv
-                .current_environment
-                .value_map
+            captured_model_state
                 .iter()
-                .filter(|(path, _)| {
-                    path.contains_local_variable(false)
-                        && matches!(
-                            path.value,
-                            PathEnum::QualifiedPath { ref selector, .. }
-                                if matches!(**selector, PathSelector::ModelField(_))
-                        )
-                })
-                .filter_map(|(path, value)| {
-                    let (path, value) = enclosing_capture_rekeys
-                        .iter()
-                        .chain(&capture_model_rekeys)
-                        .fold(
-                            (path.clone(), value.clone()),
-                            |(path, value), (local_path, replacement)| {
-                                let replacement = Path::get_as_path(replacement.clone())
-                                    .canonicalize(&self.bv.current_environment);
-                                (
-                                    path.replace_root(local_path, replacement.clone()),
-                                    value.replace_embedded_path_root(local_path, replacement),
-                                )
-                            },
-                        );
-                    (!path.contains_local_variable(false)
-                        && !value.expression.contains_local_variable(false))
-                    .then_some((path, value))
-                }),
+                .map(|(_, path, value)| (path.clone(), value.clone())),
         );
+        invocation.state_rekeys = enclosing_capture_rekeys
+            .iter()
+            .chain(&capture_model_rekeys)
+            .cloned()
+            .chain(
+                captured_model_state
+                    .iter()
+                    .map(|(source_path, path, value)| {
+                        (
+                            source_path.clone(),
+                            AbstractValue::make_typed_unknown(
+                                value.expression.infer_type(),
+                                path.clone(),
+                            ),
+                        )
+                    }),
+            )
+            .collect();
         invocation.pre_state.extend(capture_aliases);
         invocation.specialized_callee = specialized_callee;
         invocation.function_constants = function_constants.to_vec();
         invocation.is_local = is_local;
         true
+    }
+
+    pub(crate) fn callback_argument_projection_root(index: usize) -> Rc<Path> {
+        Path::new_field(Rc::new(PathEnum::PhantomData.into()), index)
     }
 
     fn find_local_callback_parameter(
@@ -1399,6 +1461,7 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                 .filter(|guard| !guard.expression.contains_local_variable(false))
                 .unwrap_or_else(|| Rc::new(abstract_value::TRUE)),
             carrier_id,
+            state_rekeys: Vec::new(),
         });
         true
     }
@@ -3346,7 +3409,7 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                 Rc::new(PathEnum::PromotedConstant { ordinal: index }.into())
             }
             None => {
-                if !args.is_empty() {
+                if !args.is_empty() && !utils::contains_unresolvable_projection(args) {
                     let typing_env = rustc_middle::ty::TypingEnv::fully_monomorphized();
                     trace!("devirtualize resolving def_id {:?}: {:?}", def_id, def_ty);
                     trace!("args {:?}", args);

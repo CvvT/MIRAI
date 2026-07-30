@@ -170,6 +170,74 @@ impl Environment {
         }
     }
 
+    /// Carries must-alias relationships along when an aggregate is copied or moved.
+    #[logfn_inputs(TRACE)]
+    pub fn copy_aliases_rooted_by(
+        &mut self,
+        target: &Rc<Path>,
+        source: &Rc<Path>,
+        move_elements: bool,
+    ) {
+        if target == source {
+            return;
+        }
+        let assumed_aliases: Vec<_> = self
+            .assumed_aliases
+            .iter()
+            .filter_map(|(alias, alias_source)| {
+                let copied_alias = (alias == source || alias.is_rooted_by(source))
+                    .then(|| alias.replace_root(source, target.clone()))
+                    .unwrap_or_else(|| alias.clone());
+                let copied_source = (alias_source == source || alias_source.is_rooted_by(source))
+                    .then(|| alias_source.replace_root(source, target.clone()))
+                    .unwrap_or_else(|| alias_source.clone());
+                (copied_alias != copied_source
+                    && (copied_alias != *alias || copied_source != *alias_source))
+                    .then_some((copied_alias, copied_source))
+            })
+            .collect();
+        self.assumed_aliases.extend(assumed_aliases);
+        if move_elements {
+            self.assumed_aliases.retain(|(alias, alias_source)| {
+                !(alias == source
+                    || alias.is_rooted_by(source)
+                    || alias_source == source
+                    || alias_source.is_rooted_by(source))
+            });
+        }
+
+        let guarded_aliases: Vec<_> = self
+            .guarded_aliases
+            .iter()
+            .filter_map(|((alias, alias_source), condition)| {
+                let copied_alias = (alias == source || alias.is_rooted_by(source))
+                    .then(|| alias.replace_root(source, target.clone()))
+                    .unwrap_or_else(|| alias.clone());
+                let copied_source = (alias_source == source || alias_source.is_rooted_by(source))
+                    .then(|| alias_source.replace_root(source, target.clone()))
+                    .unwrap_or_else(|| alias_source.clone());
+                if copied_alias == copied_source
+                    || (copied_alias == *alias && copied_source == *alias_source)
+                {
+                    return None;
+                }
+                let copied_condition = condition.replace_embedded_path_root(source, target.clone());
+                Some(((copied_alias, copied_source), copied_condition))
+            })
+            .collect();
+        for ((alias, alias_source), condition) in guarded_aliases {
+            self.assume_alias_if(alias, alias_source, condition);
+        }
+        if move_elements {
+            self.guarded_aliases.retain(|(alias, alias_source), _| {
+                !(alias == source
+                    || alias.is_rooted_by(source)
+                    || alias_source == source
+                    || alias_source.is_rooted_by(source))
+            });
+        }
+    }
+
     /// Rewrites aliases in the qualifier of a model-field path to their canonical sources.
     pub fn canonicalize_model_field_path(&self, path: Rc<Path>) -> Rc<Path> {
         let PathEnum::QualifiedPath { selector, .. } = &path.value else {
@@ -217,6 +285,7 @@ impl Environment {
     }
 
     /// Looks up a model field through unconditional and guarded alias prefixes.
+    #[logfn_inputs(TRACE)]
     pub fn value_at_aliased_model_field(
         &self,
         path: &Rc<Path>,
@@ -997,7 +1066,7 @@ mod tests {
     use super::Environment;
     use crate::abstract_value::{AbstractValue, AbstractValueTrait};
     use crate::expression::ExpressionType;
-    use crate::path::{Path, PathSelector};
+    use crate::path::{Path, PathRoot, PathSelector};
     use std::rc::Rc;
 
     fn computed_model_field(index_ordinal: usize) -> (Rc<Path>, Rc<AbstractValue>) {
@@ -1011,6 +1080,39 @@ mod tests {
             Path::new_model_field(element, Rc::from("read_count")),
             index,
         )
+    }
+
+    #[test]
+    fn aggregate_copy_rekeys_alias_endpoints() {
+        let clone = Path::new_local(2, 0);
+        let seed = Path::new_parameter(1);
+        let moved_seed = Path::new_result();
+        let mut environment = Environment::default();
+        environment.assume_alias(clone.clone(), seed.clone());
+
+        environment.copy_aliases_rooted_by(&moved_seed, &seed, false);
+
+        assert!(environment.assumed_aliases.contains(&(clone, moved_seed)));
+    }
+
+    #[test]
+    fn aggregate_move_removes_aliases_rooted_in_the_moved_from_place() {
+        let moved_from = Path::new_local(2, 0);
+        let external = Path::new_parameter(1);
+        let destination = Path::new_result();
+        let mut environment = Environment::default();
+        environment.assume_alias(moved_from.clone(), external.clone());
+
+        environment.copy_aliases_rooted_by(&destination, &moved_from, true);
+
+        assert!(environment
+            .assumed_aliases
+            .contains(&(destination, external)));
+        assert!(!environment
+            .assumed_aliases
+            .iter()
+            .any(|(alias, source)| alias.is_rooted_by(&moved_from)
+                || source.is_rooted_by(&moved_from)));
     }
 
     #[test]

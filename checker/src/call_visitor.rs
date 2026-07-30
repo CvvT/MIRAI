@@ -3667,7 +3667,7 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             }
             let mut refined_model_state = Vec::new();
             for (path, value) in &invocation.pre_state {
-                let refined_path = path.refine_parameters_and_paths(
+                let mut refined_path = path.refine_parameters_and_paths(
                     &self.actual_args,
                     &no_result,
                     &self.environment_before_call,
@@ -3681,6 +3681,16 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                     &outer_environment,
                     self.block_visitor.bv.fresh_variable_offset,
                 );
+                for (index, (argument_path, _)) in callback_arguments.iter().enumerate() {
+                    let projection_root = BlockVisitor::callback_argument_projection_root(index);
+                    if refined_path == projection_root
+                        || refined_path.is_rooted_by(&projection_root)
+                    {
+                        refined_path =
+                            refined_path.replace_root(&projection_root, argument_path.clone());
+                        break;
+                    }
+                }
                 let refined_path = callback_environment.canonicalize_model_field_path(refined_path);
                 if matches!(
                     path.value,
@@ -3822,6 +3832,14 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 });
             let requires_local_lift =
                 parent_callback_anchor.is_some() || callback_path.contains_local_variable(false);
+            let function_upvar_anchor = invocation_has_arc_model_state
+                .then(|| {
+                    callback_type.and_then(|callback_type| {
+                        self.block_visitor
+                            .find_single_function_upvar_parameter(callback_type)
+                    })
+                })
+                .flatten();
             let mut lifted_callback = !requires_local_lift
                 && callback_type.is_some_and(|callback_type| {
                     self.block_visitor.record_transitive_callback_invocation(
@@ -3839,6 +3857,7 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 });
             if !lifted_callback
                 && (parent_callback_anchor.is_some()
+                    || function_upvar_anchor.is_some()
                     || derived_callee
                     || callback_path.contains_local_variable(false))
             {
@@ -3855,7 +3874,9 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                     invocation.is_local,
                     true,
                     &enclosing_capture_rekeys,
-                    parent_callback_anchor.clone(),
+                    parent_callback_anchor
+                        .clone()
+                        .or_else(|| function_upvar_anchor.clone()),
                     invocation.carrier_id,
                 );
             }
@@ -4184,6 +4205,8 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             .enumerate()
             .filter(|(_, (path, value))| matches_argument(path, value))
             .any(|(index, _)| {
+                let (path, value) =
+                    Self::mask_available_argument_projections(invocation, index, path, value);
                 let marker = Path::new_local(999_999, 0);
                 let identity_args = (0..invocation.arguments.len())
                     .map(|argument_index| {
@@ -4214,7 +4237,7 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                     .collect::<Vec<_>>();
                 let environment = Environment::default();
                 let result = Some(Path::new_result());
-                let path_uses_parameter = path.is_some_and(|path| {
+                let path_uses_parameter = path.as_ref().is_some_and(|path| {
                     path.refine_parameters_and_paths(
                         &identity_args,
                         &result,
@@ -4229,7 +4252,7 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                         0,
                     )
                 });
-                let value_uses_parameter = value.is_some_and(|value| {
+                let value_uses_parameter = value.as_ref().is_some_and(|value| {
                     value.refine_parameters_and_paths(
                         &identity_args,
                         &result,
@@ -4246,6 +4269,41 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 });
                 path_uses_parameter || value_uses_parameter
             })
+    }
+
+    fn mask_available_argument_projections(
+        invocation: &CallbackInvocation,
+        argument_index: usize,
+        path: Option<&Rc<Path>>,
+        value: Option<&Rc<AbstractValue>>,
+    ) -> (Option<Rc<Path>>, Option<Rc<AbstractValue>>) {
+        let projection_root = BlockVisitor::callback_argument_projection_root(argument_index);
+        let parameter_root = Path::new_parameter(argument_index + 1);
+        let marker = Path::new_local(999_997, argument_index);
+        invocation
+            .pre_state
+            .iter()
+            .filter(|(projection, _)| {
+                projection != &projection_root && projection.is_rooted_by(&projection_root)
+            })
+            .fold(
+                (path.cloned(), value.cloned()),
+                |(path, value), (projection, _)| {
+                    let available_path =
+                        projection.replace_root(&projection_root, parameter_root.clone());
+                    let path = path.map(|path| {
+                        if path == available_path || path.is_rooted_by(&available_path) {
+                            path.replace_root(&available_path, marker.clone())
+                        } else {
+                            path
+                        }
+                    });
+                    let value = value.map(|value| {
+                        value.replace_embedded_path_root(&available_path, marker.clone())
+                    });
+                    (path, value)
+                },
+            )
     }
 
     fn report_unresolvable_callback(&mut self) {

@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use itertools::Itertools;
+use log::trace;
 use log_derive::{logfn, logfn_inputs};
 use serde::{Deserialize, Serialize};
 use sled::{Config, Db};
@@ -27,7 +28,7 @@ use crate::abstract_value::{self, AbstractValue};
 use crate::constant_domain::FunctionReference;
 use crate::environment::Environment;
 use crate::expression::Expression;
-use crate::path::{Path, PathEnum, PathRoot, PathSelector};
+use crate::path::{Path, PathEnum, PathRefinement, PathRoot, PathSelector};
 use crate::utils;
 
 /// A summary is a declarative abstract specification of what a function does.
@@ -115,6 +116,12 @@ pub struct Summary {
     /// Calls to function-typed parameters, together with their boundary-visible state.
     #[serde(default)]
     pub callback_invocations: Vec<CallbackInvocation>,
+
+    /// Model-field values established on normal return after callbacks. These are kept separate
+    /// from ordinary side effects so they can survive incomplete callback replay without exposing
+    /// arbitrary partial state.
+    #[serde(default)]
+    pub incomplete_model_state: Vec<(Rc<Path>, Rc<AbstractValue>)>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
@@ -127,7 +134,8 @@ pub struct CallbackInvocation {
     /// False if any callback argument could not be expressed in the summary's path namespace.
     #[serde(default = "complete_callback_arguments")]
     pub arguments_complete: bool,
-    /// Boundary-refinable field values visible at the callback invocation point.
+    /// Boundary-refinable field values visible at the callback invocation point. Projections of an
+    /// otherwise unavailable callback argument use a synthetic argument root.
     pub pre_state: Vec<(Rc<Path>, Rc<AbstractValue>)>,
     /// Boundary-visible alias relationships established before the callback invocation.
     #[serde(default)]
@@ -147,10 +155,43 @@ pub struct CallbackInvocation {
     pub is_local: bool,
     /// Stable identity of the callback chain that produced this invocation.
     pub carrier_id: Option<u64>,
+    /// Analysis-local path rekeys used to express state established after the callback in the
+    /// summary namespace. The resulting state is serialized on the enclosing Summary instead.
+    #[serde(skip)]
+    pub state_rekeys: Vec<(Rc<Path>, Rc<AbstractValue>)>,
 }
 
 fn complete_callback_arguments() -> bool {
     true
+}
+
+#[derive(Serialize, Deserialize)]
+struct PreIncompleteModelStateSummary {
+    is_computed: bool,
+    is_incomplete: bool,
+    preconditions: Vec<Precondition>,
+    assumed_aliases: Vec<(Rc<Path>, Rc<Path>)>,
+    guarded_aliases: Vec<(Rc<Path>, Rc<Path>, Rc<AbstractValue>)>,
+    side_effects: Vec<(Rc<Path>, Rc<AbstractValue>)>,
+    post_condition: Option<Rc<AbstractValue>>,
+    callback_invocations: Vec<CallbackInvocation>,
+}
+
+impl From<PreIncompleteModelStateSummary> for Summary {
+    fn from(summary: PreIncompleteModelStateSummary) -> Self {
+        Summary {
+            is_computed: summary.is_computed,
+            is_incomplete: summary.is_incomplete,
+            preconditions: summary.preconditions,
+            assumed_aliases: summary.assumed_aliases,
+            guarded_aliases: summary.guarded_aliases,
+            side_effects: summary.side_effects,
+            post_condition: summary.post_condition,
+            return_type_index: 0,
+            callback_invocations: summary.callback_invocations,
+            incomplete_model_state: Vec::new(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -205,8 +246,10 @@ impl From<PreLineageSummary> for Summary {
                     function_constants: invocation.function_constants,
                     is_local: invocation.is_local,
                     carrier_id: None,
+                    state_rekeys: Vec::new(),
                 })
                 .collect(),
+            incomplete_model_state: Vec::new(),
         }
     }
 }
@@ -261,8 +304,10 @@ impl From<PreAliasSummary> for Summary {
                     guard: invocation.guard,
                     is_local: invocation.is_local,
                     carrier_id: None,
+                    state_rekeys: Vec::new(),
                 })
                 .collect(),
+            incomplete_model_state: Vec::new(),
         }
     }
 }
@@ -320,8 +365,10 @@ impl From<PreviousSummary> for Summary {
                     guard: invocation.guard,
                     is_local: false,
                     carrier_id: None,
+                    state_rekeys: Vec::new(),
                 })
                 .collect(),
+            incomplete_model_state: Vec::new(),
         }
     }
 }
@@ -364,8 +411,10 @@ impl From<OlderSummary> for Summary {
                     guard: Rc::new(abstract_value::TRUE),
                     is_local: false,
                     carrier_id: None,
+                    state_rekeys: Vec::new(),
                 })
                 .collect(),
+            incomplete_model_state: Vec::new(),
         }
     }
 }
@@ -393,12 +442,14 @@ impl From<LegacySummary> for Summary {
             post_condition: summary.post_condition,
             return_type_index: 0,
             callback_invocations: Vec::new(),
+            incomplete_model_state: Vec::new(),
         }
     }
 }
 
 fn deserialize_summary(bytes: &[u8]) -> bincode::Result<Summary> {
     bincode::deserialize(bytes)
+        .or_else(|_| bincode::deserialize::<PreIncompleteModelStateSummary>(bytes).map(Into::into))
         .or_else(|_| bincode::deserialize::<PreLineageSummary>(bytes).map(Into::into))
         .or_else(|_| bincode::deserialize::<PreAliasSummary>(bytes).map(Into::into))
         .or_else(|_| bincode::deserialize::<PreviousSummary>(bytes).map(Into::into))
@@ -605,6 +656,9 @@ pub fn summarize(
     } else {
         vec![]
     };
+    let incomplete_model_state = exit_environment
+        .map(|environment| extract_incomplete_model_state(&[environment], callback_invocations))
+        .unwrap_or_default();
 
     preconditions.sort();
     assumed_aliases.sort();
@@ -621,16 +675,92 @@ pub fn summarize(
         post_condition: post_condition.clone(),
         return_type_index,
         callback_invocations: callback_invocations.to_vec(),
+        incomplete_model_state,
     }
 }
 
+fn extract_incomplete_model_state(
+    environments: &[&Environment],
+    callback_invocations: &[CallbackInvocation],
+) -> Vec<(Rc<Path>, Rc<AbstractValue>)> {
+    let mut incomplete_model_state = environments
+        .iter()
+        .flat_map(|environment| {
+            environment
+                .value_map
+                .iter()
+                .filter(|(path, _)| {
+                    matches!(
+                        path.value,
+                        PathEnum::QualifiedPath { ref selector, .. }
+                            if matches!(**selector, PathSelector::ModelField(_))
+                    )
+                })
+                .map(move |(path, value)| (*environment, path.clone(), value.clone()))
+        })
+        .filter_map(|(environment, path, value)| {
+            let state_rekeys = callback_invocations
+                .iter()
+                .flat_map(|invocation| &invocation.state_rekeys)
+                .collect::<Vec<_>>();
+            let path = if let Some((_, replacement)) = state_rekeys
+                .iter()
+                .find(|(local_path, _)| **local_path == *path)
+            {
+                Path::get_as_path((*replacement).clone())
+            } else {
+                state_rekeys
+                    .into_iter()
+                    .filter(|(local_path, _)| {
+                        !matches!(
+                            local_path.value,
+                            PathEnum::QualifiedPath { ref selector, .. }
+                                if matches!(**selector, PathSelector::ModelField(_))
+                        )
+                    })
+                    .fold(path, |path, (local_path, replacement)| {
+                        let replacement =
+                            Path::get_as_path(replacement.clone()).canonicalize(environment);
+                        path.replace_root(local_path, replacement)
+                    })
+            };
+            let path = environment.canonicalize_model_field_path(path);
+            let is_callback_state_path = callback_invocations.iter().any(|invocation| {
+                invocation
+                    .pre_state
+                    .iter()
+                    .any(|(pre_state_path, _)| *pre_state_path == path)
+            });
+            ((path.is_rooted_by_parameter() || is_callback_state_path)
+                && !path.contains_local_variable(false)
+                && !value.expression.contains_local_variable(false)
+                && matches!(
+                    path.value,
+                    PathEnum::QualifiedPath { ref selector, .. }
+                        if matches!(**selector, PathSelector::ModelField(_))
+                )
+                && matches!(
+                    &value.expression,
+                    Expression::CompileTimeConstant(constant) if constant.is_zero()
+                ))
+            .then_some((path, value))
+        })
+        .collect::<Vec<_>>();
+    incomplete_model_state.sort();
+    incomplete_model_state.dedup();
+    incomplete_model_state
+}
+
 /// Constructs the sound subset of a summary after analysis stopped at an unresolved operation.
-/// Preconditions and callback invocations recorded before the failure remain valid requirements,
-/// but partial side effects and postconditions are not safe to expose to callers.
+/// Preconditions and callback invocations recorded before the failure remain valid requirements.
+/// Partial side effects, model state, and postconditions are not safe to expose to callers.
 #[logfn(TRACE)]
 pub fn summarize_incomplete(
+    _argument_count: usize,
+    _current_environment: &Environment,
     preconditions: &[Precondition],
     callback_invocations: &[CallbackInvocation],
+    _exit_environment: Option<&Environment>,
     tcx: TyCtxt<'_>,
 ) -> Summary {
     trace!(
@@ -656,6 +786,7 @@ pub fn summarize_incomplete(
         is_incomplete: true,
         preconditions,
         callback_invocations: callback_invocations.to_vec(),
+        incomplete_model_state: Vec::new(),
         ..Summary::default()
     }
 }
@@ -1220,11 +1351,14 @@ pub struct SummariesForLLM {
 #[cfg(test)]
 mod tests {
     use super::{
-        deserialize_summary, PreAliasCallbackInvocation, PreAliasSummary,
+        deserialize_summary, extract_incomplete_model_state, CallbackInvocation,
+        PreAliasCallbackInvocation, PreAliasSummary, PreIncompleteModelStateSummary,
         PreLineageCallbackInvocation, PreLineageSummary, Summary, SummaryCache,
     };
-    use crate::abstract_value;
+    use crate::abstract_value::{self, AbstractValue};
     use crate::constant_domain::FunctionReference;
+    use crate::environment::Environment;
+    use crate::expression::ExpressionType;
     use crate::known_names::KnownNames;
     use crate::path::Path;
     use rustc_hir::def_id::{DefId, DefIndex};
@@ -1235,6 +1369,69 @@ mod tests {
     use tempfile::TempDir;
 
     static SUMMARY_STORE_ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn incomplete_callback_cleanup_rekeys_only_captured_model_state() {
+        let captured_path = Path::new_model_field(Path::new_local(1, 0), Rc::from("write_held"));
+        let unrelated_path = Path::new_model_field(Path::new_local(2, 0), Rc::from("write_held"));
+        let boundary_path = Path::new_model_field(Path::new_parameter(1), Rc::from("write_held"));
+        let mut environment = Environment::default();
+        environment.strong_update_value_at(captured_path.clone(), Rc::new(0_u128.into()));
+        environment.strong_update_value_at(unrelated_path, Rc::new(0_u128.into()));
+        let invocation = CallbackInvocation {
+            callee: Path::new_local(3, 0),
+            arguments: Vec::new(),
+            arguments_complete: false,
+            pre_state: vec![(boundary_path.clone(), Rc::new(1_u128.into()))],
+            pre_aliases: Vec::new(),
+            pre_guarded_aliases: Vec::new(),
+            guard: Rc::new(abstract_value::TRUE),
+            specialized_callee: None,
+            function_constants: Vec::new(),
+            is_local: false,
+            carrier_id: None,
+            state_rekeys: vec![(
+                captured_path,
+                AbstractValue::make_typed_unknown(ExpressionType::U128, boundary_path.clone()),
+            )],
+        };
+
+        let expected_state = vec![(boundary_path, Rc::new(0_u128.into()))];
+        assert_eq!(
+            extract_incomplete_model_state(&[&environment], &[invocation.clone()]),
+            expected_state
+        );
+
+        let summary = Summary {
+            is_computed: true,
+            callback_invocations: vec![invocation],
+            incomplete_model_state: expected_state.clone(),
+            ..Summary::default()
+        };
+        let bytes = bincode::serialize(&summary).unwrap();
+        let deserialized = deserialize_summary(&bytes).unwrap();
+        assert_eq!(deserialized.incomplete_model_state, expected_state);
+        assert!(deserialized.callback_invocations[0].state_rekeys.is_empty());
+    }
+
+    #[test]
+    fn pre_incomplete_model_state_summary_remains_deserializable() {
+        let old_summary = PreIncompleteModelStateSummary {
+            is_computed: true,
+            is_incomplete: true,
+            preconditions: Vec::new(),
+            assumed_aliases: Vec::new(),
+            guarded_aliases: Vec::new(),
+            side_effects: Vec::new(),
+            post_condition: None,
+            callback_invocations: Vec::new(),
+        };
+
+        let bytes = bincode::serialize(&old_summary).unwrap();
+        let summary = deserialize_summary(&bytes).unwrap();
+
+        assert!(summary.incomplete_model_state.is_empty());
+    }
 
     #[test]
     fn pre_lineage_callback_summary_remains_deserializable() {
