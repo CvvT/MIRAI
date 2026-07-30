@@ -135,9 +135,11 @@ fn main() {
             rustc_command_line_arguments
         );
         rustc_driver::run_compiler(&rustc_command_line_arguments, &mut callbacks);
+        callbacks.coverage_is_clean()
     });
     let exit_code = match result {
-        Ok(_) => rustc_driver::EXIT_SUCCESS,
+        Ok(true) => rustc_driver::EXIT_SUCCESS,
+        Ok(false) => rustc_driver::EXIT_FAILURE,
         Err(_) => rustc_driver::EXIT_FAILURE,
     };
     std::process::exit(exit_code);

@@ -35,6 +35,8 @@ pub struct MiraiCallbacks {
     output_directory: PathBuf,
     /// True if this run is done via cargo test
     test_run: bool,
+    /// True when the selected diagnostic posture established complete coverage.
+    coverage_is_clean: bool,
 }
 
 /// Constructors
@@ -45,6 +47,7 @@ impl MiraiCallbacks {
             file_name: String::new(),
             output_directory: PathBuf::default(),
             test_run: false,
+            coverage_is_clean: true,
         }
     }
 
@@ -54,7 +57,12 @@ impl MiraiCallbacks {
             file_name: String::new(),
             output_directory: PathBuf::default(),
             test_run: true,
+            coverage_is_clean: true,
         }
+    }
+
+    pub fn coverage_is_clean(&self) -> bool {
+        self.coverage_is_clean
     }
 }
 
@@ -156,10 +164,12 @@ impl MiraiCallbacks {
             constant_time_tag_cache: None,
             constant_time_tag_not_found: false,
             constant_value_cache: ConstantValueCache::default(),
+            coverage_for: HashMap::new(),
             diagnostics_for: HashMap::new(),
             file_name: self.file_name.as_str(),
             known_names_cache: KnownNamesCache::create_cache(),
             options: &std::mem::take(&mut self.options),
+            region_gaps: Vec::new(),
             session: &compiler.sess,
             generic_args_cache: HashMap::new(),
             summary_cache: SummaryCache::new(summary_store_path),
@@ -171,7 +181,7 @@ impl MiraiCallbacks {
         if crate_visitor.options.print_summaries {
             crate_visitor.call_graph.config.include_calls_in_summaries = true;
         }
-        crate_visitor.analyze_some_bodies();
+        self.coverage_is_clean = crate_visitor.analyze_some_bodies();
         crate_visitor.call_graph.output();
         crate_visitor.print_summaries();
     }

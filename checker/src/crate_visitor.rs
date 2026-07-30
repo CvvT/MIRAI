@@ -27,6 +27,10 @@ use rustc_session::Session;
 use crate::body_visitor::BodyVisitor;
 use crate::call_graph::CallGraph;
 use crate::constant_domain::ConstantValueCache;
+use crate::coverage::{
+    count_gaps, envelope_is_sealed, CoverageGapKind, CoverageManifest, CoverageOutcome,
+    CoverageRecord,
+};
 use crate::expected_errors;
 use crate::known_names::KnownNamesCache;
 use crate::options::Options;
@@ -46,11 +50,13 @@ pub struct CrateVisitor<'compilation, 'tcx> {
     pub constant_time_tag_cache: Option<Tag>,
     pub constant_time_tag_not_found: bool,
     pub constant_value_cache: ConstantValueCache<'tcx>,
+    pub coverage_for: HashMap<DefId, Vec<CoverageRecord>>,
     pub diagnostics_for: HashMap<DefId, Vec<Diag<'compilation, ()>>>,
     pub file_name: &'compilation str,
     pub generic_args_cache: HashMap<DefId, GenericArgsRef<'tcx>>,
     pub known_names_cache: KnownNamesCache,
     pub options: &'compilation Options,
+    pub region_gaps: Vec<CoverageRecord>,
     pub session: &'compilation Session,
     pub summary_cache: SummaryCache<'tcx>,
     pub tcx: TyCtxt<'tcx>,
@@ -68,7 +74,7 @@ impl Debug for CrateVisitor<'_, '_> {
 impl<'compilation> CrateVisitor<'compilation, '_> {
     /// Analyze some of the bodies in the crate that is being compiled.
     #[logfn(TRACE)]
-    pub fn analyze_some_bodies(&mut self) {
+    pub fn analyze_some_bodies(&mut self) -> bool {
         let start_instant = Instant::now();
         // Determine the functions we want to analyze.
         let selected_functions = self.get_selected_function_list();
@@ -82,7 +88,10 @@ impl<'compilation> CrateVisitor<'compilation, '_> {
 
         // Analyze all functions that are whitelisted or public
         let building_standard_summaries = std::env::var("MIRAI_START_FRESH").is_ok();
-        for local_def_id in self.tcx.hir_body_owners() {
+        let body_owners = self.tcx.hir_body_owners().collect::<Vec<_>>();
+        let mut accounted_roots = 0;
+        let mut completed_enumeration = true;
+        for (body_index, local_def_id) in body_owners.iter().copied().enumerate() {
             let def_id = local_def_id.to_def_id();
             let name = utils::summary_key_str(self.tcx, def_id);
             if let Some(selections) = &selected_functions {
@@ -93,12 +102,16 @@ impl<'compilation> CrateVisitor<'compilation, '_> {
                             name
                         );
                     }
+                    self.record_region_gap(def_id, CoverageGapKind::SkippedRoot);
+                    accounted_roots += 1;
                     continue;
                 }
                 info!("analyzing selected function {}", name);
             } else if !building_standard_summaries {
                 if !utils::is_public(def_id, self.tcx) && def_id != entry_fn_def_id {
                     debug!("skipping function {} as it is not public", name);
+                    self.record_region_gap(def_id, CoverageGapKind::SkippedRoot);
+                    accounted_roots += 1;
                     continue;
                 } else if self
                     .tcx
@@ -106,15 +119,21 @@ impl<'compilation> CrateVisitor<'compilation, '_> {
                     .requires_monomorphization(self.tcx)
                 {
                     debug!("skipping function {} as it is generic", name);
+                    self.record_region_gap(def_id, CoverageGapKind::SkippedRoot);
+                    accounted_roots += 1;
                     continue;
                 } else if self.tcx.is_const_fn(def_id) {
                     debug!("skipping function {} as it is a constant function", name);
+                    self.record_region_gap(def_id, CoverageGapKind::SkippedRoot);
+                    accounted_roots += 1;
                     continue;
                 } else if utils::is_higher_order_function(def_id, self.tcx) {
                     debug!(
                         "skipping function {} as it is a higher order function",
                         name
                     );
+                    self.record_region_gap(def_id, CoverageGapKind::SkippedRoot);
+                    accounted_roots += 1;
                     continue;
                 } else {
                     info!("analyzing function {}", name);
@@ -124,12 +143,38 @@ impl<'compilation> CrateVisitor<'compilation, '_> {
             }
             self.call_graph.add_croot(def_id);
             self.analyze_body(def_id);
-            if start_instant.elapsed().as_secs() > self.options.max_analysis_time_for_crate {
+            accounted_roots += 1;
+            if start_instant.elapsed().as_secs() >= self.options.max_analysis_time_for_crate {
                 info!("exceeded total time allowed for crate analysis");
+                for remaining_owner in &body_owners[body_index + 1..] {
+                    self.record_region_gap(
+                        remaining_owner.to_def_id(),
+                        CoverageGapKind::CrateTimeout,
+                    );
+                }
+                accounted_roots += body_owners.len() - body_index - 1;
+                completed_enumeration = false;
                 break;
             }
         }
-        self.emit_or_check_diagnostics();
+        let envelope_sealed =
+            envelope_is_sealed(completed_enumeration, accounted_roots, body_owners.len());
+        self.emit_or_check_diagnostics(envelope_sealed)
+    }
+
+    fn record_region_gap(&mut self, def_id: DefId, kind: CoverageGapKind) {
+        if !self.options.may_complete {
+            return;
+        }
+        self.region_gaps.push(CoverageRecord::gap(
+            self.tcx
+                .sess
+                .source_map()
+                .span_to_diagnostic_string(self.tcx.def_span(def_id)),
+            format!("{:?}", def_id),
+            utils::summary_key_str(self.tcx, def_id).to_string(),
+            kind,
+        ));
     }
 
     /// Use compilation options to determine a list of functions to analyze.
@@ -172,11 +217,13 @@ impl<'compilation> CrateVisitor<'compilation, '_> {
     #[logfn(TRACE)]
     fn analyze_body(&mut self, def_id: DefId) {
         let mut diagnostics: Vec<Diag<'compilation, ()>> = Vec::new();
+        let mut coverage_records = Vec::new();
         let mut active_calls_map: HashMap<DefId, u64> = HashMap::new();
         let mut body_visitor = BodyVisitor::new(
             self,
             def_id,
             &mut diagnostics,
+            &mut coverage_records,
             &mut active_calls_map,
             self.type_cache.clone(),
         );
@@ -192,6 +239,8 @@ impl<'compilation> CrateVisitor<'compilation, '_> {
         }
         let old_diags = self.diagnostics_for.insert(def_id, diagnostics);
         checked_assume!(old_diags.is_none());
+        let old_records = self.coverage_for.insert(def_id, coverage_records);
+        checked_assume!(old_records.is_none());
     }
 
     /// Extract test functions from the promoted constants of a test runner main function.
@@ -243,16 +292,17 @@ impl<'compilation> CrateVisitor<'compilation, '_> {
 
     /// Emit any diagnostics or, if testing, check that they are as expected.
     #[logfn_inputs(TRACE)]
-    fn emit_or_check_diagnostics(&mut self) {
+    fn emit_or_check_diagnostics(&mut self, envelope_sealed: bool) -> bool {
         self.session.dcx().reset_err_count();
+        let finding_count = self.diagnostics_for.values().flatten().count();
+        let analyzed_bodies = self.coverage_for.len();
         if self.options.statistics {
-            let num_diags = self.diagnostics_for.values().flatten().count();
             for (_, diags) in self.diagnostics_for.drain() {
                 for db in diags.into_iter() {
                     db.cancel();
                 }
             }
-            print!("{}, analyzed, {}", self.file_name, num_diags);
+            print!("{}, analyzed, {}", self.file_name, finding_count);
         } else if self.test_run {
             let mut expected_errors = expected_errors::ExpectedErrors::new(self.file_name);
             let mut diags = vec![];
@@ -261,14 +311,20 @@ impl<'compilation> CrateVisitor<'compilation, '_> {
                     diags.push(db);
                 }
             }
-            if !expected_errors.check_messages(&diags) {
+            let messages_ok = expected_errors.check_messages(&diags);
+            for db in diags.into_iter() {
+                db.cancel();
+            }
+            // Drain the coverage manifest before the (diverging) `fatal` below so a
+            // failing expected-errors check cannot silently discard it.
+            let coverage_is_clean =
+                self.emit_coverage_manifest(analyzed_bodies, finding_count, envelope_sealed);
+            if !messages_ok {
                 self.session
                     .dcx()
                     .fatal(format!("test failed: {}", self.file_name));
             }
-            for db in diags.into_iter() {
-                db.cancel();
-            }
+            return coverage_is_clean;
         } else {
             let mut diagnostics = vec![];
             for (_, dbs) in self.diagnostics_for.drain() {
@@ -290,6 +346,48 @@ impl<'compilation> CrateVisitor<'compilation, '_> {
                 d.emit()
             }
         }
+        self.emit_coverage_manifest(analyzed_bodies, finding_count, envelope_sealed)
+    }
+
+    fn emit_coverage_manifest(
+        &mut self,
+        analyzed_bodies: usize,
+        finding_count: usize,
+        envelope_sealed: bool,
+    ) -> bool {
+        if !self.options.may_complete {
+            return true;
+        }
+        if self.options.statistics {
+            println!();
+        }
+        let mut records = self
+            .coverage_for
+            .drain()
+            .flat_map(|(_, records)| records)
+            .chain(self.region_gaps.drain(..))
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| left.sort_key().cmp(&right.sort_key()));
+        let outcome =
+            CoverageOutcome::from_ledger(&records, analyzed_bodies, finding_count, envelope_sealed);
+        let clean = outcome.is_clean();
+        let gap_counts = count_gaps(&records);
+        let crate_name = self.tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE);
+        let manifest = CoverageManifest {
+            crate_name: crate_name.as_str(),
+            clean,
+            outcome,
+            envelope_sealed,
+            analyzed_bodies,
+            finding_count,
+            gap_counts: &gap_counts,
+            records: &records,
+        };
+        eprintln!(
+            "MIRAI_COVERAGE_MANIFEST={}",
+            serde_json::to_string(&manifest).expect("coverage manifest must serialize")
+        );
+        clean
     }
 
     pub fn print_summaries(&mut self) {

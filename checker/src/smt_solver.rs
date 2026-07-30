@@ -3,6 +3,7 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root directory of this source tree.
 
+use crate::constant_domain::ConstantDomain;
 use crate::expression::Expression;
 
 use mirai_annotations::{get_model_field, precondition, set_model_field};
@@ -37,7 +38,11 @@ pub trait SmtSolver<SmtExpressionType> {
 
     /// Provides a string that contains a set of variable assignments that satisfied the
     /// assertions in the solver. Can only be called after self.solve return SmtResult::Satisfiable.
-    fn get_model_as_string(&self) -> String;
+    fn get_model_as_string(&self) -> Option<String>;
+
+    /// Evaluates a scalar MIRAI expression in the current model.
+    /// Can only be called after `solve` returns `SmtResult::Satisfiable`.
+    fn get_model_value(&self, expression: &Expression) -> Option<ConstantDomain>;
 
     /// Provides a string that contains a listing of all of the definitions and assertions that
     /// have been added to the solver.
@@ -88,8 +93,12 @@ impl SmtSolver<usize> for SolverStub {
         0
     }
 
-    fn get_model_as_string(&self) -> String {
-        String::from("not implemented")
+    fn get_model_as_string(&self) -> Option<String> {
+        None
+    }
+
+    fn get_model_value(&self, _expression: &Expression) -> Option<ConstantDomain> {
+        None
     }
 
     fn get_solver_state_as_string(&self) -> String {
@@ -104,5 +113,17 @@ impl SmtSolver<usize> for SolverStub {
 
     fn solve(&self) -> SmtResult {
         SmtResult::Undefined
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SmtResult, SmtSolver, SolverStub};
+
+    #[test]
+    fn solver_stub_reports_undecided_without_a_witness() {
+        let solver = SolverStub::default();
+        assert_eq!(solver.solve(), SmtResult::Undefined);
+        assert_eq!(solver.get_model_as_string(), None);
     }
 }

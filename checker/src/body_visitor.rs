@@ -4,7 +4,7 @@
 // LICENSE file in the root directory of this source tree.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::{Debug, Formatter, Result};
 use std::rc::Rc;
 use std::time::Instant;
@@ -22,6 +22,7 @@ use crate::abstract_value::{self, AbstractValue, AbstractValueTrait, BOTTOM};
 use crate::block_visitor::BlockVisitor;
 use crate::call_visitor::CallVisitor;
 use crate::constant_domain::ConstantDomain;
+use crate::coverage::{CoverageGapKind, CoverageRecord};
 use crate::crate_visitor::CrateVisitor;
 use crate::environment::Environment;
 use crate::expression::{Expression, ExpressionType, LayoutSource};
@@ -47,6 +48,7 @@ pub struct BodyVisitor<'analysis, 'compilation, 'tcx> {
     pub def_id: DefId,
     pub mir: &'tcx mir::Body<'tcx>,
     pub buffered_diagnostics: &'analysis mut Vec<Diag<'compilation, ()>>,
+    pub buffered_coverage_records: &'analysis mut Vec<CoverageRecord>,
     pub active_calls_map: &'analysis mut HashMap<DefId, u64>,
 
     pub already_reported_errors_for_call_to: HashSet<Rc<AbstractValue>>,
@@ -82,9 +84,651 @@ pub struct BodyVisitor<'analysis, 'compilation, 'tcx> {
     type_visitor: TypeVisitor<'tcx>,
 }
 
+#[cfg(test)]
+mod existential_precondition_tests {
+    use super::{
+        check_existential_precondition_with_solver, classify_existential_result,
+        collect_replay_input_roots, evaluate_replay_violation, ExistentialPreconditionResult,
+        ReplayEvaluation,
+    };
+    use crate::abstract_value::{AbstractValue, FALSE, TRUE};
+    use crate::constant_domain::ConstantDomain;
+    #[cfg(feature = "z3")]
+    use crate::coverage::CoverageRecord;
+    use crate::expression::{Expression, ExpressionType};
+    use crate::path::Path;
+    use crate::smt_solver::{SmtResult, SmtSolver, SolverStub};
+    #[cfg(feature = "z3")]
+    use crate::z3_solver::Z3Solver;
+    use std::collections::BTreeMap;
+    use std::rc::Rc;
+
+    struct MissingModelValueSolver;
+
+    impl SmtSolver<usize> for MissingModelValueSolver {
+        fn as_debug_string(&self, _: &usize) -> String {
+            String::new()
+        }
+
+        fn assert(&self, _: &usize) {}
+
+        fn get_as_smt_predicate(&self, _: &Expression) -> usize {
+            0
+        }
+
+        fn get_model_as_string(&self) -> Option<String> {
+            Some("model available".to_owned())
+        }
+
+        fn get_model_value(&self, _: &Expression) -> Option<ConstantDomain> {
+            None
+        }
+
+        fn get_solver_state_as_string(&self) -> String {
+            String::new()
+        }
+
+        fn invert_predicate(&self, _: &usize) -> usize {
+            0
+        }
+
+        fn solve(&self) -> SmtResult {
+            SmtResult::Satisfiable
+        }
+    }
+
+    #[test]
+    fn classifies_solver_results_without_fabricating_witnesses() {
+        assert!(matches!(
+            classify_existential_result(SmtResult::Satisfiable, Some("x -> 1".to_owned())),
+            ExistentialPreconditionResult::Satisfiable {
+                witness,
+                replay_inputs: None,
+                replay_evaluation: ReplayEvaluation::Undecided,
+            } if witness == "x -> 1"
+        ));
+        assert!(matches!(
+            classify_existential_result(SmtResult::Satisfiable, None),
+            ExistentialPreconditionResult::Undefined
+        ));
+        assert!(matches!(
+            classify_existential_result(SmtResult::Unsatisfiable, None),
+            ExistentialPreconditionResult::UnsatisfiableComplete
+        ));
+        assert!(matches!(
+            classify_existential_result(SmtResult::Undefined, None),
+            ExistentialPreconditionResult::Undefined
+        ));
+    }
+
+    #[test]
+    fn solver_stub_makes_the_existential_query_undecided() {
+        assert!(matches!(
+            check_existential_precondition_with_solver(
+                SolverStub::default(),
+                &TRUE.expression,
+                &FALSE.expression,
+            ),
+            ExistentialPreconditionResult::Undefined
+        ));
+    }
+
+    #[cfg(feature = "z3")]
+    #[test]
+    fn z3_refutes_an_unsatisfiable_existential_query() {
+        assert!(matches!(
+            check_existential_precondition_with_solver(
+                Z3Solver::new(),
+                &TRUE.expression,
+                &TRUE.expression,
+            ),
+            ExistentialPreconditionResult::UnsatisfiableComplete
+        ));
+    }
+
+    #[cfg(feature = "z3")]
+    #[test]
+    fn non_input_variables_cannot_supply_replay_inputs_or_confirm() {
+        let zero =
+            AbstractValue::make_from(Expression::CompileTimeConstant(ConstantDomain::I128(0)), 1);
+        for (kind, path) in [
+            ("local", Path::new_local(2, 0)),
+            ("result", Path::new_result()),
+            ("current parameter", Path::new_parameter(1)),
+        ] {
+            let current_value = AbstractValue::make_typed_unknown(ExpressionType::I32, path);
+            let precondition = AbstractValue::make_from(
+                Expression::GreaterThan {
+                    left: current_value,
+                    right: zero.clone(),
+                },
+                3,
+            );
+            assert!(!collect_replay_input_roots(
+                &precondition.expression,
+                &mut BTreeMap::new(),
+            ));
+
+            let result = check_existential_precondition_with_solver(
+                Z3Solver::new(),
+                &TRUE.expression,
+                &precondition.expression,
+            );
+            let (witness, replay_inputs) = match result {
+                ExistentialPreconditionResult::Satisfiable {
+                    witness,
+                    replay_inputs,
+                    ..
+                } => (witness, replay_inputs),
+                ExistentialPreconditionResult::Undefined => continue,
+                _ => panic!("unexpected scalar {kind} solver result: {result:?}"),
+            };
+            assert!(replay_inputs.is_none());
+            let record = CoverageRecord::abstract_counterexample(
+                "src/lib.rs:1:1".to_owned(),
+                "DefId(0:1)".to_owned(),
+                "test".to_owned(),
+                witness,
+            );
+            let value = serde_json::to_value(record).unwrap();
+
+            assert_eq!(value["tier"], "abstract_counterexample");
+            assert_eq!(value["replay_validation"]["status"], "undecided");
+            assert_ne!(value["tier"], "abstract_model");
+        }
+    }
+
+    #[test]
+    fn incomplete_encoding_cannot_be_reported_as_unsatisfiable() {
+        assert!(matches!(
+            check_existential_precondition_with_solver(
+                SolverStub::default(),
+                &TRUE.expression,
+                &crate::abstract_value::TOP.expression,
+            ),
+            ExistentialPreconditionResult::EncodingIncomplete
+        ));
+
+        let conditional = AbstractValue::make_from(
+            Expression::ConditionalExpression {
+                condition: Rc::new(TRUE),
+                consequent: Rc::new(TRUE),
+                alternate: Rc::new(FALSE),
+            },
+            4,
+        );
+        assert!(matches!(
+            check_existential_precondition_with_solver(
+                SolverStub::default(),
+                &TRUE.expression,
+                &conditional.expression,
+            ),
+            ExistentialPreconditionResult::EncodingIncomplete
+        ));
+    }
+
+    #[test]
+    fn replay_provenance_accepts_only_entry_parameter_values() {
+        let entry_value = AbstractValue::make_initial_parameter_value(
+            ExpressionType::I32,
+            Path::new_parameter(1),
+        );
+        let condition = Expression::GreaterThan {
+            left: entry_value,
+            right: Rc::new(0_i128.into()),
+        };
+        let mut inputs = BTreeMap::new();
+        assert!(collect_replay_input_roots(&condition, &mut inputs));
+        assert_eq!(
+            inputs,
+            BTreeMap::from([(1, (Path::new_parameter(1), ExpressionType::I32))])
+        );
+
+        let current_parameter =
+            AbstractValue::make_typed_unknown(ExpressionType::I32, Path::new_parameter(1));
+        let condition = Expression::GreaterThan {
+            left: current_parameter,
+            right: Rc::new(0_i128.into()),
+        };
+        assert!(!collect_replay_input_roots(
+            &condition,
+            &mut BTreeMap::new()
+        ));
+    }
+
+    #[cfg(feature = "z3")]
+    #[test]
+    fn satisfiable_query_carries_structured_integer_input_values() {
+        let entry_value = AbstractValue::make_initial_parameter_value(
+            ExpressionType::I32,
+            Path::new_parameter(1),
+        );
+        let precondition = Expression::Ne {
+            left: entry_value,
+            right: Rc::new(ConstantDomain::I128(3).into()),
+        };
+        let result = check_existential_precondition_with_solver(
+            Z3Solver::new(),
+            &TRUE.expression,
+            &precondition,
+        );
+        let ExistentialPreconditionResult::Satisfiable {
+            replay_inputs: Some(inputs),
+            replay_evaluation,
+            ..
+        } = result
+        else {
+            panic!("unexpected existential result: {result:?}");
+        };
+        assert!(
+            matches!(inputs.get(&1), Some(ConstantDomain::I128(3))),
+            "model input must concretely violate the precondition: {inputs:?}"
+        );
+        assert_eq!(
+            replay_evaluation,
+            ReplayEvaluation::NativePredicateAgreement
+        );
+    }
+
+    #[cfg(feature = "z3")]
+    #[test]
+    fn satisfiable_query_carries_structured_boolean_input_values() {
+        let precondition = Expression::InitialParameterValue {
+            path: Path::new_parameter(1),
+            var_type: ExpressionType::Bool,
+        };
+        let result = check_existential_precondition_with_solver(
+            Z3Solver::new(),
+            &TRUE.expression,
+            &precondition,
+        );
+        assert!(matches!(
+            result,
+            ExistentialPreconditionResult::Satisfiable {
+                replay_inputs: Some(inputs),
+                replay_evaluation: ReplayEvaluation::NativePredicateAgreement,
+                ..
+            } if inputs == BTreeMap::from([(1, ConstantDomain::False)])
+        ));
+    }
+
+    #[cfg(feature = "z3")]
+    #[test]
+    fn structured_model_extraction_preserves_integer_signedness() {
+        for (var_type, value) in [
+            (ExpressionType::I8, ConstantDomain::I128(-128)),
+            (ExpressionType::U8, ConstantDomain::U128(255)),
+        ] {
+            let entry_value =
+                AbstractValue::make_initial_parameter_value(var_type, Path::new_parameter(1));
+            let precondition = Expression::Ne {
+                left: entry_value,
+                right: Rc::new(value.clone().into()),
+            };
+            let result = check_existential_precondition_with_solver(
+                Z3Solver::new(),
+                &TRUE.expression,
+                &precondition,
+            );
+
+            assert!(
+                matches!(
+                    &result,
+                    ExistentialPreconditionResult::Satisfiable {
+                        replay_inputs: Some(inputs),
+                        ..
+                    } if *inputs == BTreeMap::from([(1, value.clone())])
+                ),
+                "structured extraction changed the value's signedness: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn structured_model_extraction_fails_closed_on_omitted_assignment() {
+        let entry_value = AbstractValue::make_initial_parameter_value(
+            ExpressionType::I32,
+            Path::new_parameter(1),
+        );
+        let entry_condition = Expression::Equals {
+            left: entry_value.clone(),
+            right: entry_value,
+        };
+        let result = check_existential_precondition_with_solver(
+            MissingModelValueSolver,
+            &entry_condition,
+            &FALSE.expression,
+        );
+
+        assert!(
+            matches!(
+                result,
+                ExistentialPreconditionResult::Satisfiable {
+                    replay_inputs: None,
+                    ..
+                }
+            ),
+            "an input omitted from the model must not receive a fabricated value: {result:?}"
+        );
+    }
+
+    #[test]
+    fn replay_provenance_rejects_non_parameter_roots() {
+        for path in [Path::new_local(2, 0), Path::new_result()] {
+            let value = AbstractValue::make_initial_parameter_value(ExpressionType::I32, path);
+            assert!(!collect_replay_input_roots(
+                &value.expression,
+                &mut BTreeMap::new()
+            ));
+        }
+    }
+
+    #[test]
+    fn concrete_expression_replay_rederives_entry_and_violation() {
+        let input = AbstractValue::make_initial_parameter_value(
+            ExpressionType::I32,
+            Path::new_parameter(1),
+        );
+        let entry_condition = Expression::GreaterOrEqual {
+            left: input.clone(),
+            right: Rc::new(0_i128.into()),
+        };
+        let precondition = Expression::GreaterThan {
+            left: input,
+            right: Rc::new(3_i128.into()),
+        };
+
+        assert_eq!(
+            evaluate_replay_violation(
+                &entry_condition,
+                &precondition,
+                &BTreeMap::from([(1, ConstantDomain::I128(2))]),
+            ),
+            ReplayEvaluation::NativePredicateAgreement
+        );
+        assert_eq!(
+            evaluate_replay_violation(
+                &entry_condition,
+                &precondition,
+                &BTreeMap::from([(1, ConstantDomain::I128(4))]),
+            ),
+            ReplayEvaluation::Refuted
+        );
+        assert_eq!(
+            evaluate_replay_violation(&entry_condition, &precondition, &BTreeMap::new()),
+            ReplayEvaluation::Undecided
+        );
+    }
+}
+
 impl Debug for BodyVisitor<'_, '_, '_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         "BodyVisitor".fmt(f)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum ExistentialPreconditionResult {
+    Satisfiable {
+        witness: String,
+        replay_inputs: Option<BTreeMap<usize, ConstantDomain>>,
+        replay_evaluation: ReplayEvaluation,
+    },
+    UnsatisfiableComplete,
+    EncodingIncomplete,
+    Undefined,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReplayEvaluation {
+    NativePredicateAgreement,
+    Refuted,
+    Undecided,
+}
+
+#[cfg(test)]
+fn classify_existential_result(
+    result: SmtResult,
+    witness: Option<String>,
+) -> ExistentialPreconditionResult {
+    match result {
+        SmtResult::Satisfiable => match witness {
+            Some(witness) => ExistentialPreconditionResult::Satisfiable {
+                witness,
+                replay_inputs: None,
+                replay_evaluation: ReplayEvaluation::Undecided,
+            },
+            None => ExistentialPreconditionResult::Undefined,
+        },
+        SmtResult::Unsatisfiable => ExistentialPreconditionResult::UnsatisfiableComplete,
+        SmtResult::Undefined => ExistentialPreconditionResult::Undefined,
+    }
+}
+
+fn evaluate_replay_expression(
+    expression: &Expression,
+    inputs: &BTreeMap<usize, ConstantDomain>,
+) -> Option<ConstantDomain> {
+    let evaluate_binary = |left: &Rc<AbstractValue>, right: &Rc<AbstractValue>| {
+        Some((
+            evaluate_replay_expression(&left.expression, inputs)?,
+            evaluate_replay_expression(&right.expression, inputs)?,
+        ))
+    };
+    match expression {
+        Expression::CompileTimeConstant(value) => Some(value.clone()),
+        Expression::InitialParameterValue { path, .. } if path == path.get_path_root() => {
+            inputs.get(&path.get_parameter_root_ordinal()?).cloned()
+        }
+        Expression::And { left, right } => {
+            let (left, right) = evaluate_binary(left, right)?;
+            Some(left.and(&right))
+        }
+        Expression::BitAnd { left, right } => {
+            let (left, right) = evaluate_binary(left, right)?;
+            Some(left.bit_and(&right))
+        }
+        Expression::BitOr { left, right } => {
+            let (left, right) = evaluate_binary(left, right)?;
+            Some(left.bit_or(&right))
+        }
+        Expression::BitXor { left, right } => {
+            let (left, right) = evaluate_binary(left, right)?;
+            Some(left.bit_xor(&right))
+        }
+        Expression::Equals { left, right } => {
+            let (left, right) = evaluate_binary(left, right)?;
+            Some(left.equals(&right))
+        }
+        Expression::GreaterOrEqual { left, right } => {
+            let (left, right) = evaluate_binary(left, right)?;
+            Some(left.greater_or_equal(&right))
+        }
+        Expression::GreaterThan { left, right } => {
+            let (left, right) = evaluate_binary(left, right)?;
+            Some(left.greater_than(&right))
+        }
+        Expression::LessOrEqual { left, right } => {
+            let (left, right) = evaluate_binary(left, right)?;
+            Some(left.less_or_equal(&right))
+        }
+        Expression::LessThan { left, right } => {
+            let (left, right) = evaluate_binary(left, right)?;
+            Some(left.less_than(&right))
+        }
+        Expression::LogicalNot { operand } => {
+            Some(evaluate_replay_expression(&operand.expression, inputs)?.logical_not())
+        }
+        Expression::Ne { left, right } => {
+            let (left, right) = evaluate_binary(left, right)?;
+            Some(left.not_equals(&right))
+        }
+        Expression::Or { left, right } => {
+            let (left, right) = evaluate_binary(left, right)?;
+            Some(left.or(&right))
+        }
+        _ => None,
+    }
+}
+
+fn evaluate_replay_violation(
+    entry_condition: &Expression,
+    precondition: &Expression,
+    inputs: &BTreeMap<usize, ConstantDomain>,
+) -> ReplayEvaluation {
+    match (
+        evaluate_replay_expression(entry_condition, inputs)
+            .and_then(|value| value.as_bool_if_known()),
+        evaluate_replay_expression(precondition, inputs).and_then(|value| value.as_bool_if_known()),
+    ) {
+        (Some(true), Some(false)) => ReplayEvaluation::NativePredicateAgreement,
+        (Some(_), Some(_)) => ReplayEvaluation::Refuted,
+        _ => ReplayEvaluation::Undecided,
+    }
+}
+
+fn existential_encoding_is_complete(expression: &Expression) -> bool {
+    let binary_operands_are_complete = |left: &Rc<AbstractValue>, right: &Rc<AbstractValue>| {
+        existential_encoding_is_complete(&left.expression)
+            && existential_encoding_is_complete(&right.expression)
+    };
+    match expression {
+        Expression::CompileTimeConstant(
+            ConstantDomain::Char(_)
+            | ConstantDomain::False
+            | ConstantDomain::I128(_)
+            | ConstantDomain::True
+            | ConstantDomain::U128(_),
+        ) => true,
+        Expression::InitialParameterValue { var_type, .. }
+        | Expression::Variable { var_type, .. } => {
+            *var_type == ExpressionType::Bool
+                || *var_type == ExpressionType::Char
+                || var_type.is_integer()
+        }
+        Expression::And { left, right }
+        | Expression::Equals { left, right }
+        | Expression::GreaterOrEqual { left, right }
+        | Expression::GreaterThan { left, right }
+        | Expression::LessOrEqual { left, right }
+        | Expression::LessThan { left, right }
+        | Expression::Ne { left, right }
+        | Expression::Or { left, right } => binary_operands_are_complete(left, right),
+        Expression::BitAnd { left, right }
+        | Expression::BitOr { left, right }
+        | Expression::BitXor { left, right } => {
+            left.expression.infer_type() == ExpressionType::Bool
+                && right.expression.infer_type() == ExpressionType::Bool
+                && binary_operands_are_complete(left, right)
+        }
+        Expression::LogicalNot { operand } => existential_encoding_is_complete(&operand.expression),
+        _ => false,
+    }
+}
+
+fn collect_replay_input_roots(
+    expression: &Expression,
+    inputs: &mut BTreeMap<usize, (Rc<Path>, ExpressionType)>,
+) -> bool {
+    let mut collect_binary = |left: &Rc<AbstractValue>, right: &Rc<AbstractValue>| {
+        collect_replay_input_roots(&left.expression, inputs)
+            && collect_replay_input_roots(&right.expression, inputs)
+    };
+    match expression {
+        Expression::CompileTimeConstant(
+            ConstantDomain::Char(_)
+            | ConstantDomain::False
+            | ConstantDomain::I128(_)
+            | ConstantDomain::True
+            | ConstantDomain::U128(_),
+        ) => true,
+        Expression::InitialParameterValue { path, var_type } => {
+            if path == path.get_path_root() {
+                let Some(ordinal) = path.get_parameter_root_ordinal() else {
+                    return false;
+                };
+                inputs
+                    .entry(ordinal)
+                    .and_modify(|existing| {
+                        if existing.1 != *var_type || existing.0 != *path {
+                            existing.1 = ExpressionType::NonPrimitive;
+                        }
+                    })
+                    .or_insert_with(|| (path.clone(), *var_type));
+                inputs[&ordinal].1 != ExpressionType::NonPrimitive
+            } else {
+                false
+            }
+        }
+        Expression::And { left, right }
+        | Expression::Equals { left, right }
+        | Expression::GreaterOrEqual { left, right }
+        | Expression::GreaterThan { left, right }
+        | Expression::LessOrEqual { left, right }
+        | Expression::LessThan { left, right }
+        | Expression::Ne { left, right }
+        | Expression::Or { left, right } => collect_binary(left, right),
+        Expression::LogicalNot { operand } => {
+            collect_replay_input_roots(&operand.expression, inputs)
+        }
+        // Current-state variables are not entry inputs, even when parameter-rooted.
+        Expression::Variable { .. } => false,
+        _ => false,
+    }
+}
+
+fn check_existential_precondition_with_solver<SmtExpressionType>(
+    solver: impl SmtSolver<SmtExpressionType>,
+    entry_condition: &Expression,
+    precondition: &Expression,
+) -> ExistentialPreconditionResult {
+    if !existential_encoding_is_complete(entry_condition)
+        || !existential_encoding_is_complete(precondition)
+    {
+        return ExistentialPreconditionResult::EncodingIncomplete;
+    }
+    let entry_predicate = solver.get_as_smt_predicate(entry_condition);
+    solver.assert(&entry_predicate);
+    let precondition_predicate = solver.get_as_smt_predicate(precondition);
+    let violation_predicate = solver.invert_predicate(&precondition_predicate);
+    solver.assert(&violation_predicate);
+    let result = solver.solve();
+    match result {
+        SmtResult::Satisfiable => {
+            let mut replay_input_roots = BTreeMap::new();
+            let provenance_is_complete =
+                collect_replay_input_roots(entry_condition, &mut replay_input_roots)
+                    && collect_replay_input_roots(precondition, &mut replay_input_roots);
+            let replay_inputs = provenance_is_complete
+                .then(|| {
+                    replay_input_roots
+                        .into_iter()
+                        .map(|(ordinal, (path, var_type))| {
+                            solver
+                                .get_model_value(&Expression::InitialParameterValue {
+                                    path,
+                                    var_type,
+                                })
+                                .map(|value| (ordinal, value))
+                        })
+                        .collect::<Option<BTreeMap<_, _>>>()
+                })
+                .flatten();
+            let replay_evaluation = replay_inputs
+                .as_ref()
+                .map(|inputs| evaluate_replay_violation(entry_condition, precondition, inputs))
+                .unwrap_or(ReplayEvaluation::Undecided);
+            match solver.get_model_as_string() {
+                Some(witness) => ExistentialPreconditionResult::Satisfiable {
+                    witness,
+                    replay_inputs,
+                    replay_evaluation,
+                },
+                None => ExistentialPreconditionResult::Undefined,
+            }
+        }
+        SmtResult::Unsatisfiable => ExistentialPreconditionResult::UnsatisfiableComplete,
+        SmtResult::Undefined => ExistentialPreconditionResult::Undefined,
     }
 }
 
@@ -103,6 +747,7 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
         crate_visitor: &'analysis mut CrateVisitor<'compilation, 'tcx>,
         def_id: DefId,
         buffered_diagnostics: &'analysis mut Vec<Diag<'compilation, ()>>,
+        buffered_coverage_records: &'analysis mut Vec<CoverageRecord>,
         active_calls_map: &'analysis mut HashMap<DefId, u64>,
         type_cache: Rc<RefCell<TypeCache<'tcx>>>,
     ) -> BodyVisitor<'analysis, 'compilation, 'tcx> {
@@ -124,6 +769,7 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
             def_id,
             mir,
             buffered_diagnostics,
+            buffered_coverage_records,
             active_calls_map,
 
             already_reported_errors_for_call_to: HashSet::new(),
@@ -310,6 +956,9 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
                 }
             }
         }
+        if self.cv.options.may_complete && result.is_incomplete {
+            self.record_incomplete_analysis();
+        }
         self.cv
             .constant_value_cache
             .swap_heap_counter(saved_heap_counter);
@@ -327,7 +976,64 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
         result
     }
 
+    fn record_incomplete_analysis(&mut self) {
+        let site = self
+            .tcx
+            .sess
+            .source_map()
+            .span_to_diagnostic_string(self.tcx.def_span(self.def_id));
+        let summary_key = self.function_name.to_string();
+        self.buffered_coverage_records.push(CoverageRecord::gap(
+            site,
+            format!("{:?}", self.def_id),
+            summary_key,
+            CoverageGapKind::IncompleteAnalysis,
+        ));
+    }
+
+    pub(crate) fn record_coverage_gap(&mut self, span: rustc_span::Span, kind: CoverageGapKind) {
+        if !self.cv.options.may_complete {
+            return;
+        }
+        self.buffered_coverage_records.push(CoverageRecord::gap(
+            self.tcx.sess.source_map().span_to_diagnostic_string(span),
+            format!("{:?}", self.def_id),
+            self.function_name.to_string(),
+            kind,
+        ));
+    }
+
+    pub(crate) fn record_abstract_counterexample(
+        &mut self,
+        span: rustc_span::Span,
+        witness: String,
+    ) {
+        if !self.cv.options.may_complete {
+            return;
+        }
+        self.buffered_coverage_records
+            .push(CoverageRecord::abstract_counterexample(
+                self.tcx.sess.source_map().span_to_diagnostic_string(span),
+                format!("{:?}", self.def_id),
+                self.function_name.to_string(),
+                witness,
+            ));
+    }
+
+    pub(crate) fn record_existential_refutation(&mut self, span: rustc_span::Span) {
+        if !self.cv.options.may_complete {
+            return;
+        }
+        self.buffered_coverage_records
+            .push(CoverageRecord::solver_refutation(
+                self.tcx.sess.source_map().span_to_diagnostic_string(span),
+                format!("{:?}", self.def_id),
+                self.function_name.to_string(),
+            ));
+    }
+
     fn report_timeout(&mut self, elapsed_time_in_seconds: u64) {
+        self.record_coverage_gap(self.tcx.def_span(self.def_id), CoverageGapKind::BodyTimeout);
         // This body is beyond MIRAI for now
         if self.cv.options.diag_level != DiagLevel::Default {
             let warning = self.cv.session.dcx().struct_span_warn(
@@ -366,12 +1072,20 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
         if let [span] = &diagnostic_builder.span.primary_spans() {
             if span.in_derive_expansion() {
                 info!("derive macro has warning: {:?}", diagnostic_builder);
+                self.record_coverage_gap(*span, CoverageGapKind::DeriveGenerated);
                 diagnostic_builder.cancel();
                 return;
             }
         }
         let call_depth = *self.active_calls_map.get(&self.def_id).unwrap_or(&0u64);
         if call_depth > 1 {
+            let span = diagnostic_builder
+                .span
+                .primary_spans()
+                .first()
+                .copied()
+                .unwrap_or_else(|| self.tcx.def_span(self.def_id));
+            self.record_coverage_gap(span, CoverageGapKind::RecursiveReentrySuppression);
             diagnostic_builder.cancel();
             return;
         }
@@ -549,6 +1263,7 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
                 })
             } else {
                 debug!("max path length exceeded in refined value");
+                self.record_coverage_gap(self.current_span, CoverageGapKind::PathLengthBound);
                 let result = match path.value {
                     PathEnum::LocalVariable { .. } => refined_val,
                     PathEnum::Parameter { .. } => {
@@ -1149,7 +1864,9 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
             let in_range = ge_zero.and(le_one_past);
             let (in_range_as_bool, entry_cond_as_bool) =
                 self.check_condition_value_and_reachability(&in_range);
-            //todo: eventually give a warning if in_range_as_bool is unknown. For now, that is too noisy.
+            if entry_cond_as_bool.unwrap_or(true) && in_range_as_bool.is_none() {
+                self.record_coverage_gap(self.current_span, CoverageGapKind::UnknownOffsetSafety);
+            }
             if entry_cond_as_bool.unwrap_or(true) && !in_range_as_bool.unwrap_or(true) {
                 let span = self.current_span;
                 let message = "[MIRAI] effective offset is outside allocated range";
@@ -1708,6 +2425,17 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
         };
         self.smt_solver.backtrack();
         result
+    }
+
+    pub(crate) fn check_existential_precondition(
+        &mut self,
+        precondition: &Rc<AbstractValue>,
+    ) -> ExistentialPreconditionResult {
+        check_existential_precondition_with_solver(
+            Self::get_solver(),
+            &self.current_environment.entry_condition.expression,
+            &precondition.expression,
+        )
     }
 
     /// Copies/moves all paths rooted in source_path to corresponding paths rooted in target_path.
@@ -2434,6 +3162,10 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
                         );
                         return true;
                     }
+                    self.record_coverage_gap(
+                        self.current_span,
+                        CoverageGapKind::ElementTrackingBound,
+                    );
                 }
                 if !source_path.is_rooted_by_parameter() {
                     // The local environment is the authority on what is known about source_path
@@ -2464,6 +3196,8 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
                     length as u64,
                     strong_update,
                 );
+            } else {
+                self.record_coverage_gap(self.current_span, CoverageGapKind::ElementTrackingBound);
             }
             let target_len_path = Path::new_length(target_path.clone());
             let len_value = self.get_u128_const_val(length as u128);

@@ -80,6 +80,7 @@ pub mod call_graph;
 pub mod call_visitor;
 pub mod callbacks;
 pub mod constant_domain;
+pub mod coverage;
 pub mod crate_visitor;
 pub mod environment;
 pub mod expected_errors;

@@ -20,8 +20,9 @@ use rustc_middle::ty::{GenericArg, GenericArgKind, GenericArgsRef, Ty, TyCtxt, T
 
 use crate::abstract_value::{AbstractValue, AbstractValueTrait};
 use crate::block_visitor::BlockVisitor;
-use crate::body_visitor::BodyVisitor;
+use crate::body_visitor::{BodyVisitor, ExistentialPreconditionResult};
 use crate::constant_domain::{ConstantDomain, FunctionReference};
+use crate::coverage::{CoverageGapKind, CoverageRecord};
 use crate::environment::Environment;
 use crate::expression::{Expression, ExpressionType, LayoutSource};
 use crate::k_limits;
@@ -32,6 +33,59 @@ use crate::summaries::{CallbackInvocation, Precondition, Summary};
 use crate::tag_domain::Tag;
 use crate::type_visitor::TypeVisitor;
 use crate::{abstract_value, utils};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreconditionAbstraction {
+    Bottom,
+    ContainsTop,
+    SolverEligible,
+}
+
+fn classify_precondition_abstraction(condition: &AbstractValue) -> PreconditionAbstraction {
+    if matches!(condition.expression, Expression::Bottom) {
+        PreconditionAbstraction::Bottom
+    } else if condition.expression.contains_top() {
+        PreconditionAbstraction::ContainsTop
+    } else {
+        PreconditionAbstraction::SolverEligible
+    }
+}
+
+#[cfg(test)]
+mod existential_abstraction_tests {
+    use super::{classify_precondition_abstraction, PreconditionAbstraction};
+    use crate::abstract_value::{AbstractValue, BOTTOM, TOP, TRUE};
+    use crate::expression::Expression;
+    use std::rc::Rc;
+
+    #[test]
+    fn top_and_bottom_never_reach_the_existential_solver() {
+        assert_eq!(
+            classify_precondition_abstraction(&BOTTOM),
+            PreconditionAbstraction::Bottom
+        );
+        assert_eq!(
+            classify_precondition_abstraction(&TOP),
+            PreconditionAbstraction::ContainsTop
+        );
+
+        let nested_top = AbstractValue::make_from(
+            Expression::And {
+                left: Rc::new(TOP),
+                right: Rc::new(TRUE),
+            },
+            3,
+        );
+        assert_eq!(
+            classify_precondition_abstraction(nested_top.as_ref()),
+            PreconditionAbstraction::ContainsTop
+        );
+        assert_eq!(
+            classify_precondition_abstraction(&TRUE),
+            PreconditionAbstraction::SolverEligible
+        );
+    }
+}
 
 pub struct CallVisitor<'call, 'block, 'analysis, 'compilation, 'tcx> {
     pub actual_args: Vec<(Rc<Path>, Rc<AbstractValue>)>,
@@ -127,10 +181,12 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 Vec::new()
             } else {
                 let mut baseline_diagnostics = Vec::new();
+                let mut baseline_coverage_records = Vec::new();
                 let mut baseline_visitor = BodyVisitor::new(
                     self.block_visitor.bv.cv,
                     self.callee_def_id,
                     &mut baseline_diagnostics,
+                    &mut baseline_coverage_records,
                     self.block_visitor.bv.active_calls_map,
                     self.block_visitor.bv.cv.type_cache.clone(),
                 );
@@ -161,14 +217,33 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                     .collect();
                 drop(baseline_visitor);
                 for diagnostic in baseline_diagnostics {
+                    if self.block_visitor.bv.cv.options.may_complete {
+                        let span = diagnostic
+                            .span
+                            .primary_spans()
+                            .first()
+                            .copied()
+                            .unwrap_or_else(|| tcx.def_span(self.callee_def_id));
+                        baseline_coverage_records.push(CoverageRecord::gap(
+                            tcx.sess.source_map().span_to_diagnostic_string(span),
+                            format!("{:?}", self.callee_def_id),
+                            utils::summary_key_str(tcx, self.callee_def_id).to_string(),
+                            CoverageGapKind::BaselineDiagnosticSuppression,
+                        ));
+                    }
                     diagnostic.cancel();
                 }
+                self.block_visitor
+                    .bv
+                    .buffered_coverage_records
+                    .append(&mut baseline_coverage_records);
                 callbacks
             };
             let mut body_visitor = BodyVisitor::new(
                 self.block_visitor.bv.cv,
                 self.callee_def_id,
                 self.block_visitor.bv.buffered_diagnostics,
+                self.block_visitor.bv.buffered_coverage_records,
                 self.block_visitor.bv.active_calls_map,
                 self.block_visitor.bv.cv.type_cache.clone(),
             );
@@ -493,6 +568,10 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             } else {
                 // Probably a statically unbounded self recursive call. Use an empty summary and let
                 // earlier calls do the joining and widening required.
+                self.block_visitor.bv.record_coverage_gap(
+                    self.block_visitor.bv.current_span,
+                    CoverageGapKind::RecursionBound,
+                );
                 let mut summary = Summary::default();
                 summary
                     .side_effects
@@ -3359,6 +3438,10 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                         callee.summary_cache_key == specialized_callee.summary_cache_key
                     }) {
                         trace!("ignoring unresolved self-specialized captured callback");
+                        self.block_visitor.bv.record_coverage_gap(
+                            self.block_visitor.bv.current_span,
+                            CoverageGapKind::SelfSpecializedCallbackSuppression,
+                        );
                         continue;
                     }
                     Rc::new(ConstantDomain::Function(specialized_callee.clone()).into())
@@ -3387,6 +3470,10 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 })
             {
                 trace!("ignoring self-specialized local callback");
+                self.block_visitor.bv.record_coverage_gap(
+                    self.block_visitor.bv.current_span,
+                    CoverageGapKind::SelfSpecializedCallbackSuppression,
+                );
                 continue;
             }
             let resolved_callback_differs =
@@ -3463,10 +3550,19 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 self.report_unresolvable_callback();
                 continue;
             }
-            if !invocation.arguments_complete
-                && Self::remove_unavailable_argument_dependencies(invocation, &mut callback_summary)
-            {
-                if self.block_visitor.bv.check_for_errors {
+            if !invocation.arguments_complete {
+                let (analysis_is_incomplete, dependency_was_removed) =
+                    Self::remove_unavailable_argument_dependencies(
+                        invocation,
+                        &mut callback_summary,
+                    );
+                if dependency_was_removed {
+                    self.block_visitor.bv.record_coverage_gap(
+                        self.block_visitor.bv.current_span,
+                        CoverageGapKind::CallbackArgumentDependencyLoss,
+                    );
+                }
+                if analysis_is_incomplete && self.block_visitor.bv.check_for_errors {
                     callback_analysis_is_incomplete = true;
                 }
             }
@@ -3903,8 +3999,9 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
     fn remove_unavailable_argument_dependencies(
         invocation: &CallbackInvocation,
         callback_summary: &mut Summary,
-    ) -> bool {
+    ) -> (bool, bool) {
         let mut removed = false;
+        let mut nested_callback_argument_removed = false;
         callback_summary.preconditions.retain(|precondition| {
             let uses_unavailable = Self::callback_component_uses_unavailable_argument(
                 invocation,
@@ -3998,6 +4095,7 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                         *path = Path::new_computed(Rc::new(abstract_value::BOTTOM));
                         *value = Rc::new(abstract_value::BOTTOM);
                         callback_invocation.arguments_complete = false;
+                        nested_callback_argument_removed = true;
                     }
                 }
                 callback_invocation.pre_state.retain(|(path, value)| {
@@ -4043,7 +4141,7 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                     });
                 true
             });
-        removed
+        (removed, removed || nested_callback_argument_removed)
     }
 
     fn callback_component_uses_unavailable_argument(
@@ -4219,6 +4317,19 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
         }
     }
 
+    fn record_stopped_obligation_discovery(
+        &mut self,
+        precondition_index: usize,
+        precondition_count: usize,
+    ) {
+        if precondition_index + 1 < precondition_count {
+            self.block_visitor.bv.record_coverage_gap(
+                self.block_visitor.bv.current_span,
+                CoverageGapKind::SubsequentObligationDiscoveryStopped,
+            );
+        }
+    }
+
     /// Checks if the preconditions obtained from the summary of the function being called
     /// are met by the current state and arguments of the calling function.
     /// Preconditions that are definitely false and reachable cause diagnostic messages.
@@ -4230,7 +4341,8 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
         // A precondition can refer to the result if the precondition prevents the result expression
         // from overflowing.
         let result = Some(self.block_visitor.visit_rh_place(&self.destination));
-        for precondition in &function_summary.preconditions {
+        for (precondition_index, precondition) in function_summary.preconditions.iter().enumerate()
+        {
             let mut refined_condition = precondition.condition.refine_parameters_and_paths(
                 &self.actual_args,
                 &result,
@@ -4251,6 +4363,73 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                     0,
                 );
             }
+            let precondition_abstraction =
+                classify_precondition_abstraction(refined_condition.as_ref());
+            if precondition_abstraction == PreconditionAbstraction::Bottom {
+                // The precondition has no value, assume it is unreachable after all.
+                debug!("precondition refines to BOTTOM {:?}", precondition);
+                self.block_visitor.bv.record_coverage_gap(
+                    self.block_visitor.bv.current_span,
+                    CoverageGapKind::PreconditionBottom,
+                );
+                continue;
+            }
+
+            if self.block_visitor.bv.cv.options.may_complete
+                && refined_condition.as_bool_if_known().is_none()
+            {
+                match precondition_abstraction {
+                    PreconditionAbstraction::ContainsTop => {
+                        self.block_visitor.bv.record_coverage_gap(
+                            self.block_visitor.bv.current_span,
+                            CoverageGapKind::PreconditionTop,
+                        );
+                    }
+                    PreconditionAbstraction::SolverEligible => {
+                        match self
+                            .block_visitor
+                            .bv
+                            .check_existential_precondition(&refined_condition)
+                        {
+                            ExistentialPreconditionResult::Satisfiable {
+                                witness,
+                                replay_inputs,
+                                replay_evaluation,
+                            } => {
+                                drop((replay_inputs, replay_evaluation));
+                                self.block_visitor.bv.record_abstract_counterexample(
+                                    self.block_visitor.bv.current_span,
+                                    witness,
+                                );
+                                self.block_visitor.bv.record_coverage_gap(
+                                    self.block_visitor.bv.current_span,
+                                    CoverageGapKind::ReplayValidationUndecided,
+                                );
+                            }
+                            ExistentialPreconditionResult::UnsatisfiableComplete => {
+                                self.block_visitor.bv.record_existential_refutation(
+                                    self.block_visitor.bv.current_span,
+                                );
+                                continue;
+                            }
+                            ExistentialPreconditionResult::EncodingIncomplete => {
+                                self.block_visitor.bv.record_coverage_gap(
+                                    self.block_visitor.bv.current_span,
+                                    CoverageGapKind::ExistentialEncodingIncomplete,
+                                );
+                            }
+                            ExistentialPreconditionResult::Undefined => {
+                                self.block_visitor.bv.record_coverage_gap(
+                                    self.block_visitor.bv.current_span,
+                                    CoverageGapKind::ExistentialCheckUndecided,
+                                );
+                            }
+                        }
+                    }
+                    PreconditionAbstraction::Bottom => unreachable!(),
+                }
+            }
+
             let (refined_precondition_as_bool, entry_cond_as_bool) = self
                 .block_visitor
                 .bv
@@ -4266,17 +4445,15 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 continue;
             }
 
-            if refined_condition.is_bottom() {
-                // The precondition has no value, assume it is unreachable after all.
-                debug!("precondition refines to BOTTOM {:?}", precondition);
-                continue;
-            }
-
             if self.is_indirect_function_call
                 && refined_precondition_as_bool == Some(false)
                 && entry_cond_as_bool == Some(true)
             {
                 self.issue_diagnostic_for_call(precondition, &refined_condition, false);
+                self.record_stopped_obligation_discovery(
+                    precondition_index,
+                    function_summary.preconditions.len(),
+                );
                 return;
             }
 
@@ -4292,6 +4469,10 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                     // we know for certain that it will be false, should this call be reached,
                     // it seems appropriate to issue an error message rather than a warning.
                     self.issue_diagnostic_for_call(precondition, &refined_condition, false);
+                    self.record_stopped_obligation_discovery(
+                        precondition_index,
+                        function_summary.preconditions.len(),
+                    );
                     return;
                 } else {
                     // Promote the precondition, but be assertive.
@@ -4338,6 +4519,10 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                         || pc.provenance == precondition.provenance
                 });
                 if seen_precondition {
+                    self.block_visitor.bv.record_coverage_gap(
+                        self.block_visitor.bv.current_span,
+                        CoverageGapKind::DeduplicatedObligation,
+                    );
                     continue;
                 }
                 let promoted_condition = match (
@@ -4374,6 +4559,10 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                         info!("derive macro has warning: {:?}", precondition.message);
                         // do not propagate preconditions across derive macros since
                         // derived code is pretty much foreign code.
+                        self.block_visitor.bv.record_coverage_gap(
+                            self.block_visitor.bv.current_span,
+                            CoverageGapKind::DeriveGenerated,
+                        );
                         continue;
                     }
 
@@ -4567,6 +4756,10 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
         } else {
             // We don't know anything other than the return value type.
             // We'll assume there were no side effects and no preconditions.
+            self.block_visitor.bv.record_coverage_gap(
+                self.block_visitor.bv.current_span,
+                CoverageGapKind::IncompleteSummaryEffectLoss,
+            );
             let args = self.actual_args.iter().map(|(_, a)| a.clone()).collect();
             let result_type = self
                 .type_visitor()

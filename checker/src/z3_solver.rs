@@ -4,6 +4,7 @@
 // LICENSE file in the root directory of this source tree.
 //
 
+use std::cell::Cell;
 use std::ffi::{CStr, CString};
 use std::fmt::{Debug, Formatter, Result};
 use std::rc::Rc;
@@ -47,6 +48,7 @@ pub struct Z3Solver {
     empty_str: z3_sys::Z3_string,
     /// A logical predicate has_tag(path, tag) that indicates path is attached with tag.
     has_tag_func: z3_sys::Z3_func_decl,
+    current_model: Cell<z3_sys::Z3_model>,
 }
 
 impl Debug for Z3Solver {
@@ -67,6 +69,8 @@ impl Z3Solver {
 
             let z3_context = z3_sys::Z3_mk_context(z3_sys_cfg);
             let z3_solver = z3_sys::Z3_mk_solver(z3_context);
+            // Z3_mk_context manages AST lifetimes, but solvers and models remain caller-managed.
+            z3_sys::Z3_solver_inc_ref(z3_context, z3_solver);
             let empty_str = CString::new("").unwrap().into_raw();
             let symbol = z3_sys::Z3_mk_string_symbol(z3_context, empty_str);
 
@@ -109,6 +113,7 @@ impl Z3Solver {
                 two,
                 empty_str,
                 has_tag_func,
+                current_model: Cell::new(std::ptr::null_mut()),
             }
         }
     }
@@ -132,6 +137,7 @@ impl SmtSolver<Z3ExpressionType> for Z3Solver {
     fn assert(&self, expression: &Z3ExpressionType) {
         let _guard = Z3_MUTEX.lock().unwrap();
         unsafe {
+            self.release_cached_model();
             z3_sys::Z3_solver_assert(self.z3_context, self.z3_solver, *expression);
         }
     }
@@ -140,6 +146,7 @@ impl SmtSolver<Z3ExpressionType> for Z3Solver {
     fn backtrack(&self) {
         let _guard = Z3_MUTEX.lock().unwrap();
         unsafe {
+            self.release_cached_model();
             z3_sys::Z3_solver_pop(self.z3_context, self.z3_solver, 1);
         }
     }
@@ -151,13 +158,65 @@ impl SmtSolver<Z3ExpressionType> for Z3Solver {
     }
 
     #[logfn_inputs(TRACE)]
-    fn get_model_as_string(&self) -> String {
+    fn get_model_as_string(&self) -> Option<String> {
         let _guard = Z3_MUTEX.lock().unwrap();
         unsafe {
-            let model = z3_sys::Z3_solver_get_model(self.z3_context, self.z3_solver);
+            let model = self.model_for_reading();
+            if model.is_null() {
+                return None;
+            }
             let debug_str_bytes = z3_sys::Z3_model_to_string(self.z3_context, model);
+            if debug_str_bytes.is_null() {
+                return None;
+            }
             let debug_str = CStr::from_ptr(debug_str_bytes);
-            String::from(debug_str.to_str().unwrap())
+            Some(String::from(debug_str.to_str().unwrap()))
+        }
+    }
+
+    fn get_model_value(&self, expression: &Expression) -> Option<ConstantDomain> {
+        let _guard = Z3_MUTEX.lock().unwrap();
+        let (path, var_type) = match expression {
+            Expression::InitialParameterValue { path, var_type } => (path, *var_type),
+            _ => return None,
+        };
+        unsafe {
+            let model = self.model_for_reading();
+            if model.is_null() {
+                return None;
+            }
+            let symbol = self.get_symbol_for(path);
+            let ast = z3_sys::Z3_mk_const(self.z3_context, symbol, self.get_sort_for(var_type));
+            let mut value_ast = std::ptr::null_mut();
+            if !z3_sys::Z3_model_eval(self.z3_context, model, ast, false, &mut value_ast)
+                || value_ast.is_null()
+            {
+                return None;
+            }
+            match var_type {
+                ExpressionType::Bool => {
+                    match z3_sys::Z3_get_bool_value(self.z3_context, value_ast) {
+                        z3_sys::Z3_L_TRUE => Some(ConstantDomain::True),
+                        z3_sys::Z3_L_FALSE => Some(ConstantDomain::False),
+                        _ => None,
+                    }
+                }
+                ExpressionType::Char => {
+                    let value = self.get_model_integer(value_ast)?.parse::<u32>().ok()?;
+                    char::from_u32(value).map(ConstantDomain::Char)
+                }
+                t if t.is_signed_integer() => self
+                    .get_model_integer(value_ast)?
+                    .parse::<i128>()
+                    .ok()
+                    .map(ConstantDomain::I128),
+                t if t.is_unsigned_integer() => self
+                    .get_model_integer(value_ast)?
+                    .parse::<u128>()
+                    .ok()
+                    .map(ConstantDomain::U128),
+                _ => None,
+            }
         }
     }
 
@@ -180,6 +239,7 @@ impl SmtSolver<Z3ExpressionType> for Z3Solver {
     fn set_backtrack_position(&self) {
         let _guard = Z3_MUTEX.lock().unwrap();
         unsafe {
+            self.release_cached_model();
             z3_sys::Z3_solver_push(self.z3_context, self.z3_solver);
         }
     }
@@ -188,7 +248,16 @@ impl SmtSolver<Z3ExpressionType> for Z3Solver {
     fn solve(&self) -> SmtResult {
         let _guard = Z3_MUTEX.lock().unwrap();
         unsafe {
-            match z3_sys::Z3_solver_check(self.z3_context, self.z3_solver) {
+            // Invalidate any model cached from a previous solve so stale results cannot be read.
+            // The model is deliberately NOT fetched here: solve() is also used on the
+            // set_backtrack_position/solve/backtrack path, and calling Z3_solver_get_model inside a
+            // pushed scope that is subsequently popped by Z3_solver_pop corrupts Z3's heap and
+            // crashes. The model is instead fetched lazily by the reader methods, which are only
+            // ever called (per the trait contract) after a Satisfiable solve with no intervening
+            // pop, where Z3_solver_get_model is safe.
+            self.release_cached_model();
+            let result = z3_sys::Z3_solver_check(self.z3_context, self.z3_solver);
+            match result {
                 z3_sys::Z3_L_TRUE => SmtResult::Satisfiable,
                 z3_sys::Z3_L_FALSE => SmtResult::Unsatisfiable,
                 _ => SmtResult::Undefined,
@@ -198,6 +267,46 @@ impl SmtSolver<Z3ExpressionType> for Z3Solver {
 }
 
 impl Z3Solver {
+    /// Releases the retained model cached from a previous solve.
+    /// The caller must hold `Z3_MUTEX`.
+    unsafe fn release_cached_model(&self) {
+        let model = self.current_model.replace(std::ptr::null_mut());
+        if !model.is_null() {
+            z3_sys::Z3_model_dec_ref(self.z3_context, model);
+        }
+    }
+
+    /// Returns the model for the most recent solve, retaining it on first use. Models are
+    /// caller-managed even with `Z3_mk_context`; this reference is balanced by
+    /// `release_cached_model`.
+    /// Must only be called after `solve` returned `Satisfiable`. Fetching lazily here — rather
+    /// than inside `solve` — avoids acquiring a model inside a pushed scope that is later popped.
+    /// Mutation methods release the retained model before changing the solver. The caller must
+    /// hold `Z3_MUTEX`.
+    unsafe fn model_for_reading(&self) -> z3_sys::Z3_model {
+        let cached = self.current_model.get();
+        if !cached.is_null() {
+            return cached;
+        }
+        let model = z3_sys::Z3_solver_get_model(self.z3_context, self.z3_solver);
+        if !model.is_null() {
+            z3_sys::Z3_model_inc_ref(self.z3_context, model);
+            self.current_model.set(model);
+        }
+        model
+    }
+
+    unsafe fn get_model_integer(&self, value_ast: z3_sys::Z3_ast) -> Option<&str> {
+        if !z3_sys::Z3_is_numeral_ast(self.z3_context, value_ast) {
+            return None;
+        }
+        let value = z3_sys::Z3_get_numeral_string(self.z3_context, value_ast);
+        if value.is_null() {
+            return None;
+        }
+        CStr::from_ptr(value).to_str().ok()
+    }
+
     fn as_debug_string_helper(&self, expression: Z3ExpressionType) -> String {
         unsafe {
             let debug_str_bytes = z3_sys::Z3_ast_to_string(self.z3_context, expression);
@@ -2175,8 +2284,40 @@ impl Z3Solver {
 
 impl Drop for Z3Solver {
     fn drop(&mut self) {
+        let _guard = Z3_MUTEX.lock().unwrap();
         unsafe {
+            self.release_cached_model();
+            z3_sys::Z3_solver_dec_ref(self.z3_context, self.z3_solver);
             z3_sys::Z3_del_context(self.z3_context);
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::abstract_value::TRUE;
+
+    #[test]
+    fn pushed_sat_queries_do_not_capture_models_before_backtracking() {
+        let solver = Z3Solver::new();
+        let predicate = solver.get_as_smt_predicate(&TRUE.expression);
+
+        for _ in 0..10 {
+            assert_eq!(solver.solve_expression(&predicate), SmtResult::Satisfiable);
+            assert!(solver.current_model.get().is_null());
+        }
+
+        let model_solver = Z3Solver::new();
+        let predicate = model_solver.get_as_smt_predicate(&TRUE.expression);
+        model_solver.assert(&predicate);
+        assert_eq!(model_solver.solve(), SmtResult::Satisfiable);
+        assert!(model_solver.get_model_as_string().is_some());
+        assert!(!model_solver.current_model.get().is_null());
+        assert_eq!(
+            model_solver.solve_expression(&predicate),
+            SmtResult::Satisfiable
+        );
+        assert!(model_solver.current_model.get().is_null());
     }
 }

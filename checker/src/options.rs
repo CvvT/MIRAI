@@ -11,6 +11,17 @@ use itertools::Itertools;
 use mirai_annotations::*;
 use rustc_session::EarlyDiagCtxt;
 
+fn diag_configuration(diag: &str) -> (DiagLevel, bool) {
+    match diag {
+        "default" => (DiagLevel::Default, false),
+        "verify" => (DiagLevel::Verify, false),
+        "library" => (DiagLevel::Library, false),
+        "paranoid" => (DiagLevel::Paranoid, false),
+        "may-complete" => (DiagLevel::Paranoid, true),
+        _ => assume_unreachable!(),
+    }
+}
+
 /// Creates the clap::Command metadata for argument parsing.
 fn make_options_parser(running_test_harness: bool) -> Command {
     // We could put this into lazy_static! with a Mutex around, but we really do not expect
@@ -26,10 +37,10 @@ fn make_options_parser(running_test_harness: bool) -> Command {
         .arg(Arg::new("diag")
             .long("diag")
             .num_args(1)
-            .value_parser(["default", "verify", "library", "paranoid"])
+            .value_parser(["default", "verify", "library", "paranoid", "may-complete"])
             .default_value("default")
             .help("Level of diagnostics.\n")
-            .long_help("With `default`, false positives will be avoided where possible.\nWith 'verify' errors are reported for incompletely analyzed functions.\nWith `paranoid`, all possible errors will be reported.\n"))
+            .long_help("With `default`, false positives will be avoided where possible.\nWith 'verify' errors are reported for incompletely analyzed functions.\nWith `paranoid`, all possible errors will be reported.\nWith `may-complete`, paranoid diagnostics are augmented with a machine-readable coverage manifest.\n"))
         .arg(Arg::new("constant_time")
             .long("constant_time")
             .num_args(1)
@@ -81,6 +92,7 @@ pub struct Options {
     pub single_func: Option<String>,
     pub test_only: bool,
     pub diag_level: DiagLevel,
+    pub may_complete: bool,
     pub constant_time_tag_name: Option<String>,
     pub max_analysis_time_for_body: u64,
     pub max_analysis_time_for_crate: u64,
@@ -181,13 +193,8 @@ impl Options {
             self.single_func = matches.get_one::<String>("single_func").cloned();
         }
         if matches.contains_id("diag") {
-            self.diag_level = match matches.get_one::<String>("diag").unwrap().as_str() {
-                "default" => DiagLevel::Default,
-                "verify" => DiagLevel::Verify,
-                "library" => DiagLevel::Library,
-                "paranoid" => DiagLevel::Paranoid,
-                _ => assume_unreachable!(),
-            };
+            let diag = matches.get_one::<String>("diag").unwrap().as_str();
+            (self.diag_level, self.may_complete) = diag_configuration(diag);
         }
         if running_test_harness
             && !matches!(
@@ -200,6 +207,7 @@ impl Options {
                 self.diag_level = DiagLevel::Library;
             }
         }
+
         if matches.contains_id("constant_time") {
             self.constant_time_tag_name = matches.get_one::<String>("constant_time").cloned();
         }
@@ -213,6 +221,7 @@ impl Options {
                     None => assume_unreachable!(),
                 }
         }
+
         if matches.contains_id("crate_analysis_timeout") {
             self.max_analysis_time_for_crate = match matches
                 .get_one::<String>("crate_analysis_timeout")
@@ -246,5 +255,18 @@ impl Options {
             self.print_summaries = true;
         }
         args[rustc_args_start..].to_vec()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn may_complete_preserves_paranoid_diagnostic_semantics() {
+        let (diag_level, may_complete) = diag_configuration("may-complete");
+
+        assert_eq!(diag_level, DiagLevel::Paranoid);
+        assert!(may_complete);
     }
 }

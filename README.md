@@ -40,10 +40,18 @@ also have found and fixed a few bugs.
 You can use the environment variable `MIRAI_FLAGS` to get cargo to provide command line options to MIRAI. The value is a
 string which can contain any of the following flags:
 
-- `--diag=default|verify|library|paranoid`: configures level of diagnostics. With `default` MIRAI
+- `--diag=default|verify|library|paranoid|may-complete`: configures level of diagnostics. With `default` MIRAI
    will not report errors which are potential 'false positives'. With `verify` it will point out
    functions that may contain such errors. With `library` it will require explicit preconditions.
-   With `paranoid` it will flag any issue that may be an error.
+   With `paranoid` it will flag any issue that may be an error. With `may-complete` it will also
+   emit a machine-readable coverage manifest and return a nonzero status unless complete coverage
+   has been established. Satisfiable existential checks are labeled `abstract_counterexample`.
+   MIRAI structurally extracts scalar assignments only for entry parameter roots; assignments
+   involving locals, call results, projections, or other non-input roots are rejected for replay.
+   It deterministically re-evaluates the certified expression fragment against those inputs and the
+   recorded entry assumptions, without another solver query. MIR execution from the captured entry
+   state and same-site violation observation are not yet implemented, so SAT results still carry a
+   `replay_validation_undecided` coverage gap and are never promoted to a confirmed tier.
 - `--single_func <name>`: the name of a specific function you want to analyze.
 - `--body_analysis_timeout <seconds>`: the maximum number of seconds to spend analyzing a function body.
 - `--call_graph_config <path_to_config>`: path to configuration file for call graph generator (see [Call Graph Generator documentation](documentation/CallGraph.md)). No call graph will be generated if this is not specified.
