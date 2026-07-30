@@ -143,12 +143,17 @@
 //     correctly refuses to invent values, but silence is a KNOWN FALSE NEGATIVE, not evidence that
 //     the branch is unreachable. The real syscall entry accepts caller-controlled `level`/`optname`;
 //     `level = SOL_SOCKET`, `optname = SO_KEEPALIVE`, and a `U32(1)` value reach the branch that
-//     re-enters the same descriptor lock. Closing this missed reachable bug requires sound
-//     entry-replay / callback-argument reconstruction across nested callbacks (scope L, no bounded
-//     safe increment). The default build is not vulnerable: without `mirai_buggy_setsockopt`,
-//     `set_tcp_option` is deferred until after the descriptor write guard is released. Until the
-//     separate entry-replay workstream lands, the buggy-variant row remains XFAIL and
-//     `require_no_descriptor_writer` stays.
+//     re-enters the same descriptor lock. A follow-up measurement replaced BOTTOM with typed
+//     unknowns at fresh boundary paths. That preserved symbolic reachability without diagnostics,
+//     because the retained condition has the form
+//     `!(so == KEEPALIVE && value == U32) || write_held == 0`: with symbolic inputs and
+//     `write_held == 1`, it is unknown rather than definitely false. Thus callback-argument
+//     reconstruction alone cannot close this false negative under MIRAI's must-violation reporting
+//     rule. Doing so requires a separately chartered existential check for satisfiability of
+//     `guard && !precondition`; forcing the guard true would fabricate user input. The default build
+//     is not vulnerable: without `mirai_buggy_setsockopt`, `set_tcp_option` is deferred until after
+//     the descriptor write guard is released. Until an existential checker lands, the buggy-variant
+//     row remains XFAIL and `require_no_descriptor_writer` stays.
 //
 // The `mirai_real_path_tripwire` is a different oracle: it invokes the LiteBox-level proxy
 // contract through the same `&self.litebox` handle and exercises callback-capture representation.
