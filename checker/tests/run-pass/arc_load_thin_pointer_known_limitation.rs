@@ -136,20 +136,19 @@
 //     `write_held` precondition. Regression `custom_mutex_guard_deref_mut_alias.rs` fires its
 //     positive control (`unsatisfied precondition`) and leaves its no-alias negative control inert
 //     (exactly one warning). The two run_mirai_known_limits.ps1 positive controls also fire.
-//   * The SOLE remaining terminal blocker on the generic production row is NOT alias identity and
-//     NOT the incompleteness gate: at the outer `setsockopt_common` callback boundary the read
-//     precondition's branch guards `so`/`value` arrive as user-controlled symbolic `(BOTTOM, BOTTOM)`
-//     (`callback argument could not be represented in summary`). The sound representability predicate
-//     correctly excludes them; INVENTING values for genuinely user-controlled input would be
-//     unsound. This is an entry-replay limitation, NOT proof that sound detection is fundamentally
-//     impossible: on the generic user-controlled root, staying silent is itself SOUND (`optname` is
-//     refined only to `{REUSEADDR, BROADCAST, KEEPALIVE}`, so `so == KEEPALIVE` is never provably
-//     true and firing unconditionally would be a false positive on the non-KEEPALIVE options),
-//     whereas a CONCRETE `KEEPALIVE`/`U32(1)` call would become provable once `so`/`value` bindings
-//     are reconstructed. Closing the generic user-controlled `setsockopt` syscall root therefore
-//     requires sound entry-replay / callback-argument reconstruction across nested callbacks
-//     (scope L, no bounded safe increment). Until that separate workstream lands, this row remains
-//     XFAIL and `require_no_descriptor_writer` stays.
+//   * The SOLE remaining terminal blocker on the feature-gated `mirai_buggy_setsockopt` row is NOT
+//     alias identity and NOT the incompleteness gate: at the outer `setsockopt_common` callback
+//     boundary the read precondition's branch guards `so`/`value` arrive as `(BOTTOM, BOTTOM)`
+//     (`callback argument could not be represented in summary`). The representability predicate
+//     correctly refuses to invent values, but silence is a KNOWN FALSE NEGATIVE, not evidence that
+//     the branch is unreachable. The real syscall entry accepts caller-controlled `level`/`optname`;
+//     `level = SOL_SOCKET`, `optname = SO_KEEPALIVE`, and a `U32(1)` value reach the branch that
+//     re-enters the same descriptor lock. Closing this missed reachable bug requires sound
+//     entry-replay / callback-argument reconstruction across nested callbacks (scope L, no bounded
+//     safe increment). The default build is not vulnerable: without `mirai_buggy_setsockopt`,
+//     `set_tcp_option` is deferred until after the descriptor write guard is released. Until the
+//     separate entry-replay workstream lands, the buggy-variant row remains XFAIL and
+//     `require_no_descriptor_writer` stays.
 //
 // The `mirai_real_path_tripwire` is a different oracle: it invokes the LiteBox-level proxy
 // contract through the same `&self.litebox` handle and exercises callback-capture representation.
