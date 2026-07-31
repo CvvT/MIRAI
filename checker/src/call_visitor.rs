@@ -3867,6 +3867,21 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 });
             let requires_local_lift =
                 parent_callback_anchor.is_some() || callback_path.contains_local_variable(false);
+            // True when the callback closure is defined inside the function currently being
+            // analyzed (its captures resolve to this frame's locals/parameters). Such a closure
+            // is fully discharged here (see `discharge_local_closure` below); lifting it into
+            // this function's own summary would let every outer caller replay it against their
+            // own state and re-report the same obligation, whose violating state originates
+            // entirely within this body. Forwarding frames that merely pass the closure through
+            // (where it is defined in a callee, not here) still lift it so the defining function
+            // can see and discharge it.
+            let closure_defined_in_current_fn = callback_ref
+                .def_id
+                .is_some_and(|def_id| {
+                    self.block_visitor.bv.tcx.is_closure_like(def_id)
+                        && self.block_visitor.bv.tcx.parent(def_id)
+                            == self.block_visitor.bv.def_id
+                });
             let function_upvar_anchor = invocation_has_arc_model_state
                 .then(|| {
                     callback_type.and_then(|callback_type| {
@@ -3894,7 +3909,8 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 && (parent_callback_anchor.is_some()
                     || function_upvar_anchor.is_some()
                     || derived_callee
-                    || callback_path.contains_local_variable(false))
+                    || (callback_path.contains_local_variable(false)
+                        && !(discharge_local_closure && closure_defined_in_current_fn)))
             {
                 let callback_type = callback_type.unwrap_or_else(|| {
                     self.type_visitor()
