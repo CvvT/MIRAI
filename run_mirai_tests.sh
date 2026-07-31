@@ -9,6 +9,11 @@ set -euo pipefail
 repository_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$repository_root"
 
+# This runner builds MIRAI itself. Ignore analysis settings inherited from a
+# prior MIRAI invocation and keep the artifact paths below rooted in this tree.
+unset RUSTC_WORKSPACE_WRAPPER MIRAI_FLAGS MIRAI_LOG MIRAI_SHARE_PERSISTENT_STORE CARGO_TARGET_DIR
+export RUST_SYSROOT="$(rustc --print sysroot)"
+
 cargo build --tests
 cargo test
 
@@ -23,7 +28,7 @@ cargo test
 cargo test -p mirai --test integration_tests run_pass -- --exact
 cargo build -p mirai --bin mirai
 
-sysroot="$(rustc --print sysroot)"
+sysroot="$RUST_SYSROOT"
 annotations="$(find target/debug/deps -maxdepth 1 -type f \
     -name 'libmirai_annotations-*.rlib' -print -quit)"
 if [[ -z "$annotations" ]]; then
