@@ -2085,16 +2085,10 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
         checked_assume!(left_type == right_type);
 
         let environment = &self.block_visitor.bv.current_environment;
-        let mut left =
+        let left =
             Path::new_deref(self.actual_args[0].0.clone(), left_type).canonicalize(environment);
-        let mut right =
+        let right =
             Path::new_deref(self.actual_args[1].0.clone(), right_type).canonicalize(environment);
-        if let Some(value) = environment.value_at(&left) {
-            left = Path::get_as_path(value.clone());
-        }
-        if let Some(value) = environment.value_at(&right) {
-            right = Path::get_as_path(value.clone());
-        }
         let result = if environment.paths_must_alias(&left, &right) {
             Rc::new(abstract_value::FALSE)
         } else {
