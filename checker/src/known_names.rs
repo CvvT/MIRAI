@@ -168,6 +168,8 @@ pub enum KnownNames {
     StdPtrSwapNonOverlapping,
     StdSliceCmpMemcmp,
     StdOpsDerefDeref,
+    // Keep new summary-serialized variants at the end so existing variant indices remain stable.
+    MiraiNotAlias,
 }
 
 /// An analysis lifetime cache that contains a map from def ids to known names.
@@ -237,6 +239,7 @@ fn known_name_for_mirai_annotations(
             "mirai_does_not_have_tag" => KnownNames::MiraiDoesNotHaveTag,
             "mirai_get_model_field" => KnownNames::MiraiGetModelField,
             "mirai_has_tag" => KnownNames::MiraiHasTag,
+            "mirai_not_alias" => KnownNames::MiraiNotAlias,
             "mirai_postcondition" => KnownNames::MiraiPostcondition,
             "mirai_precondition_start" => KnownNames::MiraiPreconditionStart,
             "mirai_precondition" => KnownNames::MiraiPrecondition,

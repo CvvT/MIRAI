@@ -5864,6 +5864,7 @@ impl AbstractValueTrait for Rc<AbstractValue> {
             | Expression::HeapBlock { .. }
             | Expression::HeapBlockLayout { .. }
             | Expression::Reference { .. }
+            | Expression::NotAlias { .. }
             | Expression::UnknownTagCheck { .. } => return TagDomain::empty_set(),
 
             Expression::InitialParameterValue { .. }
@@ -6064,6 +6065,7 @@ impl AbstractValueTrait for Rc<AbstractValue> {
                     .or_else(|| length.get_widened_subexpression(path))
             }),
             Expression::Reference(..) => None,
+            Expression::NotAlias { .. } => None,
             Expression::InitialParameterValue { .. } => None,
             Expression::Switch {
                 discriminator,
@@ -6350,6 +6352,23 @@ impl AbstractValueTrait for Rc<AbstractValue> {
                 .not_equals(
                     right.refine_parameters_and_paths(args, result, pre_env, post_env, fresh),
                 ),
+            Expression::NotAlias { left, right } => {
+                let refined_left =
+                    left.refine_parameters_and_paths(args, result, pre_env, post_env, fresh);
+                let refined_right =
+                    right.refine_parameters_and_paths(args, result, pre_env, post_env, fresh);
+                if post_env.paths_must_alias(&refined_left, &refined_right) {
+                    Rc::new(FALSE)
+                } else {
+                    AbstractValue::make_from(
+                        Expression::NotAlias {
+                            left: refined_left,
+                            right: refined_right,
+                        },
+                        1,
+                    )
+                }
+            }
             Expression::Neg { operand } => operand
                 .refine_parameters_and_paths(args, result, pre_env, post_env, fresh)
                 .negate(),
@@ -6768,6 +6787,7 @@ impl AbstractValueTrait for Rc<AbstractValue> {
             Expression::Ne { left, right } => left
                 .refine_with(path_condition, depth + 1)
                 .not_equals(right.refine_with(path_condition, depth + 1)),
+            Expression::NotAlias { .. } => value,
             Expression::Neg { operand } => operand.refine_with(path_condition, depth + 1).negate(),
             Expression::LogicalNot { operand } => {
                 operand.refine_with(path_condition, depth + 1).logical_not()
@@ -6929,6 +6949,13 @@ impl AbstractValueTrait for Rc<AbstractValue> {
             Expression::Join { left, right } => left
                 .replace_embedded_path_root(old_root, new_root.clone())
                 .join(right.replace_embedded_path_root(old_root, new_root)),
+            Expression::NotAlias { left, right } => AbstractValue::make_from(
+                Expression::NotAlias {
+                    left: left.replace_root(old_root, new_root.clone()),
+                    right: right.replace_root(old_root, new_root),
+                },
+                self.expression_size,
+            ),
             Expression::Offset { left, right } => left
                 .replace_embedded_path_root(old_root, new_root)
                 .offset(right.clone()),
@@ -7229,6 +7256,9 @@ impl AbstractValueTrait for Rc<AbstractValue> {
             | Expression::InitialParameterValue { path, .. }
             | Expression::UnknownTagField { path }
             | Expression::Variable { path, .. } => variables.contains(path),
+            Expression::NotAlias { left, right } => {
+                variables.contains(left) || variables.contains(right)
+            }
             Expression::Switch {
                 discriminator,
                 cases,

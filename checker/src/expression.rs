@@ -431,6 +431,11 @@ pub enum Expression {
         /// all result in the same widened value.
         operand: Rc<AbstractValue>,
     },
+
+    /// True only when the two paths are proven to refer to disjoint runtime locations.
+    ///
+    /// Keep new summary-serialized variants at the end so existing variant indices remain stable.
+    NotAlias { left: Rc<Path>, right: Rc<Path> },
 }
 
 /// Used by Expression::AbstractHeapBlockLayout
@@ -539,6 +544,9 @@ impl Debug for Expression {
             }
             Expression::Ne { left, right } => {
                 f.write_fmt(format_args!("({left:?}) != ({right:?})"))
+            }
+            Expression::NotAlias { left, right } => {
+                f.write_fmt(format_args!("not_alias({left:?}, {right:?})"))
             }
             Expression::Neg { operand } => f.write_fmt(format_args!("-({operand:?})")),
             Expression::Or { left, right } => {
@@ -714,6 +722,10 @@ impl Expression {
             | Expression::UnknownTagCheck { operand, .. } => operand
                 .expression
                 .contains_local_variable(is_post_condition),
+            Expression::NotAlias { left, right } => {
+                left.contains_local_variable(is_post_condition)
+                    || right.contains_local_variable(is_post_condition)
+            }
             Expression::Reference(path) => path.contains_local_variable(is_post_condition),
             Expression::Switch {
                 discriminator,
@@ -816,6 +828,7 @@ impl Expression {
             Expression::Neg { operand }
             | Expression::LogicalNot { operand }
             | Expression::UnknownTagCheck { operand, .. } => operand.expression.contains_top(),
+            Expression::NotAlias { left, right } => left.contains_top() || right.contains_top(),
             Expression::Reference(path) => path.contains_top(),
             Expression::Switch {
                 discriminator,
@@ -877,6 +890,7 @@ impl Expression {
             Expression::Mul { .. } => Some(TagPropagation::Mul),
             Expression::MulOverflows { .. } => Some(TagPropagation::MulOverflows),
             Expression::Ne { .. } => Some(TagPropagation::Ne),
+            Expression::NotAlias { .. } => None,
             Expression::Neg { .. } => Some(TagPropagation::Neg),
             Expression::Or { .. } => Some(TagPropagation::Or),
             Expression::Offset { .. } => Some(TagPropagation::Offset),
@@ -981,6 +995,9 @@ impl Expression {
             | Expression::LogicalNot { operand }
             | Expression::UnknownTagCheck { operand, .. } => {
                 operand.expression.has_tagged_subcomponent(tag, env)
+            }
+            Expression::NotAlias { left, right } => {
+                left.has_tagged_subcomponent(tag, env) || right.has_tagged_subcomponent(tag, env)
             }
             Expression::Reference(path) => path.has_tagged_subcomponent(tag, env),
             Expression::Switch {
@@ -1188,6 +1205,7 @@ impl Expression {
             Expression::Mul { left, .. } => left.expression.infer_type(),
             Expression::MulOverflows { .. } => Bool,
             Expression::Ne { .. } => Bool,
+            Expression::NotAlias { .. } => Bool,
             Expression::Neg { operand } => operand.expression.infer_type(),
             Expression::Or { .. } => Bool,
             Expression::Offset { .. } => ThinPointer,
@@ -1402,6 +1420,10 @@ impl Expression {
             }
             Expression::UnknownTagField { path } => {
                 path.record_heap_blocks_and_strings(result);
+            }
+            Expression::NotAlias { left, right } => {
+                left.record_heap_blocks_and_strings(result);
+                right.record_heap_blocks_and_strings(result);
             }
         }
     }

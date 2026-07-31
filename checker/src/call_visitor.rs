@@ -727,6 +727,10 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 self.handle_check_tag(true);
                 return true;
             }
+            KnownNames::MiraiNotAlias => {
+                self.handle_not_alias();
+                return true;
+            }
             KnownNames::MiraiPostcondition => {
                 checked_assume!(self.actual_args.len() == 3);
                 if self.block_visitor.bv.check_for_errors {
@@ -2061,6 +2065,43 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             .bv
             .current_environment
             .assume_alias(alias_path, source_path);
+        self.use_entry_condition_as_exit_condition();
+    }
+
+    /// Returns false for a proven must-alias pair and otherwise preserves an unknown obligation.
+    fn handle_not_alias(&mut self) {
+        checked_assume!(self.actual_args.len() == 2);
+        checked_assume!(self.actual_argument_types.len() == 2);
+        let left_type = ExpressionType::from(
+            self.type_visitor()
+                .get_dereferenced_type(self.actual_argument_types[0])
+                .kind(),
+        );
+        let right_type = ExpressionType::from(
+            self.type_visitor()
+                .get_dereferenced_type(self.actual_argument_types[1])
+                .kind(),
+        );
+        checked_assume!(left_type == right_type);
+
+        let environment = &self.block_visitor.bv.current_environment;
+        let mut left =
+            Path::new_deref(self.actual_args[0].0.clone(), left_type).canonicalize(environment);
+        let mut right =
+            Path::new_deref(self.actual_args[1].0.clone(), right_type).canonicalize(environment);
+        if let Some(value) = environment.value_at(&left) {
+            left = Path::get_as_path(value.clone());
+        }
+        if let Some(value) = environment.value_at(&right) {
+            right = Path::get_as_path(value.clone());
+        }
+        let result = if environment.paths_must_alias(&left, &right) {
+            Rc::new(abstract_value::FALSE)
+        } else {
+            AbstractValue::make_from(Expression::NotAlias { left, right }, 1)
+        };
+        let target_path = self.block_visitor.visit_rh_place(&self.destination);
+        self.block_visitor.bv.update_value_at(target_path, result);
         self.use_entry_condition_as_exit_condition();
     }
 

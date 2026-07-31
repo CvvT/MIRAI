@@ -1854,6 +1854,10 @@ impl Z3Solver {
                 }
             }
             Expression::Join { left, right } => self.boolean_join(left, right),
+            Expression::NotAlias { .. } => unsafe {
+                let symbol = self.get_symbol_for(expression);
+                z3_sys::Z3_mk_const(self.z3_context, symbol, self.bool_sort)
+            },
             Expression::Reference(path) => unsafe {
                 let path_symbol = self.get_symbol_for(path);
                 z3_sys::Z3_mk_const(self.z3_context, path_symbol, self.bool_sort)

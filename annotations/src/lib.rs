@@ -441,6 +441,20 @@ macro_rules! assumed_alias {
     };
 }
 
+/// Returns false when MIRAI can prove that the two referenced pointer-like values alias.
+///
+/// Until MIRAI can prove that the values are disjoint, all other results remain unknown.
+#[macro_export]
+macro_rules! not_alias {
+    ($left:expr, $right:expr) => {
+        if cfg!(mirai) {
+            mirai_annotations::mirai_not_alias($left, $right)
+        } else {
+            true
+        }
+    };
+}
+
 /// Equivalent to the standard assert! when used with an unmodified Rust compiler.
 /// When compiled with MIRAI, this causes MIRAI to verify the condition at the
 /// point where it appears in a function, but to also add it a postcondition that can
@@ -1177,6 +1191,12 @@ pub fn mirai_assume(_condition: bool) {}
 // Helper function for MIRAI. Should only be called via the assumed_alias macro.
 #[doc(hidden)]
 pub fn mirai_assume_alias<T: ?Sized>(_alias: &T, _source: &T) {}
+
+// Helper function for MIRAI. Should only be called via the not_alias macro.
+#[doc(hidden)]
+pub fn mirai_not_alias<T: ?Sized>(_left: &T, _right: &T) -> bool {
+    true
+}
 
 // Helper function for MIRAI. Should only be called via the assume_precondition macro.
 #[doc(hidden)]

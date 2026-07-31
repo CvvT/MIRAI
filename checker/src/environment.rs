@@ -147,6 +147,45 @@ impl Environment {
         self.assumed_aliases.insert(relationship);
     }
 
+    /// Returns true if the two paths are identical after applying must-alias relationships.
+    pub fn paths_must_alias(&self, left: &Rc<Path>, right: &Rc<Path>) -> bool {
+        fn canonicalize(env: &Environment, path: Rc<Path>) -> Rc<Path> {
+            let mut result = path;
+            let mut visited = HashSet::new();
+            let mut aliases: Vec<_> = env
+                .assumed_aliases
+                .iter()
+                .filter(|(alias, source)| !source.is_rooted_by(alias))
+                .collect();
+            aliases.sort_by(|(left_alias, left_source), (right_alias, right_source)| {
+                left_alias
+                    .cmp(right_alias)
+                    .then_with(|| left_source.cmp(right_source))
+            });
+            while visited.insert(result.clone()) {
+                let mut best: Option<(&Rc<Path>, &Rc<Path>)> = None;
+                for (alias, source) in &aliases {
+                    if result != *alias && !result.is_rooted_by(alias) {
+                        continue;
+                    }
+                    if best
+                        .as_ref()
+                        .is_none_or(|(current, _)| alias.is_rooted_by(current))
+                    {
+                        best = Some((alias, source));
+                    }
+                }
+                let Some((alias, source)) = best else {
+                    break;
+                };
+                result = result.replace_root(alias, source.clone());
+            }
+            result
+        }
+
+        canonicalize(self, left.clone()) == canonicalize(self, right.clone())
+    }
+
     /// Records an alias relationship that holds when condition is true.
     pub fn assume_alias_if(
         &mut self,
@@ -1113,6 +1152,43 @@ mod tests {
             .iter()
             .any(|(alias, source)| alias.is_rooted_by(&moved_from)
                 || source.is_rooted_by(&moved_from)));
+    }
+
+    #[test]
+    fn must_alias_canonicalization_is_independent_of_insertion_order() {
+        let alias = Path::new_local(1, 0);
+        let nested_alias = Path::new_qualified(alias.clone(), Rc::new(PathSelector::Field(0)));
+        let shallow_source = Path::new_local(2, 0);
+        let nested_source = Path::new_local(3, 0);
+        let queried = Path::new_qualified(nested_alias.clone(), Rc::new(PathSelector::Field(1)));
+        let expected = Path::new_qualified(nested_source.clone(), Rc::new(PathSelector::Field(1)));
+
+        for relationships in [
+            [
+                (alias.clone(), shallow_source.clone()),
+                (nested_alias.clone(), nested_source.clone()),
+            ],
+            [
+                (nested_alias.clone(), nested_source.clone()),
+                (alias.clone(), shallow_source.clone()),
+            ],
+        ] {
+            let mut environment = Environment::default();
+            for (alias, source) in relationships {
+                environment.assume_alias(alias, source);
+            }
+            assert!(environment.paths_must_alias(&queried, &expected));
+        }
+    }
+
+    #[test]
+    fn must_alias_canonicalization_ignores_expanding_alias() {
+        let alias = Path::new_local(1, 0);
+        let expanding_source = Path::new_qualified(alias.clone(), Rc::new(PathSelector::Field(0)));
+        let mut environment = Environment::default();
+        environment.assume_alias(alias.clone(), expanding_source);
+
+        assert!(environment.paths_must_alias(&alias, &alias));
     }
 
     #[test]
