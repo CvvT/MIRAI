@@ -147,6 +147,12 @@ impl MiraiCallbacks {
             }
             return;
         }
+        if self.options.print_summary_keys {
+            for local_def_id in tcx.hir_body_owners() {
+                println!("{}", utils::summary_key_str(tcx, local_def_id.to_def_id()));
+            }
+            return;
+        }
         let output_dir = String::from(self.output_directory.to_str().expect("valid string"));
         let summary_store_path = if std::env::var("MIRAI_SHARE_PERSISTENT_STORE").is_ok() {
             output_dir

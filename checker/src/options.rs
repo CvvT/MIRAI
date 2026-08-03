@@ -72,10 +72,22 @@ fn make_options_parser(running_test_harness: bool) -> Command {
             .long("print_function_names")
             .num_args(0)
             .help("Just print out the signatures of functions in the crate"))
+        .arg(Arg::new("print_summary_keys")
+            .long("print_summary_keys")
+            .num_args(0)
+            .help("Just print out the canonical summary keys of functions in the crate"))
         .arg(Arg::new("print_summaries")
             .long("print_summaries")
             .num_args(0)
-            .help("Print out function summaries (work in progress)"));
+            .help("Print out function summaries (work in progress)"))
+        .arg(Arg::new("print_summaries_full")
+            .long("print_summaries_full")
+            .num_args(0)
+            .help("Print out complete function summaries as JSON"))
+        .arg(Arg::new("print_summaries_readable")
+            .long("print_summaries_readable")
+            .num_args(0)
+            .help("Print out complete function summaries with readable paths and values"));
     if running_test_harness {
         parser = parser.arg(Arg::new("test_only")
             .long("test_only")
@@ -99,7 +111,10 @@ pub struct Options {
     pub statistics: bool,
     pub call_graph_config: Option<String>,
     pub print_function_names: bool,
+    pub print_summary_keys: bool,
     pub print_summaries: bool,
+    pub print_summaries_full: bool,
+    pub print_summaries_readable: bool,
 }
 
 /// Represents diag level.
@@ -249,10 +264,28 @@ impl Options {
             self.print_function_names = true;
         }
         if !matches!(
+            matches.value_source("print_summary_keys"),
+            Some(ValueSource::DefaultValue)
+        ) {
+            self.print_summary_keys = true;
+        }
+        if !matches!(
             matches.value_source("print_summaries"),
             Some(ValueSource::DefaultValue)
         ) {
             self.print_summaries = true;
+        }
+        if !matches!(
+            matches.value_source("print_summaries_full"),
+            Some(ValueSource::DefaultValue)
+        ) {
+            self.print_summaries_full = true;
+        }
+        if !matches!(
+            matches.value_source("print_summaries_readable"),
+            Some(ValueSource::DefaultValue)
+        ) {
+            self.print_summaries_readable = true;
         }
         args[rustc_args_start..].to_vec()
     }

@@ -233,6 +233,8 @@ impl<'compilation> CrateVisitor<'compilation, '_> {
         if matches!(kind, rustc_hir::def::DefKind::Static { .. })
             || utils::is_foreign_contract(self.tcx, def_id)
             || self.options.print_summaries
+            || self.options.print_summaries_full
+            || self.options.print_summaries_readable
         {
             self.summary_cache
                 .set_summary_for(def_id, self.tcx, summary);
@@ -391,6 +393,16 @@ impl<'compilation> CrateVisitor<'compilation, '_> {
     }
 
     pub fn print_summaries(&mut self) {
+        if self.options.print_summaries_readable {
+            let summaries = self.summary_cache.get_readable_summaries(self.tcx);
+            print!("{}", summaries.to_json());
+            return;
+        }
+        if self.options.print_summaries_full {
+            let summaries = self.summary_cache.get_full_summaries(self.tcx);
+            print!("{}", summaries.to_json());
+            return;
+        }
         if !self.options.print_summaries {
             return;
         }

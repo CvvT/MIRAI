@@ -1051,40 +1051,7 @@ impl<'tcx> SummaryCache<'tcx> {
         let mut entries = Vec::new();
         for (key, value) in self.def_id_cache.iter() {
             let fully_qualified_name = self.key_cache.get(key).unwrap().to_string();
-            let file_name;
-            let source;
-            if tcx.is_mir_available(*key) {
-                let mir = if tcx.is_const_fn(*key) {
-                    tcx.mir_for_ctfe(*key)
-                } else {
-                    let instance = rustc_middle::ty::InstanceKind::Item(*key);
-                    tcx.instance_mir(instance)
-                };
-                file_name = source_map.span_to_filename(mir.span).into_local_path();
-                source = source_map
-                    .span_to_snippet(mir.span)
-                    .ok()
-                    .unwrap_or_default();
-            } else {
-                let span = tcx.def_span(*key);
-                file_name = source_map.span_to_filename(span).into_local_path();
-                source = source_map.span_to_snippet(span).ok().unwrap_or_default();
-            }
-            let mut path = None;
-            if let Some(mut p) = file_name {
-                if p.is_absolute() {
-                    p = p
-                        .strip_prefix(current_dir().unwrap_or_default())
-                        .unwrap_or(&p)
-                        .to_path_buf();
-                    if p.is_absolute() {
-                        let sysroot = utils::find_sysroot();
-                        let rel = p.strip_prefix(sysroot).unwrap_or(&p);
-                        p = PathBuf::from("/").join(rel).to_path_buf();
-                    }
-                }
-                path = Some(p.to_string_lossy().to_string());
-            }
+            let (path, source) = Self::get_source(tcx, *key);
             let mut calls = vec![];
             if let Some(call_vec) = call_site_per_def_id.get(key) {
                 for (span, def_id) in call_vec.iter() {
@@ -1094,13 +1061,84 @@ impl<'tcx> SummaryCache<'tcx> {
                 }
             };
             entries.push((
-                path.unwrap_or_default(),
+                path,
                 fully_qualified_name,
                 source,
                 LLMSummary::from_summary(value, calls),
             ));
         }
         SummariesForLLM { entries }
+    }
+
+    pub fn get_full_summaries(&self, tcx: TyCtxt) -> FullSummaries {
+        let entries = self
+            .def_id_cache
+            .iter()
+            .map(|(def_id, summary)| {
+                let (path, source) = Self::get_source(tcx, *def_id);
+                let fully_qualified_name = self.key_cache.get(def_id).unwrap().to_string();
+                (path, fully_qualified_name, source, summary.clone())
+            })
+            .collect();
+        FullSummaries { entries }
+    }
+
+    pub fn get_readable_summaries(&self, tcx: TyCtxt) -> ReadableSummaries {
+        let entries = self
+            .def_id_cache
+            .iter()
+            .map(|(def_id, summary)| {
+                let (path, source) = Self::get_source(tcx, *def_id);
+                let fully_qualified_name = self.key_cache.get(def_id).unwrap().to_string();
+                (
+                    path,
+                    fully_qualified_name,
+                    source,
+                    ReadableSummary::from(summary),
+                )
+            })
+            .collect();
+        ReadableSummaries { entries }
+    }
+
+    fn get_source(tcx: TyCtxt, def_id: DefId) -> (String, String) {
+        let source_map = tcx.sess.source_map();
+        let (file_name, source) = if tcx.is_mir_available(def_id) {
+            let mir = if tcx.is_const_fn(def_id) {
+                tcx.mir_for_ctfe(def_id)
+            } else {
+                let instance = rustc_middle::ty::InstanceKind::Item(def_id);
+                tcx.instance_mir(instance)
+            };
+            (
+                source_map.span_to_filename(mir.span).into_local_path(),
+                source_map
+                    .span_to_snippet(mir.span)
+                    .ok()
+                    .unwrap_or_default(),
+            )
+        } else {
+            let span = tcx.def_span(def_id);
+            (
+                source_map.span_to_filename(span).into_local_path(),
+                source_map.span_to_snippet(span).ok().unwrap_or_default(),
+            )
+        };
+        let Some(mut path) = file_name else {
+            return (String::new(), source);
+        };
+        if path.is_absolute() {
+            path = path
+                .strip_prefix(current_dir().unwrap_or_default())
+                .unwrap_or(&path)
+                .to_path_buf();
+            if path.is_absolute() {
+                let sysroot = utils::find_sysroot();
+                let relative_path = path.strip_prefix(sysroot).unwrap_or(&path);
+                path = PathBuf::from("/").join(relative_path);
+            }
+        }
+        (path.to_string_lossy().to_string(), source)
     }
 
     /// Returns (and caches) a string that uniquely identifies a definition to serve as a key to
@@ -1346,6 +1384,57 @@ impl<'tcx> SummaryCache<'tcx> {
 pub struct SummariesForLLM {
     // (source path, fully qualified function name, function source, summary)
     entries: Vec<(String, String, String, LLMSummary)>,
+}
+
+#[derive(Serialize)]
+pub struct FullSummaries {
+    // (source path, fully qualified function name, function source, summary)
+    entries: Vec<(String, String, String, Summary)>,
+}
+
+#[derive(Serialize)]
+pub struct ReadableSummaries {
+    // (source path, fully qualified function name, function source, summary)
+    entries: Vec<(String, String, String, ReadableSummary)>,
+}
+
+#[derive(Serialize)]
+pub struct ReadableSummary {
+    is_computed: bool,
+    is_incomplete: bool,
+    preconditions: Vec<ReadablePrecondition>,
+    assumed_aliases: Vec<ReadableAlias>,
+    guarded_aliases: Vec<ReadableGuardedAlias>,
+    side_effects: Vec<ReadableEffect>,
+    post_condition: Option<String>,
+    callback_invocations: Vec<String>,
+    incomplete_model_state: Vec<ReadableEffect>,
+}
+
+#[derive(Serialize)]
+pub struct ReadablePrecondition {
+    condition: String,
+    message: String,
+    provenance: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct ReadableAlias {
+    left: String,
+    right: String,
+}
+
+#[derive(Serialize)]
+pub struct ReadableGuardedAlias {
+    left: String,
+    right: String,
+    condition: String,
+}
+
+#[derive(Serialize)]
+pub struct ReadableEffect {
+    path: String,
+    value: String,
 }
 
 #[cfg(test)]
@@ -1612,6 +1701,74 @@ impl SummariesForLLM {
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(&self).unwrap()
     }
+}
+
+impl FullSummaries {
+    pub fn to_json(&self) -> String {
+        serde_json::to_string_pretty(&self).unwrap()
+    }
+}
+
+impl ReadableSummaries {
+    pub fn to_json(&self) -> String {
+        serde_json::to_string_pretty(&self).unwrap()
+    }
+}
+
+impl From<&Summary> for ReadableSummary {
+    fn from(summary: &Summary) -> Self {
+        Self {
+            is_computed: summary.is_computed,
+            is_incomplete: summary.is_incomplete,
+            preconditions: summary
+                .preconditions
+                .iter()
+                .map(|precondition| ReadablePrecondition {
+                    condition: format!("{:?}", precondition.condition),
+                    message: precondition.message.to_string(),
+                    provenance: precondition.provenance.as_deref().map(str::to_owned),
+                })
+                .collect(),
+            assumed_aliases: summary
+                .assumed_aliases
+                .iter()
+                .map(|(left, right)| ReadableAlias {
+                    left: format!("{left:?}"),
+                    right: format!("{right:?}"),
+                })
+                .collect(),
+            guarded_aliases: summary
+                .guarded_aliases
+                .iter()
+                .map(|(left, right, condition)| ReadableGuardedAlias {
+                    left: format!("{left:?}"),
+                    right: format!("{right:?}"),
+                    condition: format!("{condition:?}"),
+                })
+                .collect(),
+            side_effects: readable_effects(&summary.side_effects),
+            post_condition: summary
+                .post_condition
+                .as_ref()
+                .map(|condition| format!("{condition:?}")),
+            callback_invocations: summary
+                .callback_invocations
+                .iter()
+                .map(|invocation| format!("{invocation:#?}"))
+                .collect(),
+            incomplete_model_state: readable_effects(&summary.incomplete_model_state),
+        }
+    }
+}
+
+fn readable_effects(effects: &[(Rc<Path>, Rc<AbstractValue>)]) -> Vec<ReadableEffect> {
+    effects
+        .iter()
+        .map(|(path, value)| ReadableEffect {
+            path: format!("{path:?}"),
+            value: format!("{value:?}"),
+        })
+        .collect()
 }
 
 #[derive(Serialize)]
