@@ -1441,7 +1441,7 @@ impl ConstantDomain {
             if let ConstantDomain::U128(val) = self_as_u128 {
                 match target_type {
                     ExpressionType::Char => unsafe {
-                        ConstantDomain::Char(std::mem::transmute::<u32, char>(val as u32))
+                        ConstantDomain::Char(char::from_u32_unchecked(val as u32))
                     },
                     ExpressionType::U8 => ConstantDomain::U128((val as u8) as u128),
                     ExpressionType::U16 => ConstantDomain::U128((val as u16) as u128),

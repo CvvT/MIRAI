@@ -2074,7 +2074,6 @@ impl AbstractValueTrait for Rc<AbstractValue> {
 
     /// Returns an element that is "self.cmp(other)".
     #[logfn_inputs(TRACE)]
-    #[must_use]
     fn compare(&self, other: Self) -> Self {
         let zero = Rc::new(ConstantDomain::I128(0).into());
         let one = Rc::new(ConstantDomain::I128(1).into());
