@@ -1407,8 +1407,23 @@ pub struct ReadableSummary {
     guarded_aliases: Vec<ReadableGuardedAlias>,
     side_effects: Vec<ReadableEffect>,
     post_condition: Option<String>,
-    callback_invocations: Vec<String>,
+    callback_invocations: Vec<ReadableCallbackInvocation>,
     incomplete_model_state: Vec<ReadableEffect>,
+}
+
+#[derive(Serialize)]
+pub struct ReadableCallbackInvocation {
+    callee: String,
+    arguments: Vec<ReadableEffect>,
+    arguments_complete: bool,
+    pre_state: Vec<ReadableEffect>,
+    pre_aliases: Vec<ReadableAlias>,
+    pre_guarded_aliases: Vec<ReadableGuardedAlias>,
+    guard: String,
+    specialized_callee: Option<String>,
+    function_constants: Vec<String>,
+    is_local: bool,
+    carrier_id: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -1553,6 +1568,36 @@ mod tests {
 
         assert_eq!(invocation.callee, callee);
         assert_eq!(invocation.carrier_id, None);
+    }
+
+    #[test]
+    fn readable_callback_invocations_are_structured_json() {
+        let invocation = CallbackInvocation {
+            callee: Path::new_parameter(2),
+            arguments: vec![(Path::new_parameter(1), Rc::new(42_u128.into()))],
+            arguments_complete: true,
+            pre_state: Vec::new(),
+            pre_aliases: Vec::new(),
+            pre_guarded_aliases: Vec::new(),
+            guard: Rc::new(abstract_value::TRUE),
+            specialized_callee: None,
+            function_constants: Vec::new(),
+            is_local: false,
+            carrier_id: Some(7),
+            state_rekeys: vec![(Path::new_parameter(3), Rc::new(1_u128.into()))],
+        };
+        let readable = super::ReadableSummary::from(&Summary {
+            callback_invocations: vec![invocation],
+            ..Summary::default()
+        });
+
+        let value = serde_json::to_value(readable).unwrap();
+        let callback = &value["callback_invocations"][0];
+        assert!(callback.is_object());
+        assert_eq!(callback["callee"], "param_2");
+        assert_eq!(callback["arguments"][0]["path"], "param_1");
+        assert_eq!(callback["carrier_id"], 7);
+        assert!(callback.get("state_rekeys").is_none());
     }
 
     #[test]
@@ -1754,9 +1799,49 @@ impl From<&Summary> for ReadableSummary {
             callback_invocations: summary
                 .callback_invocations
                 .iter()
-                .map(|invocation| format!("{invocation:#?}"))
+                .map(ReadableCallbackInvocation::from)
                 .collect(),
             incomplete_model_state: readable_effects(&summary.incomplete_model_state),
+        }
+    }
+}
+
+impl From<&CallbackInvocation> for ReadableCallbackInvocation {
+    fn from(invocation: &CallbackInvocation) -> Self {
+        Self {
+            callee: format!("{:?}", invocation.callee),
+            arguments: readable_effects(&invocation.arguments),
+            arguments_complete: invocation.arguments_complete,
+            pre_state: readable_effects(&invocation.pre_state),
+            pre_aliases: invocation
+                .pre_aliases
+                .iter()
+                .map(|(left, right)| ReadableAlias {
+                    left: format!("{left:?}"),
+                    right: format!("{right:?}"),
+                })
+                .collect(),
+            pre_guarded_aliases: invocation
+                .pre_guarded_aliases
+                .iter()
+                .map(|(left, right, condition)| ReadableGuardedAlias {
+                    left: format!("{left:?}"),
+                    right: format!("{right:?}"),
+                    condition: format!("{condition:?}"),
+                })
+                .collect(),
+            guard: format!("{:?}", invocation.guard),
+            specialized_callee: invocation
+                .specialized_callee
+                .as_ref()
+                .map(|callee| format!("{callee:?}")),
+            function_constants: invocation
+                .function_constants
+                .iter()
+                .map(|function| format!("{function:?}"))
+                .collect(),
+            is_local: invocation.is_local,
+            carrier_id: invocation.carrier_id,
         }
     }
 }
