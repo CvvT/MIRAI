@@ -524,7 +524,7 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                             self.block_visitor.bv.tcx,
                         ));
                 if self.unresolved_callback_argument
-                    && !Self::retained_callbacks_are_specialized(&result)
+                    && !Self::retained_callback_callees_are_anchored(&result)
                 {
                     self.report_unresolvable_callback();
                 }
@@ -559,7 +559,7 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                             self.block_visitor.bv.tcx,
                         ));
                 if self.unresolved_callback_argument
-                    && !Self::retained_callbacks_are_specialized(&summary)
+                    && !Self::retained_callback_callees_are_anchored(&summary)
                 {
                     self.report_unresolvable_callback();
                 }
@@ -1858,6 +1858,9 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                         }
                         indirect_call_visitor
                             .block_visitor
+                            .deduplicate_last_callback_invocation();
+                        indirect_call_visitor
+                            .block_visitor
                             .bv
                             .assume_preconditions_of_next_call = true;
                     }
@@ -1875,6 +1878,38 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                     self.report_incomplete_summary(&summary);
                     self.callee_def_id = saved_callee_def_id;
                 }
+                return;
+            }
+        }
+        if callee_func_ref.is_none() {
+            checked_assume!(self.actual_argument_types.len() == 2);
+            let callee_ty = self.actual_argument_types[0];
+            let callee_arg_array_path = self.actual_args[1].0.clone();
+            let mut actual_args: Vec<(Rc<Path>, Rc<AbstractValue>)> =
+                if let TyKind::Tuple(tuple_types) = self.actual_argument_types[1].kind() {
+                    tuple_types
+                        .iter()
+                        .enumerate()
+                        .map(|(index, ty)| {
+                            let path = Path::new_field(callee_arg_array_path.clone(), index)
+                                .canonicalize(&self.block_visitor.bv.current_environment);
+                            let value = self
+                                .block_visitor
+                                .bv
+                                .lookup_path_and_refine_result(path.clone(), ty);
+                            (path, value)
+                        })
+                        .collect()
+                } else {
+                    assume_unreachable!("expected second type argument to be a tuple type");
+                };
+            actual_args.insert(0, self.actual_args[0].clone());
+            let callee_path = Path::get_as_path(callee.clone());
+            if self
+                .block_visitor
+                .record_callback_invocation(callee_path, callee_ty, &actual_args)
+            {
+                self.handle_abstract_value();
                 return;
             }
         }
@@ -3206,7 +3241,7 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
     #[logfn_inputs(TRACE)]
     pub fn report_incomplete_summary(&mut self, function_summary: &Summary) {
         if self.unresolved_callback_argument
-            && !Self::retained_callbacks_are_specialized(function_summary)
+            && !Self::retained_callback_callees_are_anchored(function_summary)
         {
             self.report_unresolvable_callback();
             return;
@@ -3421,7 +3456,8 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             return;
         }
         let diagnostics_before_replay = self.block_visitor.bv.buffered_diagnostics.len();
-        let mut callback_analysis_is_incomplete = false;
+        let mut incomplete_callback_dependencies = Vec::new();
+        let mut covered_nested_callbacks = Vec::new();
         let outer_environment = self.block_visitor.bv.current_environment.clone();
         let no_result = None;
         for invocation in &function_summary.callback_invocations {
@@ -3482,6 +3518,28 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                     Rc::new(ConstantDomain::Function(specialized_callee.clone()).into())
                 } else {
                     trace!("captured callback path did not resolve to a function");
+                    if self.defer_forwarded_callback(
+                        invocation,
+                        parent_callback_anchor.as_ref(),
+                        &outer_environment,
+                    ) {
+                        continue;
+                    }
+                    let has_single_callable_upvar =
+                        self.callback_has_single_callable_upvar(argument_index);
+                    let is_anchored_self_relay =
+                        parent_callback_anchor.as_ref().is_some_and(|anchor| {
+                            invocation.arguments_complete
+                                && invocation.callee == *anchor
+                                && has_single_callable_upvar
+                        });
+                    if (parent_callback_anchor.is_none()
+                        && (self.has_retained_specialization_for_current_callback()
+                            || has_single_callable_upvar))
+                        || is_anchored_self_relay
+                    {
+                        continue;
+                    }
                     self.report_unresolvable_callback();
                     continue;
                 };
@@ -3496,6 +3554,16 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             };
             let Some(callback_ref) = callback_ref else {
                 trace!("callback argument did not resolve to a function");
+                if self.defer_forwarded_callback(
+                    invocation,
+                    parent_callback_anchor.as_ref(),
+                    &outer_environment,
+                ) {
+                    continue;
+                }
+                if self.callback_value_is_boundary_parameter(&callback_value, &outer_environment) {
+                    continue;
+                }
                 self.report_unresolvable_callback();
                 continue;
             };
@@ -3585,10 +3653,28 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 self.report_unresolvable_callback();
                 continue;
             }
+            let nested_carriers: Vec<_> = if invocation.specialized_callee.is_some() {
+                callback_summary
+                    .callback_invocations
+                    .iter()
+                    .filter_map(|nested| nested.carrier_id)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let mut replay_invocation = invocation.clone();
+            if callback_value.is_function() {
+                if let Some((path, value)) = replay_invocation.arguments.first_mut() {
+                    if value.is_bottom() {
+                        *path = callback_path.clone();
+                        *value = callback_value.clone();
+                    }
+                }
+            }
             if !invocation.arguments_complete {
                 let (analysis_is_incomplete, dependency_was_removed) =
                     Self::remove_unavailable_argument_dependencies(
-                        invocation,
+                        &replay_invocation,
                         &mut callback_summary,
                     );
                 if dependency_was_removed {
@@ -3598,10 +3684,10 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                     );
                 }
                 if analysis_is_incomplete && self.block_visitor.bv.check_for_errors {
-                    callback_analysis_is_incomplete = true;
+                    incomplete_callback_dependencies.push(invocation.clone());
                 }
             }
-            let mut callback_arguments: Vec<(Rc<Path>, Rc<AbstractValue>)> = invocation
+            let mut callback_arguments: Vec<(Rc<Path>, Rc<AbstractValue>)> = replay_invocation
                 .arguments
                 .iter()
                 .enumerate()
@@ -3637,8 +3723,11 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 })
                 .collect();
             if let Some((path, value)) = callback_arguments.first_mut() {
-                if value.is_function() {
+                if value.is_function() || callback_value.is_function() {
                     *path = callback_path.clone();
+                    if value.is_bottom() {
+                        *value = callback_value.clone();
+                    }
                 }
             }
             let mut callback_environment = outer_environment.clone();
@@ -3739,6 +3828,14 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             let invocation_has_arc_model_state = refined_model_state
                 .iter()
                 .any(|(path, _)| self.is_arc_projected_model_field(path));
+            let forwards_captured_callback =
+                callback_summary
+                    .callback_invocations
+                    .iter()
+                    .any(|invocation| {
+                        invocation.callee.get_parameter_root_ordinal() == Some(1)
+                            && invocation.callee != Path::new_parameter(1)
+                    });
             if !invocation_has_arc_model_state && !callback_summary.preconditions.is_empty() {
                 if let Some(carriers) = invocation
                     .carrier_id
@@ -3853,8 +3950,16 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 && callback_type.is_some_and(|callback_type| {
                     let callback_type = self.type_visitor().get_dereferenced_type(callback_type);
                     if let TyKind::Closure(_, closure_args) = callback_type.kind() {
-                        let upvar_count = closure_args.as_closure().upvar_tys().len();
+                        let upvar_tys = closure_args.as_closure().upvar_tys();
+                        let upvar_count = upvar_tys.len();
                         upvar_count > 0
+                            && upvar_tys.iter().all(|upvar_ty| {
+                                let upvar_ty = self.type_visitor().specialize_type(
+                                    upvar_ty,
+                                    &self.type_visitor().generic_argument_map,
+                                );
+                                !utils::contains_function(upvar_ty, self.block_visitor.bv.tcx)
+                            })
                             && (0..upvar_count).all(|field| {
                                 let field_path = Path::new_field(callback_path.clone(), field);
                                 self.block_visitor
@@ -3871,11 +3976,14 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 });
             let requires_local_lift =
                 parent_callback_anchor.is_some() || callback_path.contains_local_variable(false);
-            let function_upvar_anchor = invocation_has_arc_model_state
+            let function_upvar_anchor = (invocation_has_arc_model_state
+                || forwards_captured_callback)
                 .then(|| {
                     callback_type.and_then(|callback_type| {
-                        self.block_visitor
-                            .find_single_function_upvar_parameter(callback_type)
+                        self.block_visitor.find_single_function_upvar_parameter(
+                            callback_type,
+                            forwards_captured_callback,
+                        )
                     })
                 })
                 .flatten();
@@ -3896,7 +4004,7 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 });
             if !lifted_callback
                 && (parent_callback_anchor.is_some()
-                    || function_upvar_anchor.is_some()
+                    || (function_upvar_anchor.is_some() && !forwards_captured_callback)
                     || derived_callee
                     || (callback_path.contains_local_variable(false) && !discharge_local_closure))
             {
@@ -3972,8 +4080,10 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 .flatten();
             let rewrapped_callback_anchor = if lifted_callback_anchor.is_none() {
                 callback_type.and_then(|callback_type| {
-                    self.block_visitor
-                        .find_single_function_upvar_parameter(callback_type)
+                    self.block_visitor.find_single_function_upvar_parameter(
+                        callback_type,
+                        forwards_captured_callback,
+                    )
                 })
             } else {
                 None
@@ -4047,13 +4157,155 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 }
             }
             self.block_visitor.bv.current_environment = outer_environment.clone();
+            if !nested_carriers.is_empty() {
+                covered_nested_callbacks.extend(
+                    self.block_visitor
+                        .bv
+                        .callback_invocations
+                        .iter()
+                        .filter(|nested| {
+                            nested
+                                .carrier_id
+                                .is_some_and(|carrier| nested_carriers.contains(&carrier))
+                                && nested.callee == invocation.callee
+                        })
+                        .cloned(),
+                );
+            }
         }
+        let callback_analysis_is_incomplete =
+            incomplete_callback_dependencies.iter().any(|dependency| {
+                !covered_nested_callbacks.iter().any(|covered| {
+                    dependency.carrier_id.is_some()
+                        && dependency.carrier_id == covered.carrier_id
+                        && dependency.callee == covered.callee
+                        && dependency.pre_state == covered.pre_state
+                        && dependency.pre_aliases == covered.pre_aliases
+                        && dependency.pre_guarded_aliases == covered.pre_guarded_aliases
+                        && dependency.guard == covered.guard
+                        && dependency.is_local == covered.is_local
+                        && dependency.state_rekeys == covered.state_rekeys
+                })
+            });
         if callback_analysis_is_incomplete {
             self.block_visitor.bv.analysis_is_incomplete = true;
             if self.block_visitor.bv.buffered_diagnostics.len() == diagnostics_before_replay {
                 self.report_unrepresentable_callback_argument();
             }
         }
+    }
+
+    fn defer_forwarded_callback(
+        &mut self,
+        invocation: &CallbackInvocation,
+        parent_callback_anchor: Option<&Rc<Path>>,
+        outer_environment: &Environment,
+    ) -> bool {
+        let Some(anchor) = parent_callback_anchor else {
+            return false;
+        };
+        if !invocation.pre_state.is_empty()
+            || !invocation.pre_aliases.is_empty()
+            || !invocation.pre_guarded_aliases.is_empty()
+            || invocation.guard.as_bool_if_known() != Some(true)
+        {
+            return false;
+        }
+        let Some(ordinal) = anchor.get_parameter_root_ordinal() else {
+            return false;
+        };
+        if ordinal == 0 || ordinal > self.block_visitor.bv.mir.arg_count {
+            return false;
+        }
+        let callback_type = self.type_visitor().get_loc_ty(mir::Local::from(ordinal));
+        let no_result = None;
+        let callback_arguments = invocation
+            .arguments
+            .iter()
+            .map(|(path, value)| {
+                (
+                    path.refine_parameters_and_paths(
+                        &self.actual_args,
+                        &no_result,
+                        &self.environment_before_call,
+                        outer_environment,
+                        self.block_visitor.bv.fresh_variable_offset,
+                    ),
+                    value.refine_parameters_and_paths(
+                        &self.actual_args,
+                        &no_result,
+                        &self.environment_before_call,
+                        outer_environment,
+                        self.block_visitor.bv.fresh_variable_offset,
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        self.block_visitor.record_transitive_callback_invocation(
+            anchor.clone(),
+            callback_type,
+            &callback_arguments,
+            None,
+            &[],
+            invocation.is_local,
+            false,
+            &[],
+            Some(anchor.clone()),
+            invocation.carrier_id,
+        )
+    }
+
+    fn has_retained_specialization_for_current_callback(&self) -> bool {
+        let Some(callback_ref) = &self.callee_func_ref else {
+            return false;
+        };
+        let mut matches = self
+            .block_visitor
+            .bv
+            .callback_invocations
+            .iter()
+            .filter(|invocation| {
+                invocation
+                    .specialized_callee
+                    .as_ref()
+                    .is_some_and(|specialized| {
+                        specialized.summary_cache_key == callback_ref.summary_cache_key
+                    })
+            });
+        matches.next().is_some() && matches.next().is_none()
+    }
+
+    fn callback_has_single_callable_upvar(&mut self, argument_index: usize) -> bool {
+        let Some(callback_type) = self.actual_argument_types.get(argument_index).copied() else {
+            return false;
+        };
+        let callback_type = self.type_visitor().get_dereferenced_type(callback_type);
+        let TyKind::Closure(_, closure_args) = callback_type.kind() else {
+            return false;
+        };
+        let upvar_tys = closure_args.as_closure().upvar_tys();
+        if upvar_tys.len() != 1 {
+            return false;
+        }
+        let upvar_ty = self
+            .type_visitor()
+            .specialize_type(upvar_tys[0], &self.type_visitor().generic_argument_map);
+        let upvar_ty = self.type_visitor().get_dereferenced_type(upvar_ty);
+        matches!(upvar_ty.kind(), TyKind::Param(_))
+            || utils::contains_function(upvar_ty, self.block_visitor.bv.tcx)
+    }
+
+    fn callback_value_is_boundary_parameter(
+        &self,
+        callback_value: &Rc<AbstractValue>,
+        environment: &Environment,
+    ) -> bool {
+        let callback_path = Path::get_as_path(callback_value.clone())
+            .remove_initial_value_wrapper()
+            .canonicalize(environment);
+        callback_path
+            .get_parameter_root_ordinal()
+            .is_some_and(|ordinal| ordinal > 0 && ordinal <= self.block_visitor.bv.mir.arg_count)
     }
 
     fn remove_unavailable_argument_dependencies(
@@ -4357,12 +4609,12 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
         self.block_visitor.bv.emit_diagnostic(warning);
     }
 
-    fn retained_callbacks_are_specialized(function_summary: &Summary) -> bool {
+    fn retained_callback_callees_are_anchored(function_summary: &Summary) -> bool {
         !function_summary.callback_invocations.is_empty()
             && function_summary
                 .callback_invocations
                 .iter()
-                .all(|invocation| invocation.specialized_callee.is_some())
+                .all(|invocation| invocation.callee.get_parameter_root_ordinal().is_some())
     }
 
     fn report_unrepresentable_callback_argument(&mut self) {

@@ -824,9 +824,6 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
         callee_ty: Ty<'tcx>,
         actual_args: &[(Rc<Path>, Rc<AbstractValue>)],
     ) -> bool {
-        if !self.bv.check_for_errors {
-            return false;
-        }
         let allow_captured_parameter =
             self.bv.treat_as_foreign || self.bv.tcx.is_closure_like(self.bv.def_id);
         let Some(callee_parameter) =
@@ -834,6 +831,9 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
         else {
             return false;
         };
+        if !self.bv.check_for_errors {
+            return true;
+        }
         self.push_callback_invocation(callee_parameter, actual_args, true, None)
     }
 
@@ -850,16 +850,27 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
         local_callback_anchor: Option<Rc<Path>>,
         carrier_id: Option<u64>,
     ) -> bool {
-        if !self.bv.check_for_errors {
-            return false;
-        }
         let (callee_parameter, capture_aliases, is_local, newly_local) =
             if let Some(callee_parameter) = local_callback_anchor {
                 let Some(ordinal) = callee_parameter.get_parameter_root_ordinal() else {
                     return false;
                 };
-                let parameter_ty = self.type_visitor().get_loc_ty(mir::Local::from(ordinal));
-                if !utils::contains_function(parameter_ty, self.bv.tcx) {
+                if ordinal == 0 || ordinal > self.bv.mir.arg_count {
+                    return false;
+                }
+                let parameter_ty = self.bv.mir.local_decls[mir::Local::from(ordinal)].ty;
+                let parameter_ty = self
+                    .type_visitor()
+                    .specialize_type(parameter_ty, &self.type_visitor().generic_argument_map);
+                // Anchors reach this branch only from a recorded callback callee, so a generic
+                // parameter is callable by provenance even when its bound is erased from MIR.
+                if !matches!(
+                    self.type_visitor()
+                        .get_dereferenced_type(parameter_ty)
+                        .kind(),
+                    TyKind::Param(_)
+                ) && !utils::contains_function(parameter_ty, self.bv.tcx)
+                {
                     return false;
                 }
                 let capture_aliases = self
@@ -871,7 +882,7 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                     )
                     .map(|(_, capture_aliases)| capture_aliases)
                     .unwrap_or_default();
-                (callee_parameter, capture_aliases, true, false)
+                (callee_parameter, capture_aliases, is_local, false)
             } else if let Some(callee_parameter) =
                 self.find_callback_parameter(callee_path, callee_ty, true)
             {
@@ -892,6 +903,9 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
         if capture_aliases.is_empty() && newly_local {
             return false;
         };
+        if !self.bv.check_for_errors {
+            return true;
+        }
         if self.bv.callback_invocations.len() >= k_limits::MAX_INFERRED_PRECONDITIONS {
             self.bv.analysis_is_incomplete = true;
             return true;
@@ -1004,39 +1018,101 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                 .then_some((source_path.clone(), path, value))
             })
             .collect::<Vec<_>>();
-        let invocation = self
-            .bv
-            .callback_invocations
-            .last_mut()
-            .expect("push_callback_invocation must append an invocation");
-        invocation.pre_state.extend(
-            captured_model_state
-                .iter()
-                .map(|(_, path, value)| (path.clone(), value.clone())),
-        );
-        invocation.state_rekeys = enclosing_capture_rekeys
-            .iter()
-            .chain(&capture_model_rekeys)
-            .cloned()
-            .chain(
+        {
+            let invocation = self
+                .bv
+                .callback_invocations
+                .last_mut()
+                .expect("push_callback_invocation must append an invocation");
+            invocation.pre_state.extend(
                 captured_model_state
                     .iter()
-                    .map(|(source_path, path, value)| {
-                        (
-                            source_path.clone(),
-                            AbstractValue::make_typed_unknown(
-                                value.expression.infer_type(),
-                                path.clone(),
-                            ),
-                        )
-                    }),
-            )
-            .collect();
-        invocation.pre_state.extend(capture_aliases);
-        invocation.specialized_callee = specialized_callee;
-        invocation.function_constants = function_constants.to_vec();
-        invocation.is_local = is_local;
+                    .map(|(_, path, value)| (path.clone(), value.clone())),
+            );
+            invocation.state_rekeys = enclosing_capture_rekeys
+                .iter()
+                .chain(&capture_model_rekeys)
+                .cloned()
+                .chain(
+                    captured_model_state
+                        .iter()
+                        .map(|(source_path, path, value)| {
+                            (
+                                source_path.clone(),
+                                AbstractValue::make_typed_unknown(
+                                    value.expression.infer_type(),
+                                    path.clone(),
+                                ),
+                            )
+                        }),
+                )
+                .collect();
+            invocation.pre_state.extend(capture_aliases);
+            invocation.specialized_callee = specialized_callee;
+            invocation.function_constants = function_constants.to_vec();
+            invocation.is_local = is_local;
+        }
+        self.deduplicate_last_callback_invocation();
         true
+    }
+
+    pub(crate) fn deduplicate_last_callback_invocation(&mut self) {
+        let Some(new_invocation) = self.bv.callback_invocations.last().cloned() else {
+            return;
+        };
+        let same_context = |invocation: &CallbackInvocation| {
+            new_invocation.carrier_id.is_some()
+                && invocation.carrier_id == new_invocation.carrier_id
+                && invocation.callee == new_invocation.callee
+                && invocation.pre_state == new_invocation.pre_state
+                && invocation.pre_aliases == new_invocation.pre_aliases
+                && invocation.pre_guarded_aliases == new_invocation.pre_guarded_aliases
+                && invocation.guard == new_invocation.guard
+                && invocation.is_local == new_invocation.is_local
+                && invocation.state_rekeys == new_invocation.state_rekeys
+        };
+        let is_unspecialized_relay = |invocation: &CallbackInvocation| {
+            invocation.specialized_callee.is_none()
+                && invocation.arguments.first().is_some_and(|(path, value)| {
+                    value.is_bottom()
+                        && matches!(
+                            &path.value,
+                            PathEnum::Computed { value } if value.is_bottom()
+                        )
+                })
+                && invocation
+                    .arguments
+                    .iter()
+                    .skip(1)
+                    .map(|(path, _)| path)
+                    .eq(new_invocation
+                        .arguments
+                        .iter()
+                        .skip(1)
+                        .map(|(path, _)| path))
+        };
+        let previous_invocations =
+            &self.bv.callback_invocations[..self.bv.callback_invocations.len() - 1];
+        let discard_new = previous_invocations
+            .iter()
+            .any(|invocation| invocation == &new_invocation)
+            || (new_invocation.specialized_callee.is_none()
+                && previous_invocations.iter().any(|invocation| {
+                    same_context(invocation)
+                        && invocation.specialized_callee.is_some()
+                        && is_unspecialized_relay(&new_invocation)
+                }));
+        if discard_new {
+            self.bv.callback_invocations.pop();
+        } else if new_invocation.specialized_callee.is_some() {
+            let last = self.bv.callback_invocations.pop().unwrap();
+            self.bv.callback_invocations.retain(|invocation| {
+                !same_context(invocation)
+                    || invocation.specialized_callee.is_some()
+                    || !is_unspecialized_relay(invocation)
+            });
+            self.bv.callback_invocations.push(last);
+        }
     }
 
     pub(crate) fn callback_argument_projection_root(index: usize) -> Rc<Path> {
@@ -1207,6 +1283,7 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
     pub fn find_single_function_upvar_parameter(
         &mut self,
         callee_ty: Ty<'tcx>,
+        allow_generic_upvar: bool,
     ) -> Option<Rc<Path>> {
         let callee_ty = self.type_visitor().get_dereferenced_type(callee_ty);
         let TyKind::Closure(_, args) = callee_ty.kind() else {
@@ -1220,12 +1297,17 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
             .type_visitor()
             .specialize_type(upvar_tys[0], &self.type_visitor().generic_argument_map);
         let upvar_ty = self.type_visitor().get_dereferenced_type(upvar_ty);
-        if !matches!(upvar_ty.kind(), TyKind::Closure(..) | TyKind::FnDef(..)) {
+        if !allow_generic_upvar
+            && !matches!(upvar_ty.kind(), TyKind::Closure(..) | TyKind::FnDef(..))
+        {
             return None;
         }
         let matching_parameters = (1..=self.bv.mir.arg_count)
             .filter_map(|ordinal| {
-                let parameter_ty = self.type_visitor().get_loc_ty(mir::Local::from(ordinal));
+                let parameter_ty = self.bv.mir.local_decls[mir::Local::from(ordinal)].ty;
+                let parameter_ty = self
+                    .type_visitor()
+                    .specialize_type(parameter_ty, &self.type_visitor().generic_argument_map);
                 let parameter_ty = self.type_visitor().get_dereferenced_type(parameter_ty);
                 (parameter_ty == upvar_ty).then(|| Path::new_parameter(ordinal))
             })
