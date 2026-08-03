@@ -2869,7 +2869,10 @@ impl AbstractValueTrait for Rc<AbstractValue> {
                         .conditional_expression(self.equals(v1.clone()), self.equals(v2.clone()));
                 }
             }
+            // LiteBox's `RwLockWriteGuard::deref_mut` exposed the pointer-width integer case:
+            // its promoted non-null reference condition was retained as `transmute(&field, Usize)`.
             // [0 == transmute(x, thin pointer)] -> 0 == x
+            // [0 == transmute(non-null reference, pointer-width integer)] -> false
             (
                 Expression::CompileTimeConstant(ConstantDomain::U128(val)),
                 Expression::Transmute {
@@ -2879,6 +2882,26 @@ impl AbstractValueTrait for Rc<AbstractValue> {
             ) => {
                 if *val == 0 && *target_type == ExpressionType::ThinPointer {
                     return self.equals(operand.clone());
+                }
+                let pointer_bits = ExpressionType::ThinPointer.bit_length();
+                if *val == 0 && target_type.is_integer() && target_type.bit_length() >= pointer_bits
+                {
+                    let is_non_null = operand.is_non_null()
+                        || if let Expression::Rem { left, right } = &operand.expression {
+                            let pointer_modulus = 1u128 << pointer_bits;
+                            left.is_non_null()
+                                && matches!(
+                                    right.expression,
+                                    Expression::CompileTimeConstant(ConstantDomain::U128(
+                                        modulus
+                                    )) if modulus == pointer_modulus
+                                )
+                        } else {
+                            false
+                        };
+                    if is_non_null {
+                        return Rc::new(FALSE);
+                    }
                 }
             }
 
@@ -7320,6 +7343,58 @@ mod tests {
 
     fn masked_pointer_transmute(operand: Rc<AbstractValue>, modulus: u128) -> Rc<AbstractValue> {
         pointer_transmute(operand.remainder(Rc::new(ConstantDomain::U128(modulus).into())))
+    }
+
+    fn integer_transmute(
+        operand: Rc<AbstractValue>,
+        target_type: ExpressionType,
+    ) -> Rc<AbstractValue> {
+        AbstractValue::make_typed_unary(operand, target_type, |operand, target_type| {
+            Expression::Transmute {
+                operand,
+                target_type,
+            }
+        })
+    }
+
+    #[test]
+    fn zero_is_not_equal_to_non_null_reference_transmuted_to_pointer_width_integer() {
+        let zero: Rc<AbstractValue> = Rc::new(0_u128.into());
+        let reference = AbstractValue::make_reference(Path::new_parameter(1));
+        let direct = integer_transmute(reference.clone(), ExpressionType::Usize);
+        assert_eq!(zero.equals(direct), Rc::new(FALSE));
+
+        let pointer_modulus = 1u128 << ExpressionType::ThinPointer.bit_length();
+        let masked = integer_transmute(
+            reference.clone().remainder(Rc::new(pointer_modulus.into())),
+            ExpressionType::Usize,
+        );
+        assert_eq!(zero.equals(masked), Rc::new(FALSE));
+
+        for narrow_type in [ExpressionType::U8, ExpressionType::U32] {
+            let narrow = integer_transmute(reference.clone(), narrow_type);
+            assert_ne!(zero.equals(narrow), Rc::new(FALSE));
+
+            let masked_narrow = integer_transmute(
+                reference.clone().remainder(Rc::new(pointer_modulus.into())),
+                narrow_type,
+            );
+            assert_ne!(zero.equals(masked_narrow), Rc::new(FALSE));
+        }
+
+        let wrong_mask = integer_transmute(
+            reference.remainder(Rc::new((pointer_modulus / 2).into())),
+            ExpressionType::Usize,
+        );
+        assert_ne!(zero.equals(wrong_mask), Rc::new(FALSE));
+
+        let unknown =
+            AbstractValue::make_typed_unknown(ExpressionType::U128, Path::new_parameter(2));
+        let masked_unknown = integer_transmute(
+            unknown.remainder(Rc::new(pointer_modulus.into())),
+            ExpressionType::Usize,
+        );
+        assert_ne!(zero.equals(masked_unknown), Rc::new(FALSE));
     }
 
     // Checks consistency of `Ord`, `PartialOrd`, `PartialEq` and `Eq` implementations for `AbstractValue`.
