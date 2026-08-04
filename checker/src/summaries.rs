@@ -754,8 +754,8 @@ fn extract_incomplete_model_state(
 /// Constructs the sound subset of a summary after analysis stopped at an unresolved operation.
 /// Preconditions and callback invocations recorded before the failure remain valid requirements.
 /// Partial side effects, model state, and postconditions are not safe to expose to callers.
-pub(crate) fn retain_in_incomplete_summary(precondition: &Precondition) -> bool {
-    !precondition
+pub(crate) fn is_incomplete_analysis_marker(precondition: &Precondition) -> bool {
+    precondition
         .message
         .starts_with("incomplete analysis of call")
 }
@@ -777,7 +777,7 @@ pub fn summarize_incomplete(
     let mut preconditions = add_provenance(
         &preconditions
             .iter()
-            .filter(|precondition| retain_in_incomplete_summary(precondition))
+            .filter(|precondition| !is_incomplete_analysis_marker(precondition))
             .cloned()
             .collect::<Vec<_>>(),
         tcx,
