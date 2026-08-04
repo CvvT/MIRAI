@@ -5137,6 +5137,15 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                     } else {
                         (callee_subject.clone(), live_subject.clone())
                     };
+                    let left_type = self
+                        .type_visitor()
+                        .get_path_rustc_type(&left, self.block_visitor.bv.current_span);
+                    let right_type = self
+                        .type_visitor()
+                        .get_path_rustc_type(&right, self.block_visitor.bv.current_span);
+                    if left_type.is_never() || right_type.is_never() || left_type != right_type {
+                        continue;
+                    }
                     let roots_differ = left.get_path_root() != right.get_path_root();
                     if !not_alias_paths_are_caller_representable(&left, &right)
                         || environment.paths_must_alias(&left, &right)
