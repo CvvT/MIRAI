@@ -33,7 +33,6 @@ pub enum CoverageGapKind {
     BodyTimeout,
     CallbackArgumentDependencyLoss,
     CrateTimeout,
-    DeduplicatedObligation,
     DeriveGenerated,
     ElementTrackingBound,
     ExistentialCheckUndecided,
