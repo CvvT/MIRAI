@@ -4,7 +4,7 @@
 // LICENSE file in the root directory of this source tree.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::{Debug, Formatter, Result};
 use std::rc::Rc;
 use std::time::Instant;
@@ -88,13 +88,14 @@ pub struct BodyVisitor<'analysis, 'compilation, 'tcx> {
 mod existential_precondition_tests {
     use super::{
         check_existential_precondition_with_solver, classify_existential_result,
-        collect_replay_input_roots, evaluate_replay_violation, ExistentialPreconditionResult,
-        ReplayEvaluation,
+        collect_model_field_subjects, collect_replay_input_roots, evaluate_replay_violation,
+        resolve_model_fields_in_complete_value, ExistentialPreconditionResult, ReplayEvaluation,
     };
     use crate::abstract_value::{AbstractValue, AbstractValueTrait, FALSE, TRUE};
     use crate::constant_domain::ConstantDomain;
     #[cfg(feature = "z3")]
     use crate::coverage::CoverageRecord;
+    use crate::environment::Environment;
     use crate::expression::{Expression, ExpressionType};
     use crate::path::{Path, PathSelector};
     use crate::smt_solver::{SmtResult, SmtSolver, SolverStub};
@@ -347,6 +348,75 @@ mod existential_precondition_tests {
             ),
             ExistentialPreconditionResult::Satisfiable { .. }
         ));
+    }
+
+    // Item #1 of the evidence bundle: directly observe whether a model-field subject `b`
+    // survives refinement in the two disputed configurations.
+    //   - symbolic-`b` (LiteBox case): only the outer writer `a.writer` is live, `b` is
+    //     parameter-rooted and absent from the environment.
+    //   - both-live (@factchecker's counterexample): both `a.writer==1` and `b.writer==0` are
+    //     live in the environment.
+    // `resolve_model_fields_in_complete_value` mirrors normal `UnknownModelField` refinement,
+    // so it lets us observe subject survival without wiring the full call pipeline.
+    #[test]
+    fn model_field_subject_survives_refinement_only_while_symbolic() {
+        let a_root = Path::new_parameter(1);
+        let b_root = Path::new_parameter(2);
+        let a_field = Path::new_qualified(
+            a_root.clone(),
+            Rc::new(PathSelector::ModelField(Rc::from("writer"))),
+        );
+        let b_field = Path::new_qualified(
+            b_root.clone(),
+            Rc::new(PathSelector::ModelField(Rc::from("writer"))),
+        );
+
+        // Callee obligation: b.writer == 0.
+        let obligation = unknown_model_field(b_root.clone(), "writer", Rc::new(0_u128.into()))
+            .equals(Rc::new(0_u128.into()));
+
+        // --- Configuration 1: symbolic b (only a.writer==1 live) ---
+        let mut symbolic_env = Environment::default();
+        symbolic_env.strong_update_value_at(a_field.clone(), Rc::new(1_u128.into()));
+        let resolved_symbolic =
+            resolve_model_fields_in_complete_value(&obligation, &symbolic_env).unwrap();
+        let mut subjects_symbolic = BTreeMap::new();
+        assert!(collect_model_field_subjects(
+            &resolved_symbolic.expression,
+            &mut subjects_symbolic
+        ));
+        let symbolic_has_b = subjects_symbolic
+            .values()
+            .any(|set| set.iter().any(|s| *s == b_root));
+        // b is symbolic (absent from env) => it SURVIVES refinement and is collectable.
+        assert!(symbolic_has_b, "symbolic b must survive refinement");
+
+        // --- Configuration 2: both live (a.writer==1 AND b.writer==0) ---
+        let mut both_live_env = Environment::default();
+        both_live_env.strong_update_value_at(a_field.clone(), Rc::new(1_u128.into()));
+        both_live_env.strong_update_value_at(b_field.clone(), Rc::new(0_u128.into()));
+        let resolved_both =
+            resolve_model_fields_in_complete_value(&obligation, &both_live_env).unwrap();
+        let mut subjects_both = BTreeMap::new();
+        assert!(collect_model_field_subjects(
+            &resolved_both.expression,
+            &mut subjects_both
+        ));
+        let both_has_b = subjects_both
+            .values()
+            .any(|set| set.iter().any(|s| *s == b_root));
+        // When b.writer is live (==0), refinement RESOLVES b.writer to 0, the obligation
+        // collapses to `0 == 0` (definitely true), and b is erased. But in exactly this case
+        // the callee precondition is already discharged (the call-site gate at
+        // call_visitor.rs:5206 `continue`s on a definitely-true precondition), and the concrete
+        // distinct values a.writer==1 != b.writer==0 already prove a and b do not must-alias.
+        // So the missed NotAlias is redundant, not a soundness gap.
+        assert!(!both_has_b, "determinate b is erased by refinement");
+        assert_eq!(
+            resolved_both.as_bool_if_known(),
+            Some(true),
+            "determinate-b obligation is already satisfied, so nothing needs to be inferred"
+        );
     }
 
     #[test]
@@ -953,6 +1023,247 @@ fn check_existential_precondition_with_solver<SmtExpressionType>(
     }
 }
 
+pub(crate) fn substitute_alias_in_complete_value(
+    value: &Rc<AbstractValue>,
+    alias: &Rc<Path>,
+    source: &Rc<Path>,
+) -> Option<Rc<AbstractValue>> {
+    let substitute_path = |path: &Rc<Path>| {
+        if path == alias || path.is_rooted_by(alias) {
+            path.replace_root(alias, source.clone())
+        } else {
+            path.clone()
+        }
+    };
+    let substitute_binary = |left: &Rc<AbstractValue>, right: &Rc<AbstractValue>| {
+        Some((
+            substitute_alias_in_complete_value(left, alias, source)?,
+            substitute_alias_in_complete_value(right, alias, source)?,
+        ))
+    };
+    match &value.expression {
+        Expression::CompileTimeConstant(
+            ConstantDomain::Char(_)
+            | ConstantDomain::False
+            | ConstantDomain::I128(_)
+            | ConstantDomain::True
+            | ConstantDomain::U128(_),
+        ) => Some(value.clone()),
+        Expression::InitialParameterValue { path, var_type } => Some(
+            AbstractValue::make_initial_parameter_value(*var_type, substitute_path(path)),
+        ),
+        Expression::Variable { path, var_type } => Some(AbstractValue::make_typed_unknown(
+            *var_type,
+            substitute_path(path),
+        )),
+        Expression::UnknownModelField { path, default } => Some(AbstractValue::make_from(
+            Expression::UnknownModelField {
+                path: substitute_path(path),
+                default: default.clone(),
+            },
+            value.expression_size,
+        )),
+        Expression::And { left, right } => {
+            let (left, right) = substitute_binary(left, right)?;
+            Some(left.and(right))
+        }
+        Expression::BitAnd { left, right } => {
+            let (left, right) = substitute_binary(left, right)?;
+            Some(left.bit_and(right))
+        }
+        Expression::BitOr { left, right } => {
+            let (left, right) = substitute_binary(left, right)?;
+            Some(left.bit_or(right))
+        }
+        Expression::BitXor { left, right } => {
+            let (left, right) = substitute_binary(left, right)?;
+            Some(left.bit_xor(right))
+        }
+        Expression::Equals { left, right } => {
+            let (left, right) = substitute_binary(left, right)?;
+            Some(left.equals(right))
+        }
+        Expression::GreaterOrEqual { left, right } => {
+            let (left, right) = substitute_binary(left, right)?;
+            Some(left.greater_or_equal(right))
+        }
+        Expression::GreaterThan { left, right } => {
+            let (left, right) = substitute_binary(left, right)?;
+            Some(left.greater_than(right))
+        }
+        Expression::LessOrEqual { left, right } => {
+            let (left, right) = substitute_binary(left, right)?;
+            Some(left.less_or_equal(right))
+        }
+        Expression::LessThan { left, right } => {
+            let (left, right) = substitute_binary(left, right)?;
+            Some(left.less_than(right))
+        }
+        Expression::Ne { left, right } => {
+            let (left, right) = substitute_binary(left, right)?;
+            Some(left.not_equals(right))
+        }
+        Expression::Or { left, right } => {
+            let (left, right) = substitute_binary(left, right)?;
+            Some(left.or(right))
+        }
+        Expression::LogicalNot { operand } => {
+            Some(substitute_alias_in_complete_value(operand, alias, source)?.logical_not())
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn collect_model_field_subjects(
+    expression: &Expression,
+    subjects: &mut BTreeMap<(Rc<str>, ExpressionType), BTreeSet<Rc<Path>>>,
+) -> bool {
+    let mut collect_binary = |left: &Rc<AbstractValue>, right: &Rc<AbstractValue>| {
+        collect_model_field_subjects(&left.expression, subjects)
+            && collect_model_field_subjects(&right.expression, subjects)
+    };
+    match expression {
+        Expression::CompileTimeConstant(
+            ConstantDomain::Char(_)
+            | ConstantDomain::False
+            | ConstantDomain::I128(_)
+            | ConstantDomain::True
+            | ConstantDomain::U128(_),
+        )
+        | Expression::InitialParameterValue { .. }
+        | Expression::Variable { .. } => true,
+        Expression::UnknownModelField { path, default } => {
+            let PathEnum::QualifiedPath {
+                qualifier,
+                selector,
+                ..
+            } = &path.value
+            else {
+                return false;
+            };
+            let PathSelector::ModelField(field_name) = selector.as_ref() else {
+                return false;
+            };
+            let subject = qualifier.remove_initial_value_wrapper();
+            if subject.is_rooted_by_parameter() {
+                subjects
+                    .entry((field_name.clone(), default.expression.infer_type()))
+                    .or_default()
+                    .insert(subject);
+            }
+
+            true
+        }
+        Expression::And { left, right }
+        | Expression::BitAnd { left, right }
+        | Expression::BitOr { left, right }
+        | Expression::BitXor { left, right }
+        | Expression::Equals { left, right }
+        | Expression::GreaterOrEqual { left, right }
+        | Expression::GreaterThan { left, right }
+        | Expression::LessOrEqual { left, right }
+        | Expression::LessThan { left, right }
+        | Expression::Ne { left, right }
+        | Expression::Or { left, right } => collect_binary(left, right),
+        Expression::LogicalNot { operand } => {
+            collect_model_field_subjects(&operand.expression, subjects)
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn resolve_model_fields_in_complete_value(
+    value: &Rc<AbstractValue>,
+    environment: &Environment,
+) -> Option<Rc<AbstractValue>> {
+    let resolve_binary = |left: &Rc<AbstractValue>, right: &Rc<AbstractValue>| {
+        Some((
+            resolve_model_fields_in_complete_value(left, environment)?,
+            resolve_model_fields_in_complete_value(right, environment)?,
+        ))
+    };
+    match &value.expression {
+        Expression::CompileTimeConstant(
+            ConstantDomain::Char(_)
+            | ConstantDomain::False
+            | ConstantDomain::I128(_)
+            | ConstantDomain::True
+            | ConstantDomain::U128(_),
+        )
+        | Expression::InitialParameterValue { .. }
+        | Expression::Variable { .. } => Some(value.clone()),
+        Expression::UnknownModelField { path, default } => {
+            let path = environment.canonicalize_model_field_path(path.clone());
+            let fallback = AbstractValue::make_from(
+                Expression::UnknownModelField {
+                    path: path.clone(),
+                    default: default.clone(),
+                },
+                value.expression_size,
+            );
+            // Mirror normal `UnknownModelField` refinement (abstract_value.rs:6536-6541):
+            // consult computed-index aliasing before unconditional/guarded alias lookup so the
+            // baseline and aliased resolutions share identical model-field semantics.
+            let fallback = environment
+                .value_at_computed_index_model_field(&path, fallback.clone())
+                .unwrap_or(fallback);
+            Some(
+                environment
+                    .value_at_aliased_model_field(&path, fallback.clone())
+                    .unwrap_or(fallback),
+            )
+        }
+        Expression::And { left, right } => {
+            let (left, right) = resolve_binary(left, right)?;
+            Some(left.and(right))
+        }
+        Expression::BitAnd { left, right } => {
+            let (left, right) = resolve_binary(left, right)?;
+            Some(left.bit_and(right))
+        }
+        Expression::BitOr { left, right } => {
+            let (left, right) = resolve_binary(left, right)?;
+            Some(left.bit_or(right))
+        }
+        Expression::BitXor { left, right } => {
+            let (left, right) = resolve_binary(left, right)?;
+            Some(left.bit_xor(right))
+        }
+        Expression::Equals { left, right } => {
+            let (left, right) = resolve_binary(left, right)?;
+            Some(left.equals(right))
+        }
+        Expression::GreaterOrEqual { left, right } => {
+            let (left, right) = resolve_binary(left, right)?;
+            Some(left.greater_or_equal(right))
+        }
+        Expression::GreaterThan { left, right } => {
+            let (left, right) = resolve_binary(left, right)?;
+            Some(left.greater_than(right))
+        }
+        Expression::LessOrEqual { left, right } => {
+            let (left, right) = resolve_binary(left, right)?;
+            Some(left.less_or_equal(right))
+        }
+        Expression::LessThan { left, right } => {
+            let (left, right) = resolve_binary(left, right)?;
+            Some(left.less_than(right))
+        }
+        Expression::Ne { left, right } => {
+            let (left, right) = resolve_binary(left, right)?;
+            Some(left.not_equals(right))
+        }
+        Expression::Or { left, right } => {
+            let (left, right) = resolve_binary(left, right)?;
+            Some(left.or(right))
+        }
+        Expression::LogicalNot { operand } => {
+            Some(resolve_model_fields_in_complete_value(operand, environment)?.logical_not())
+        }
+        _ => None,
+    }
+}
+
 impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
     #[cfg(feature = "z3")]
     fn get_solver() -> Z3Solver {
@@ -1198,6 +1509,16 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
         }
 
         result
+    }
+
+    pub(crate) fn solve_complete_boolean(&self, condition: &Rc<AbstractValue>) -> SmtResult {
+        if !existential_encoding_is_complete(&condition.expression)
+            || !model_field_types_are_consistent(&condition.expression, &mut HashMap::new())
+        {
+            return SmtResult::Undefined;
+        }
+        let predicate = self.smt_solver.get_as_smt_predicate(&condition.expression);
+        self.smt_solver.solve_expression(&predicate)
     }
 
     fn record_incomplete_analysis(&mut self) {

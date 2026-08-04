@@ -4,7 +4,7 @@
 // LICENSE file in the root directory of this source tree.
 
 // use std::{f16, f64, f128};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::{Debug, Formatter, Result};
 use std::rc::Rc;
 use std::{f16, f64};
@@ -20,7 +20,10 @@ use rustc_middle::ty::{GenericArg, GenericArgKind, GenericArgsRef, Ty, TyCtxt, T
 
 use crate::abstract_value::{AbstractValue, AbstractValueTrait};
 use crate::block_visitor::BlockVisitor;
-use crate::body_visitor::{BodyVisitor, ExistentialPreconditionResult};
+use crate::body_visitor::{
+    collect_model_field_subjects, resolve_model_fields_in_complete_value,
+    substitute_alias_in_complete_value, BodyVisitor, ExistentialPreconditionResult,
+};
 use crate::constant_domain::{ConstantDomain, FunctionReference};
 use crate::coverage::{CoverageGapKind, CoverageRecord};
 use crate::environment::Environment;
@@ -29,6 +32,7 @@ use crate::k_limits;
 use crate::known_names::KnownNames;
 use crate::options::DiagLevel;
 use crate::path::{Path, PathEnum, PathRefinement, PathRoot, PathSelector};
+use crate::smt_solver::SmtResult;
 use crate::summaries::{is_incomplete_analysis_marker, CallbackInvocation, Precondition, Summary};
 use crate::tag_domain::Tag;
 use crate::type_visitor::TypeVisitor;
@@ -78,16 +82,83 @@ fn merge_with_same_promoted_obligation(
     }
 }
 
+fn contains_positive_not_alias_pair(
+    condition: &AbstractValue,
+    left: &Rc<Path>,
+    right: &Rc<Path>,
+) -> bool {
+    match &condition.expression {
+        Expression::NotAlias {
+            left: existing_left,
+            right: existing_right,
+        } => {
+            (existing_left == left && existing_right == right)
+                || (existing_left == right && existing_right == left)
+        }
+        Expression::And {
+            left: operand_left,
+            right: operand_right,
+        }
+        | Expression::Or {
+            left: operand_left,
+            right: operand_right,
+        } => {
+            contains_positive_not_alias_pair(operand_left, left, right)
+                || contains_positive_not_alias_pair(operand_right, left, right)
+        }
+        _ => false,
+    }
+}
+
+fn not_alias_paths_are_caller_representable(left: &Rc<Path>, right: &Rc<Path>) -> bool {
+    !left.contains_local_variable(false) && !right.contains_local_variable(false)
+}
+
+fn path_has_summary_boundary_root(path: &Rc<Path>) -> bool {
+    matches!(
+        path.get_path_root().value,
+        PathEnum::Parameter { .. } | PathEnum::Result | PathEnum::StaticVariable { .. }
+    )
+}
+
+fn paths_have_must_alias_prefix(
+    environment: &Environment,
+    left: &Rc<Path>,
+    right: &Rc<Path>,
+) -> bool {
+    fn prefixes(path: &Rc<Path>) -> Vec<Rc<Path>> {
+        let mut result = Vec::new();
+        let mut current = path.clone();
+        loop {
+            result.push(current.clone());
+            let PathEnum::QualifiedPath { qualifier, .. } = &current.value else {
+                break;
+            };
+            current = qualifier.clone();
+        }
+        result
+    }
+
+    prefixes(left).iter().any(|left_prefix| {
+        prefixes(right).iter().any(|right_prefix| {
+            left_prefix != right_prefix && environment.paths_must_alias(left_prefix, right_prefix)
+        })
+    })
+}
+
 #[cfg(test)]
 mod existential_abstraction_tests {
     use super::{
-        classify_precondition_abstraction, is_incomplete_analysis_marker,
-        merge_with_same_promoted_obligation, PreconditionAbstraction,
+        classify_precondition_abstraction, contains_positive_not_alias_pair,
+        is_incomplete_analysis_marker, merge_with_same_promoted_obligation,
+        not_alias_paths_are_caller_representable, path_has_summary_boundary_root,
+        paths_have_must_alias_prefix, PreconditionAbstraction,
     };
-    use crate::abstract_value::{AbstractValue, BOTTOM, TOP, TRUE};
+    use crate::abstract_value::{AbstractValue, AbstractValueTrait, BOTTOM, TOP, TRUE};
+    use crate::environment::Environment;
     use crate::expression::{Expression, ExpressionType};
     use crate::k_limits;
-    use crate::path::Path;
+    use crate::path::{Path, PathSelector};
     use crate::summaries::Precondition;
     use std::rc::Rc;
 
@@ -181,6 +252,73 @@ mod existential_abstraction_tests {
         assert!(!merge_with_same_promoted_obligation(
             &mut preconditions,
             &candidate
+        ));
+    }
+
+    #[test]
+    fn reversed_not_alias_pair_is_detected_under_entry_guard() {
+        let left = Path::new_parameter(1);
+        let right = Path::new_parameter(2);
+        let not_alias = AbstractValue::make_from(
+            Expression::NotAlias {
+                left: right.clone(),
+                right: left.clone(),
+            },
+            1,
+        );
+        let condition = AbstractValue::make_initial_parameter_value(
+            ExpressionType::Bool,
+            Path::new_parameter(3),
+        )
+        .logical_not()
+        .or(not_alias);
+
+        assert!(contains_positive_not_alias_pair(&condition, &left, &right));
+    }
+
+    #[test]
+    fn inferred_not_alias_paths_must_be_caller_representable() {
+        assert!(not_alias_paths_are_caller_representable(
+            &Path::new_parameter(1),
+            &Path::new_parameter(2),
+        ));
+        assert!(!not_alias_paths_are_caller_representable(
+            &Path::new_parameter(1),
+            &Path::new_local(1, 0),
+        ));
+    }
+
+    #[test]
+    fn live_not_alias_subjects_require_summary_boundary_roots() {
+        assert!(path_has_summary_boundary_root(&Path::new_parameter(1)));
+        assert!(path_has_summary_boundary_root(&Path::new_result()));
+        assert!(!path_has_summary_boundary_root(&Path::new_local(1, 0)));
+    }
+
+    #[test]
+    fn inferred_not_alias_paths_reject_distinct_must_alias_prefixes() {
+        let left_root = Path::new_parameter(1);
+        let right_root = Path::new_parameter(2);
+        let left_prefix = Path::new_qualified(left_root, Rc::new(PathSelector::Field(0)));
+        let right_prefix = Path::new_qualified(right_root, Rc::new(PathSelector::Field(1)));
+        let left = Path::new_qualified(left_prefix.clone(), Rc::new(PathSelector::Field(2)));
+        let right = Path::new_qualified(right_prefix.clone(), Rc::new(PathSelector::Field(2)));
+        let mut environment = Environment::default();
+        environment.assume_alias(left_prefix, right_prefix);
+
+        assert!(paths_have_must_alias_prefix(&environment, &left, &right));
+    }
+
+    #[test]
+    fn inferred_not_alias_paths_allow_divergent_fields_of_same_parameter() {
+        let root = Path::new_parameter(1);
+        let left = Path::new_qualified(root.clone(), Rc::new(PathSelector::Field(0)));
+        let right = Path::new_qualified(root, Rc::new(PathSelector::Field(1)));
+
+        assert!(!paths_have_must_alias_prefix(
+            &Environment::default(),
+            &left,
+            &right,
         ));
     }
 
@@ -4897,6 +5035,199 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
         }
     }
 
+    fn subject_root_is_closure(&self, subject: &Rc<Path>) -> bool {
+        let Some(ordinal) = subject.get_parameter_root_ordinal() else {
+            return false;
+        };
+        let parameter = Path::new_parameter(ordinal);
+        let ty = self
+            .block_visitor
+            .bv
+            .type_visitor()
+            .get_path_rustc_type(&parameter, self.block_visitor.bv.current_span);
+        matches!(
+            ty.kind(),
+            TyKind::Closure(..) | TyKind::CoroutineClosure(..)
+        )
+    }
+
+    fn infer_not_alias_preconditions_at_call(
+        &mut self,
+        refined_condition: &Rc<AbstractValue>,
+        precondition: &Precondition,
+    ) {
+        // Do not seed inferred obligations while replaying an incomplete summary: such facts
+        // could persist into `summarize_incomplete` with misleading provenance. A later complete
+        // pass re-derives them from the live environment instead.
+        if self.block_visitor.bv.recovering_incomplete_summary {
+            return;
+        }
+        if self.block_visitor.bv.function_being_analyzed_is_root()
+            && self.block_visitor.bv.cv.options.diag_level != DiagLevel::Default
+        {
+            return;
+        }
+        let environment = &self.block_visitor.bv.current_environment;
+        let Some(promotable_entry_condition) = environment
+            .entry_condition
+            .extract_promotable_conjuncts(false)
+        else {
+            return;
+        };
+
+        let mut callee_subjects = BTreeMap::new();
+        if !collect_model_field_subjects(&refined_condition.expression, &mut callee_subjects) {
+            return;
+        }
+        let live_subjects: BTreeSet<_> = environment
+            .value_map
+            .iter()
+            .filter_map(|(path, value)| {
+                let PathEnum::QualifiedPath {
+                    qualifier,
+                    selector,
+                    ..
+                } = &path.value
+                else {
+                    return None;
+                };
+                let PathSelector::ModelField(field_name) = selector.as_ref() else {
+                    return None;
+                };
+                let subject = qualifier
+                    .remove_initial_value_wrapper()
+                    .canonicalize(environment);
+                path_has_summary_boundary_root(&subject)
+                    .then(|| ((field_name.clone(), value.expression.infer_type()), subject))
+            })
+            .collect();
+        if !callee_subjects.keys().any(|field| {
+            live_subjects
+                .iter()
+                .any(|(live_field, _)| live_field == field)
+        }) {
+            return;
+        }
+
+        let Some(resolved_baseline) = resolve_model_fields_in_complete_value(
+            refined_condition,
+            &self.block_visitor.bv.current_environment,
+        ) else {
+            return;
+        };
+        let baseline = promotable_entry_condition.clone().and(resolved_baseline);
+        let baseline_result = self.block_visitor.bv.solve_complete_boolean(&baseline);
+        debug!("NotAlias inference baseline: {baseline_result:?}");
+        if baseline_result != SmtResult::Satisfiable {
+            return;
+        }
+
+        for (field, subjects) in callee_subjects {
+            for callee_subject in subjects {
+                let callee_subject = callee_subject.canonicalize(environment);
+                for (_, live_subject) in live_subjects
+                    .iter()
+                    .filter(|(live_field, _)| live_field == &field)
+                {
+                    if live_subject == &callee_subject {
+                        continue;
+                    }
+                    let (left, right) = if live_subject <= &callee_subject {
+                        (live_subject.clone(), callee_subject.clone())
+                    } else {
+                        (callee_subject.clone(), live_subject.clone())
+                    };
+                    let roots_differ = left.get_path_root() != right.get_path_root();
+                    if !not_alias_paths_are_caller_representable(&left, &right)
+                        || environment.paths_must_alias(&left, &right)
+                        || paths_have_must_alias_prefix(environment, &left, &right)
+                        || roots_differ
+                            && (self.subject_root_is_closure(&left)
+                                || self.subject_root_is_closure(&right))
+                    {
+                        continue;
+                    }
+                    let Some(substituted) = substitute_alias_in_complete_value(
+                        refined_condition,
+                        &callee_subject,
+                        live_subject,
+                    ) else {
+                        continue;
+                    };
+                    let Some(resolved) = resolve_model_fields_in_complete_value(
+                        &substituted,
+                        &self.block_visitor.bv.current_environment,
+                    ) else {
+                        continue;
+                    };
+                    let under_alias = promotable_entry_condition.clone().and(resolved);
+                    let under_alias_result =
+                        self.block_visitor.bv.solve_complete_boolean(&under_alias);
+                    debug!(
+                        "NotAlias inference under alias {:?} == {:?}: {:?}",
+                        callee_subject, live_subject, under_alias_result
+                    );
+                    if under_alias_result != SmtResult::Unsatisfiable {
+                        continue;
+                    }
+
+                    let not_alias = AbstractValue::make_from(
+                        Expression::NotAlias {
+                            left: left.clone(),
+                            right: right.clone(),
+                        },
+                        1,
+                    );
+                    let Some(promotable_not_alias) = not_alias.extract_promotable_disjuncts(false)
+                    else {
+                        continue;
+                    };
+                    let condition = promotable_entry_condition
+                        .clone()
+                        .logical_not()
+                        .or(promotable_not_alias);
+                    if let Some(existing) =
+                        self.block_visitor
+                            .bv
+                            .preconditions
+                            .iter_mut()
+                            .find(|existing| {
+                                contains_positive_not_alias_pair(&existing.condition, &left, &right)
+                            })
+                    {
+                        existing.condition = existing.condition.clone().and(condition);
+                        continue;
+                    }
+                    if self.block_visitor.bv.preconditions.len()
+                        >= k_limits::MAX_INFERRED_PRECONDITIONS
+                    {
+                        return;
+                    }
+                    let mut spans = vec![self.block_visitor.bv.current_span];
+                    if let Some(callee_span) = precondition.spans.last() {
+                        if callee_span != &self.block_visitor.bv.current_span {
+                            spans.push(*callee_span);
+                        }
+                    }
+                    self.block_visitor.bv.preconditions.push(Precondition {
+                        condition,
+                        message: Rc::from(format!(
+                            "possible alias violates precondition: {}",
+                            precondition.message
+                        )),
+                        provenance: None,
+                        spans,
+                    });
+                    if self.block_visitor.bv.preconditions.len()
+                        >= k_limits::MAX_INFERRED_PRECONDITIONS
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     /// Checks if the preconditions obtained from the summary of the function being called
     /// are met by the current state and arguments of the calling function.
     /// Preconditions that are definitely false and reachable cause diagnostic messages.
@@ -5002,15 +5333,17 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 .bv
                 .check_condition_value_and_reachability(&refined_condition);
 
-            if refined_precondition_as_bool.unwrap_or(false) {
-                // The precondition is definitely true.
-                continue;
-            };
-
             if !entry_cond_as_bool.unwrap_or(true) {
                 // The call is unreachable, so the precondition does not matter
                 continue;
             }
+
+            self.infer_not_alias_preconditions_at_call(&refined_condition, precondition);
+
+            if refined_precondition_as_bool.unwrap_or(false) {
+                // The precondition is definitely true.
+                continue;
+            };
 
             if self.is_indirect_function_call
                 && refined_precondition_as_bool == Some(false)
