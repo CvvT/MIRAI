@@ -88,7 +88,7 @@ mod existential_abstraction_tests {
     use crate::expression::{Expression, ExpressionType};
     use crate::k_limits;
     use crate::path::Path;
-    use crate::summaries::Precondition;
+    use crate::summaries::{retain_in_incomplete_summary, Precondition};
     use std::rc::Rc;
 
     #[test]
@@ -151,11 +151,7 @@ mod existential_abstraction_tests {
             &real
         ));
         preconditions.push(real);
-        preconditions.retain(|precondition| {
-            !precondition
-                .message
-                .starts_with("incomplete analysis of call")
-        });
+        preconditions.retain(|precondition| retain_in_incomplete_summary(precondition));
         assert_eq!(preconditions.len(), 1);
         assert_eq!(
             preconditions[0].message.as_ref(),
