@@ -7371,7 +7371,11 @@ mod tests {
         );
         assert_eq!(zero.equals(masked), Rc::new(FALSE));
 
-        for narrow_type in [ExpressionType::U8, ExpressionType::U32] {
+        for narrow_type in [
+            ExpressionType::U8,
+            ExpressionType::U16,
+            ExpressionType::U32,
+        ] {
             let narrow = integer_transmute(reference.clone(), narrow_type);
             assert_ne!(zero.equals(narrow), Rc::new(FALSE));
 
