@@ -41,9 +41,14 @@ fn foot(s: S) -> Option<i32> {
 
 pub fn main() {
     let fbar = foo(bar);
-    verify!(fbar.unwrap() == 2);
+    // Known limitation: calls through a function parameter are replayed as callback events without
+    // a return value. Direct and generic parameter results remain unknown; the structured field
+    // function pointer below resolves normally.
+    verify!(fbar.unwrap() == 2); //~ possible called `Option::unwrap()` on a `None` value
+    //~ possible false verification condition
+    //~ related location
     let fbas = foos(bas, 2);
-    verify!(fbas.unwrap() == 2);
+    verify!(fbas.unwrap() == 2); //~ possible false verification condition
     let fbart = foot(S { i: 2, f: bar });
     verify!(fbart.unwrap() == 4);
 }

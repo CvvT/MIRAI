@@ -4226,6 +4226,18 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 );
             }
             let callback_count_after_lift = self.block_visitor.bv.callback_invocations.len();
+            let lifted_parent_has_arc_model_state = self
+                .block_visitor
+                .bv
+                .callback_invocations
+                .get(callback_count_before_lift..callback_count_after_lift)
+                .and_then(|lifted| lifted.last())
+                .is_some_and(|invocation| {
+                    invocation
+                        .pre_state
+                        .iter()
+                        .any(|(path, _)| self.is_arc_projected_model_field(path))
+                });
             if lifted_callback
                 && refined_model_state
                     .iter()
@@ -4333,11 +4345,19 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                         > callback_count_after_lift;
                 if nested_callback_lifted && callback_count_after_lift > callback_count_before_lift
                 {
-                    callback_visitor
-                        .block_visitor
-                        .bv
-                        .callback_invocations
-                        .remove(callback_count_before_lift);
+                    if lifted_parent_has_arc_model_state {
+                        callback_visitor
+                            .block_visitor
+                            .bv
+                            .callback_invocations
+                            .truncate(callback_count_after_lift);
+                    } else {
+                        callback_visitor
+                            .block_visitor
+                            .bv
+                            .callback_invocations
+                            .remove(callback_count_before_lift);
+                    }
                 }
                 if (!lifted_callback && !nested_callback_lifted) || discharge_local_closure {
                     callback_visitor.check_preconditions_if_necessary(&callback_summary);

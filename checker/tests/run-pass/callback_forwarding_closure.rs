@@ -12,6 +12,7 @@ pub struct State {
 
 fn require_nonzero() {
     precondition!(false); //~ related location
+    //~ related location
 }
 
 fn invoke<F: FnOnce()>(callback: F) {
@@ -20,12 +21,11 @@ fn invoke<F: FnOnce()>(callback: F) {
 
 fn forward<F: FnOnce()>(state: &State, callback: F) {
     set_model_field!(&*state.lock, marker, 1usize);
-    invoke(|| callback());
+    invoke(|| callback()); //~ unsatisfied precondition
 }
 
 pub fn trigger(state: &State) {
     forward(state, require_nonzero); //~ unsatisfied precondition
-    //~ unsatisfied precondition
 }
 
 pub fn main() {}

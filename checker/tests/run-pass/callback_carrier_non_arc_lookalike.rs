@@ -6,7 +6,8 @@
 // MIRAI_FLAGS --diag=default
 //
 // The nested name deliberately ends in `::sync::Arc`, but this user-defined type must not activate
-// callback model-state carrying because it is not Rust's `Arc` diagnostic item.
+// Arc-specific callback model-state carrying because it is not Rust's `Arc` diagnostic item.
+// Ordinary callback replay still detects the genuine writer precondition violation below.
 
 use mirai_annotations::*;
 use std::ops::{Deref, DerefMut};
@@ -63,7 +64,7 @@ impl Owner {
     }
 
     pub fn trigger(&self) {
-        self.with_options(|_options| self.require_unlocked());
+        self.with_options(|_options| self.require_unlocked()); //~ unsatisfied precondition
     }
 }
 
