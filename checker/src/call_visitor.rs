@@ -134,21 +134,33 @@ mod existential_abstraction_tests {
 
     #[test]
     fn incomplete_marker_is_not_the_same_obligation_as_a_real_precondition() {
-        let mut preconditions = vec![precondition(
-            Rc::new(TRUE),
-            "lock requires no live writer",
-            Some("rwlock.rs:1:1:1:2"),
-        )];
         let incomplete_marker = precondition(
             Rc::new(TRUE),
             "incomplete analysis of call because of failure to resolve a nested call",
             Some("rwlock.rs:1:1:1:2"),
         );
+        let mut preconditions = vec![incomplete_marker];
+        let real = precondition(
+            Rc::new(TRUE),
+            "lock requires no live writer",
+            Some("rwlock.rs:1:1:1:2"),
+        );
 
         assert!(!merge_with_same_promoted_obligation(
             &mut preconditions,
-            &incomplete_marker
+            &real
         ));
+        preconditions.push(real);
+        preconditions.retain(|precondition| {
+            !precondition
+                .message
+                .starts_with("incomplete analysis of call")
+        });
+        assert_eq!(preconditions.len(), 1);
+        assert_eq!(
+            preconditions[0].message.as_ref(),
+            "lock requires no live writer"
+        );
     }
 
     #[test]
