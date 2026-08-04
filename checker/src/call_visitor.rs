@@ -86,6 +86,7 @@ mod existential_abstraction_tests {
     };
     use crate::abstract_value::{AbstractValue, BOTTOM, TOP, TRUE};
     use crate::expression::{Expression, ExpressionType};
+    use crate::k_limits;
     use crate::path::Path;
     use crate::summaries::Precondition;
     use std::rc::Rc;
@@ -226,6 +227,53 @@ mod existential_abstraction_tests {
         assert_eq!(preconditions.len(), 1);
         assert_eq!(preconditions[0].condition, merged);
         assert_eq!(preconditions[0].condition.expression_size, merged_size);
+    }
+
+    #[test]
+    fn matching_obligation_merges_at_precondition_capacity() {
+        let mut preconditions = (0..k_limits::MAX_INFERRED_PRECONDITIONS)
+            .map(|index| {
+                precondition(
+                    AbstractValue::make_initial_parameter_value(
+                        ExpressionType::Bool,
+                        Path::new_parameter(index + 1),
+                    ),
+                    if index == 0 {
+                        "lock requires no live writer"
+                    } else {
+                        "unrelated obligation"
+                    },
+                    if index == 0 {
+                        Some("rwlock.rs:1:1:1:2")
+                    } else {
+                        None
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let strengthened = AbstractValue::make_initial_parameter_value(
+            ExpressionType::Bool,
+            Path::new_parameter(k_limits::MAX_INFERRED_PRECONDITIONS + 1),
+        );
+        let candidate = precondition(
+            strengthened.clone(),
+            "lock requires no live writer",
+            Some("rwlock.rs:1:1:1:2"),
+        );
+
+        assert!(merge_with_same_promoted_obligation(
+            &mut preconditions,
+            &candidate
+        ));
+        assert_eq!(preconditions.len(), k_limits::MAX_INFERRED_PRECONDITIONS);
+        assert!(matches!(
+            &preconditions[0].condition.expression,
+            Expression::And { left, right } if left == &strengthened || right == &strengthened
+        ));
+        assert_eq!(
+            preconditions.last().unwrap().message.as_ref(),
+            "unrelated obligation"
+        );
     }
 }
 
@@ -4998,9 +5046,8 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             }
 
             // If the current function is not an analysis root, promote the precondition, subject to a k-limit.
-            if (!self.block_visitor.bv.function_being_analyzed_is_root()
-                || self.block_visitor.bv.cv.options.diag_level == DiagLevel::Default)
-                && self.block_visitor.bv.preconditions.len() < k_limits::MAX_INFERRED_PRECONDITIONS
+            if !self.block_visitor.bv.function_being_analyzed_is_root()
+                || self.block_visitor.bv.cv.options.diag_level == DiagLevel::Default
             {
                 let promoted_condition = match (
                     self.block_visitor
@@ -5071,11 +5118,15 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                     ) {
                         continue;
                     }
-                    self.block_visitor
-                        .bv
-                        .preconditions
-                        .push(promoted_precondition);
-                    continue;
+                    if self.block_visitor.bv.preconditions.len()
+                        < k_limits::MAX_INFERRED_PRECONDITIONS
+                    {
+                        self.block_visitor
+                            .bv
+                            .preconditions
+                            .push(promoted_precondition);
+                        continue;
+                    }
                 } else if !refined_condition.as_bool_if_known().unwrap_or(true)
                     && !self.block_visitor.bv.function_being_analyzed_is_root()
                 {
@@ -5088,18 +5139,22 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                     {
                         // Just a pass through function
                         let mut promoted_precondition = precondition.clone();
-                        promoted_precondition.condition = refined_condition;
+                        promoted_precondition.condition = refined_condition.clone();
                         if merge_with_same_promoted_obligation(
                             &mut self.block_visitor.bv.preconditions,
                             &promoted_precondition,
                         ) {
                             continue;
                         }
-                        self.block_visitor
-                            .bv
-                            .preconditions
-                            .push(promoted_precondition);
-                        continue;
+                        if self.block_visitor.bv.preconditions.len()
+                            < k_limits::MAX_INFERRED_PRECONDITIONS
+                        {
+                            self.block_visitor
+                                .bv
+                                .preconditions
+                                .push(promoted_precondition);
+                            continue;
+                        }
                     }
                 }
             }
