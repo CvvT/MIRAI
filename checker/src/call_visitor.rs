@@ -29,7 +29,7 @@ use crate::k_limits;
 use crate::known_names::KnownNames;
 use crate::options::DiagLevel;
 use crate::path::{Path, PathEnum, PathRefinement, PathRoot, PathSelector};
-use crate::summaries::{CallbackInvocation, Precondition, Summary};
+use crate::summaries::{is_incomplete_analysis_marker, CallbackInvocation, Precondition, Summary};
 use crate::tag_domain::Tag;
 use crate::type_visitor::TypeVisitor;
 use crate::{abstract_value, utils};
@@ -81,14 +81,14 @@ fn merge_with_same_promoted_obligation(
 #[cfg(test)]
 mod existential_abstraction_tests {
     use super::{
-        classify_precondition_abstraction, merge_with_same_promoted_obligation,
-        PreconditionAbstraction,
+        classify_precondition_abstraction, is_incomplete_analysis_marker,
+        merge_with_same_promoted_obligation, PreconditionAbstraction,
     };
     use crate::abstract_value::{AbstractValue, BOTTOM, TOP, TRUE};
     use crate::expression::{Expression, ExpressionType};
     use crate::k_limits;
     use crate::path::Path;
-    use crate::summaries::{is_incomplete_analysis_marker, Precondition};
+    use crate::summaries::Precondition;
     use std::rc::Rc;
 
     #[test]
@@ -5168,10 +5168,7 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             }
 
             // The precondition cannot be promoted, so the buck stops here.
-            if precondition
-                .message
-                .starts_with("incomplete analysis of call")
-            {
+            if is_incomplete_analysis_marker(precondition) {
                 // If the precondition is not satisfied, the summary of the callee is incomplete
                 // and so should be the summary of this method, but
                 // if we are building a call graph we don't want the analysis to stop.
