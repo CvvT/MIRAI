@@ -7401,6 +7401,23 @@ mod tests {
         assert_ne!(zero.equals(masked_unknown), Rc::new(FALSE));
     }
 
+    #[test]
+    fn zero_equality_is_not_refuted_for_narrow_constant_transmute() {
+        // A constant whose low bits truncate to zero (e.g. `0x100 as u8 == 0`) must not be
+        // folded to FALSE by the pointer-width non-null refutation: the guard is gated to
+        // targets at least as wide as a pointer, so narrow truncations remain feasible.
+        let zero: Rc<AbstractValue> = Rc::new(0_u128.into());
+        for (value, narrow_type) in [
+            (0x100_u128, ExpressionType::U8),
+            (0x1_0000_u128, ExpressionType::U16),
+            (0x1_0000_0000_u128, ExpressionType::U32),
+        ] {
+            let constant: Rc<AbstractValue> = Rc::new(value.into());
+            let truncated = integer_transmute(constant, narrow_type);
+            assert_ne!(zero.equals(truncated), Rc::new(FALSE));
+        }
+    }
+
     // Checks consistency of `Ord`, `PartialOrd`, `PartialEq` and `Eq` implementations for `AbstractValue`.
     #[test]
     fn eq_and_ord_consistency_check() {
