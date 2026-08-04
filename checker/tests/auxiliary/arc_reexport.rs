@@ -4,3 +4,7 @@
 // LICENSE file in the root directory of this source tree.
 
 pub use std::sync::Arc;
+
+pub fn require_nonzero(value: i32) {
+    assert!(value != 0);
+}

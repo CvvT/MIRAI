@@ -224,6 +224,8 @@ fn compile_auxiliary_crate(crate_name: &str) -> String {
         String::from("--crate-type"),
         String::from("rlib"),
         String::from("--edition=2021"),
+        String::from("-Z"),
+        String::from("always-encode-mir"),
         String::from("--out-dir"),
         output_dir.clone().into_os_string().into_string().unwrap(),
         String::from("--sysroot"),

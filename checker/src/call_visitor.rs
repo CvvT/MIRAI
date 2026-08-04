@@ -51,11 +51,43 @@ fn classify_precondition_abstraction(condition: &AbstractValue) -> PreconditionA
     }
 }
 
+fn merge_with_same_promoted_obligation(
+    preconditions: &mut [Precondition],
+    candidate: &Precondition,
+) -> bool {
+    let same_origin = |existing: &Precondition| {
+        existing
+            .provenance
+            .as_ref()
+            .zip(candidate.provenance.as_ref())
+            .is_some_and(|(left, right)| left == right)
+            || existing
+                .spans
+                .last()
+                .zip(candidate.spans.last())
+                .is_some_and(|(left, right)| left == right)
+    };
+    if let Some(existing) = preconditions
+        .iter_mut()
+        .find(|existing| existing.message == candidate.message && same_origin(existing))
+    {
+        existing.condition = existing.condition.clone().and(candidate.condition.clone());
+        true
+    } else {
+        false
+    }
+}
+
 #[cfg(test)]
 mod existential_abstraction_tests {
-    use super::{classify_precondition_abstraction, PreconditionAbstraction};
+    use super::{
+        classify_precondition_abstraction, merge_with_same_promoted_obligation,
+        PreconditionAbstraction,
+    };
     use crate::abstract_value::{AbstractValue, BOTTOM, TOP, TRUE};
-    use crate::expression::Expression;
+    use crate::expression::{Expression, ExpressionType};
+    use crate::path::Path;
+    use crate::summaries::Precondition;
     use std::rc::Rc;
 
     #[test]
@@ -84,6 +116,116 @@ mod existential_abstraction_tests {
             classify_precondition_abstraction(&TRUE),
             PreconditionAbstraction::SolverEligible
         );
+    }
+
+    fn precondition(
+        condition: Rc<AbstractValue>,
+        message: &'static str,
+        provenance: Option<&'static str>,
+    ) -> Precondition {
+        Precondition {
+            condition,
+            message: Rc::from(message),
+            provenance: provenance.map(Rc::from),
+            spans: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn incomplete_marker_is_not_the_same_obligation_as_a_real_precondition() {
+        let mut preconditions = vec![precondition(
+            Rc::new(TRUE),
+            "lock requires no live writer",
+            Some("rwlock.rs:1:1:1:2"),
+        )];
+        let incomplete_marker = precondition(
+            Rc::new(TRUE),
+            "incomplete analysis of call because of failure to resolve a nested call",
+            Some("rwlock.rs:1:1:1:2"),
+        );
+
+        assert!(!merge_with_same_promoted_obligation(
+            &mut preconditions,
+            &incomplete_marker
+        ));
+    }
+
+    #[test]
+    fn missing_origins_do_not_match() {
+        let mut preconditions = vec![precondition(
+            AbstractValue::make_initial_parameter_value(
+                ExpressionType::Bool,
+                Path::new_parameter(1),
+            ),
+            "same message",
+            None,
+        )];
+        let candidate = precondition(
+            AbstractValue::make_initial_parameter_value(
+                ExpressionType::Bool,
+                Path::new_parameter(2),
+            ),
+            "same message",
+            None,
+        );
+
+        assert!(!merge_with_same_promoted_obligation(
+            &mut preconditions,
+            &candidate
+        ));
+    }
+
+    #[test]
+    fn same_origin_and_message_merge_conditions_without_recursive_growth() {
+        let first = AbstractValue::make_initial_parameter_value(
+            ExpressionType::Bool,
+            Path::new_parameter(1),
+        );
+        let second = AbstractValue::make_initial_parameter_value(
+            ExpressionType::Bool,
+            Path::new_parameter(2),
+        );
+        let mut preconditions = vec![precondition(
+            first.clone(),
+            "lock requires no live writer",
+            Some("rwlock.rs:1:1:1:2"),
+        )];
+        let candidate = precondition(
+            second.clone(),
+            "lock requires no live writer",
+            Some("rwlock.rs:1:1:1:2"),
+        );
+
+        assert!(merge_with_same_promoted_obligation(
+            &mut preconditions,
+            &candidate
+        ));
+        assert_eq!(preconditions.len(), 1);
+        let merged = preconditions[0].condition.clone();
+        match &merged.expression {
+            Expression::And { left, right } => {
+                assert!(
+                    (left == &first && right == &second) || (left == &second && right == &first)
+                );
+            }
+            expression => {
+                panic!("expected both obligation paths to be retained, got {expression:?}")
+            }
+        }
+
+        let merged_size = merged.expression_size;
+        let recursive_candidate = precondition(
+            merged.clone(),
+            "lock requires no live writer",
+            Some("rwlock.rs:1:1:1:2"),
+        );
+        assert!(merge_with_same_promoted_obligation(
+            &mut preconditions,
+            &recursive_candidate
+        ));
+        assert_eq!(preconditions.len(), 1);
+        assert_eq!(preconditions[0].condition, merged);
+        assert_eq!(preconditions[0].condition.expression_size, merged_size);
     }
 }
 
@@ -4860,20 +5002,6 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 || self.block_visitor.bv.cv.options.diag_level == DiagLevel::Default)
                 && self.block_visitor.bv.preconditions.len() < k_limits::MAX_INFERRED_PRECONDITIONS
             {
-                // Promote the callee precondition to a precondition of the current function.
-                // Unless, of course, if the precondition is already a precondition of the
-                // current function.
-                let seen_precondition = self.block_visitor.bv.preconditions.iter().any(|pc| {
-                    pc.spans.last() == precondition.spans.last()
-                        || pc.provenance == precondition.provenance
-                });
-                if seen_precondition {
-                    self.block_visitor.bv.record_coverage_gap(
-                        self.block_visitor.bv.current_span,
-                        CoverageGapKind::DeduplicatedObligation,
-                    );
-                    continue;
-                }
                 let promoted_condition = match (
                     self.block_visitor
                         .bv
@@ -4937,6 +5065,12 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                         provenance: precondition.provenance.clone(),
                         spans: stacked_spans,
                     };
+                    if merge_with_same_promoted_obligation(
+                        &mut self.block_visitor.bv.preconditions,
+                        &promoted_precondition,
+                    ) {
+                        continue;
+                    }
                     self.block_visitor
                         .bv
                         .preconditions
@@ -4955,6 +5089,12 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                         // Just a pass through function
                         let mut promoted_precondition = precondition.clone();
                         promoted_precondition.condition = refined_condition;
+                        if merge_with_same_promoted_obligation(
+                            &mut self.block_visitor.bv.preconditions,
+                            &promoted_precondition,
+                        ) {
+                            continue;
+                        }
                         self.block_visitor
                             .bv
                             .preconditions
