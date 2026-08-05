@@ -254,4 +254,24 @@ pub fn shift_decoded_broadcast_alias(lock: &Lock) {
     guarded_shift_decoded_option([6, 0, 0, 0], lock, lock);
 }
 
+// Admissibility control for the byte-decode value-tracking above: decode a u32 through
+// `from_ne_bytes` and then require *unconditionally* (no `== 9` discriminant guard). The alias
+// obligation must still form and be reported, proving `from_ne_bytes` yields a value MIRAI can
+// track to the precondition -- i.e. the guarded decoded false negative that existed before the
+// decode-intrinsic fix was an admissible discriminant-precision defect, not an opaque modeling
+// gap. This cell warns independently of discriminant recovery and guards against regressing the
+// value-tracking of the byte transform itself.
+fn unconditional_byte_decoded_option(option: [u8; 4], read: &Lock, written: &Lock) {
+    set_model_field!(written, writer, 1usize);
+    dispatch_byte_decoded_option(option, |_selected| {
+        require_unlocked_when(1, read);
+    }); //~ related location
+}
+
+pub fn unconditional_byte_decoded_alias(lock: &Lock) {
+    set_model_field!(lock, writer, 0usize);
+    unconditional_byte_decoded_option(9u32.to_ne_bytes(), lock, lock);
+    //~ possible alias violates precondition
+}
+
 pub fn main() {}
