@@ -61,6 +61,26 @@ fn unique_candidate<T>(mut candidates: impl Iterator<Item = T>) -> Candidate<T> 
     }
 }
 
+fn callback_pre_state(environment: &Environment) -> Vec<(Rc<Path>, Rc<AbstractValue>)> {
+    environment
+        .value_map
+        .iter()
+        .filter_map(|(path, value)| {
+            let path = environment.canonicalize_model_field_path(path.clone());
+            (!path.contains_local_variable(false)
+                && matches!(
+                    path.value,
+                    PathEnum::QualifiedPath { ref selector, .. }
+                        if matches!(
+                            **selector,
+                            PathSelector::Field(_) | PathSelector::ModelField(_)
+                        )
+                ))
+            .then(|| (path, value.clone()))
+        })
+        .collect()
+}
+
 /// Holds the state for the basic block visitor
 pub struct BlockVisitor<'block, 'analysis, 'compilation, 'tcx> {
     pub bv: &'block mut BodyVisitor<'analysis, 'compilation, 'tcx>,
@@ -1458,24 +1478,7 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
         arguments_complete: bool,
         carrier_id: Option<u64>,
     ) -> bool {
-        let pre_state = self
-            .bv
-            .current_environment
-            .value_map
-            .iter()
-            .filter(|(path, _)| {
-                !path.contains_local_variable(false)
-                    && matches!(
-                        path.value,
-                        PathEnum::QualifiedPath { ref selector, .. }
-                            if matches!(
-                                **selector,
-                            PathSelector::Field(_) | PathSelector::ModelField(_)
-                        )
-                    )
-            })
-            .map(|(path, value)| (path.clone(), value.clone()))
-            .collect();
+        let pre_state = callback_pre_state(&self.bv.current_environment);
         let mut pre_aliases: Vec<_> = self
             .bv
             .current_environment
@@ -5007,7 +5010,12 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
 
 #[cfg(test)]
 mod tests {
-    use super::{unique_candidate, Candidate};
+    use super::{callback_pre_state, unique_candidate, Candidate};
+    use crate::abstract_value::AbstractValue;
+    use crate::environment::Environment;
+    use crate::expression::ExpressionType;
+    use crate::path::{Path, PathEnum, PathSelector};
+    use std::rc::Rc;
 
     #[test]
     fn captured_callback_selection_rejects_ambiguity() {
@@ -5023,5 +5031,47 @@ mod tests {
             unique_candidate([7, 7].into_iter()),
             Candidate::Multiple
         ));
+    }
+
+    #[test]
+    fn callback_state_canonicalizes_local_model_field_before_filtering() {
+        let result = Path::new_local(1, 0);
+        let guard_projection = Path::new_local(2, 0);
+        let receiver = Path::new_parameter(1);
+        let model = Path::new_model_field(
+            Path::new_qualified(result.clone(), Rc::new(PathSelector::Deref)),
+            Rc::from("write_held"),
+        );
+        let expected = Path::new_model_field(receiver.clone(), Rc::from("write_held"));
+        let held: Rc<AbstractValue> = Rc::new(1_u128.into());
+        let mut environment = Environment::default();
+        environment.strong_update_value_at(
+            result,
+            AbstractValue::make_typed_unknown(
+                ExpressionType::ThinPointer,
+                guard_projection.clone(),
+            ),
+        );
+        environment
+            .strong_update_value_at(guard_projection, AbstractValue::make_reference(receiver));
+        assert_eq!(
+            environment.canonicalize_model_field_path(model.clone()),
+            expected
+        );
+        assert!(!expected.contains_local_variable(false));
+        assert!(matches!(
+            expected.value,
+            PathEnum::QualifiedPath { ref selector, .. }
+                if matches!(**selector, PathSelector::ModelField(_))
+        ));
+        environment.strong_update_value_at(model, held.clone());
+
+        let pre_state = callback_pre_state(&environment);
+
+        assert!(
+            pre_state.contains(&(expected, held)),
+            "environment: {:?}; captured state: {pre_state:?}",
+            environment.value_map
+        );
     }
 }

@@ -279,7 +279,12 @@ impl Environment {
 
     /// Rewrites aliases in the qualifier of a model-field path to their canonical sources.
     pub fn canonicalize_model_field_path(&self, path: Rc<Path>) -> Rc<Path> {
-        let PathEnum::QualifiedPath { selector, .. } = &path.value else {
+        let PathEnum::QualifiedPath {
+            qualifier,
+            selector,
+            ..
+        } = &path.value
+        else {
             return path;
         };
         if !matches!(
@@ -288,7 +293,10 @@ impl Environment {
         ) {
             return path;
         }
-        let path = path.canonicalize_reference_projections(self);
+        let path = Path::new_qualified(
+            qualifier.canonicalize_reference_projections(self),
+            selector.clone(),
+        );
 
         let mut result = path;
         let mut visited = HashSet::new();

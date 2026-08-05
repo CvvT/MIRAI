@@ -435,6 +435,9 @@ impl<'tcx> TypeVisitor<'tcx> {
                 if t.is_never() {
                     return t;
                 }
+                while let TyKind::Pat(base, _) = t.kind() {
+                    t = *base;
+                }
                 match t.kind() {
                     TyKind::Infer(..) => {
                         // The qualifier does not resolve to a useful rustc type.
@@ -681,6 +684,9 @@ impl<'tcx> TypeVisitor<'tcx> {
     /// Returns the target type of a reference type.
     #[logfn_inputs(TRACE)]
     pub fn get_dereferenced_type(&self, ty: Ty<'tcx>) -> Ty<'tcx> {
+        if let TyKind::Pat(base, _) = ty.kind() {
+            return self.get_dereferenced_type(*base);
+        }
         match ty.kind() {
             TyKind::RawPtr(ty, _) => *ty,
             TyKind::Ref(_, t, _) => *t,

@@ -5056,12 +5056,9 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
         refined_condition: &Rc<AbstractValue>,
         precondition: &Precondition,
     ) {
-        // Do not seed inferred obligations while replaying an incomplete summary: such facts
-        // could persist into `summarize_incomplete` with misleading provenance. A later complete
-        // pass re-derives them from the live environment instead.
-        if self.block_visitor.bv.recovering_incomplete_summary {
-            return;
-        }
+        // An incomplete recovery may retain a guarded obligation when the entire guard is
+        // caller-promotable. Unconditional obligations still wait for a complete analysis below.
+        let recovering_incomplete_summary = self.block_visitor.bv.recovering_incomplete_summary;
         if self.block_visitor.bv.function_being_analyzed_is_root()
             && self.block_visitor.bv.cv.options.diag_level != DiagLevel::Default
         {
@@ -5169,14 +5166,40 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                     ) else {
                         continue;
                     };
-                    let under_alias = promotable_entry_condition.clone().and(resolved);
+                    let under_alias = promotable_entry_condition.clone().and(resolved.clone());
                     let under_alias_result =
                         self.block_visitor.bv.solve_complete_boolean(&under_alias);
                     debug!(
                         "NotAlias inference under alias {:?} == {:?}: {:?}",
                         callee_subject, live_subject, under_alias_result
                     );
-                    if under_alias_result != SmtResult::Unsatisfiable {
+                    let alias_guard = match under_alias_result {
+                        SmtResult::Unsatisfiable => None,
+                        SmtResult::Satisfiable => {
+                            let Some(promotable_alias_condition) =
+                                resolved.extract_promotable_disjuncts(false)
+                            else {
+                                continue;
+                            };
+                            if promotable_alias_condition != resolved {
+                                continue;
+                            }
+                            let alias_violation = promotable_entry_condition
+                                .clone()
+                                .and(resolved.logical_not());
+                            if self
+                                .block_visitor
+                                .bv
+                                .solve_complete_boolean(&alias_violation)
+                                != SmtResult::Satisfiable
+                            {
+                                continue;
+                            }
+                            Some(promotable_alias_condition)
+                        }
+                        SmtResult::Undefined => continue,
+                    };
+                    if recovering_incomplete_summary && alias_guard.is_none() {
                         continue;
                     }
 
@@ -5191,10 +5214,13 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                     else {
                         continue;
                     };
-                    let condition = promotable_entry_condition
-                        .clone()
-                        .logical_not()
-                        .or(promotable_not_alias);
+                    let condition = promotable_entry_condition.clone().logical_not().or(
+                        if let Some(alias_guard) = alias_guard {
+                            alias_guard.or(promotable_not_alias)
+                        } else {
+                            promotable_not_alias
+                        },
+                    );
                     if let Some(existing) =
                         self.block_visitor
                             .bv
