@@ -39,6 +39,9 @@ The external-LiteBox opaque `read_from_user::<u32>` pointer shape (no concrete b
 ### Hygiene: clean
 Canonical `/workspace/MIRAI` matched the published origin tip with empty status at verification. Tested code ancestor `1a00076` contains the durable admissibility control. Union-field ICE hardening (`1990510`) is present in the published branch, and `run_pass` is green. Stale-SHA/dirty banners from frozen session worktrees are known artifacts, not regressions.
 
+### Solver-timeout false positive: resolved (`23d186a`)
+The solver-timeout false-positive path is **resolved**, not open: `23d186a` "Separate solver timeouts from incomplete encoding" distinguishes `Solver(SmtResult::Undefined)` (timeout — skips diagnostic emission) from `EncodingIncomplete` (retains the guarded diagnostic), covered by the committed test `complete_boolean_query_distinguishes_incomplete_encoding_from_solver_timeout` in `body_visitor.rs`. @factchecker's under-load loop ran 30/30 stable.
+
 ## 5. Conclusion
 
 Criterion 3 is fully verified and permanently closed on the published branch, with tested code closure at ancestor `1a00076` (after `b1bcf49`). Both in-repo scopes pass, the decode boundary is backed by a real discriminating oracle (byte/shift cells) proven across a cold-built pre-fix checker, and only a non-reproducing external opaque-source item remains — non-gating.
@@ -48,4 +51,4 @@ Criterion 3 is fully verified and permanently closed on the published branch, wi
 - Byte-level per-cell gate + positive-control classification: @factchecker
 - `transport_decode_probe.rs` corroborating only / non-discriminating (warns pre- and post-fix): @factchecker, @opus
 - Terminal disposition and standing rulings: @lead
-- Commits: `3b697a8` (original verification-report commit), `1a00076` (tested code closure — durable admissibility control cell `unconditional_byte_decoded_alias`), `9ed4df3` (rustfmt), `47dc59f` (byte-decode `from_ne_bytes` oracle + fix), `b1bcf49` (shift-reconstruction fix + oracle — not another `from_ne_bytes` regression), `2c42572` (corroborating shape guard `transport_decode_probe.rs`), `1990510` (union-field ICE hardening). `ae56d9e` = byte-cell pre-fix baseline only (parent of `47dc59f`); closure anchored at `b1bcf49+`.
+- Commits: `3b697a8` (original verification-report commit), `1a00076` (tested code closure — durable admissibility control cell `unconditional_byte_decoded_alias`), `9ed4df3` (rustfmt), `47dc59f` (byte-decode `from_ne_bytes` oracle + fix), `b1bcf49` (shift-reconstruction fix + oracle — not another `from_ne_bytes` regression), `2c42572` (corroborating shape guard `transport_decode_probe.rs`), `1990510` (union-field ICE hardening), `23d186a` (solver-timeout vs incomplete-encoding separation). `ae56d9e` = byte-cell pre-fix baseline only (parent of `47dc59f`); closure anchored at `b1bcf49+`.
