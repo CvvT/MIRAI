@@ -2,7 +2,7 @@
 
 ## 1. Executive Summary
 
-Criterion 3 is **PASS** on published branch `codex/arc-deref-model-clean`, anchored after `b1bcf49`; the decode oracle is durably committed in tested code ancestor `1a00076`. Both in-repo scopes verify green, backed by a cold-proven, committed fail→pass oracle. All residuals are non-gating: an external-LiteBox opaque-source item, the LiteBox production `setsockopt` XFAIL, and a documented load-induced false-negative limitation. No open, pending, or gating work remains.
+Criterion 3 is **PASS** on published branch `codex/arc-deref-model-clean`, anchored after `b1bcf49`; the decode oracle is durably committed in tested code ancestor `1a00076`. (`1a00076` is a tested-code **ancestor**, not the published tip — the branch HEAD has since advanced through the report-correction commits and is a strict descendant of it, so the verdict holds at HEAD and every descendant.) Both in-repo scopes verify green, backed by a cold-proven, committed fail→pass oracle. All residuals are non-gating: an external-LiteBox opaque-source item, the LiteBox production `setsockopt` XFAIL, and a documented load-induced false-negative limitation. No open, pending, or gating work remains.
 
 ## 2. Findings
 
@@ -26,7 +26,7 @@ The teeth belong to two distinct cells in `inferred_guarded_not_alias_preconditi
 ## 3. Corrections of Record
 
 - **The original `transport_decode_probe.rs` (`2c42572`) was corroborating coverage only — NOT fail→pass.** That version warned identically at *both* `ae56d9e` and the post-fix branch (KEEPALIVE 1, BROADCAST 0); constant-folding explained it. Commit `ae087a4` subsequently strengthened the fixture so the raw `u32::from_ne_bytes` result is the sole precondition gate across a nested-helper/dispatch-callback boundary, adding transport-shaped coverage. Per @factchecker's direct pre/post runs, however, even the strengthened fixture **warns identically at both `ae56d9e` and the post-fix branch** — it is corroborating coverage only and is **not** a discriminating fail→pass differential. The load-bearing fail→pass evidence is exclusively the main fixture's byte- and shift-decoded KEEPALIVE cells (`inferred_guarded_not_alias_precondition.rs`); `transport_decode_probe.rs` is never relied upon for that attribution.
-- **The "decoded-silent / literal-warns" matched-plumbing isolation is NOT load-bearing.** @factchecker's matched-control (`matched.rs`) and opaque-pair runs both showed *no* decode-vs-direct divergence (both fire; the session-local exit code is not treated as durable evidence). That specific isolation does not discriminate; the committed byte/shift fail→pass is the decisive evidence.
+- **The "decoded-silent / literal-warns" matched-plumbing isolation is NOT load-bearing.** @factchecker's matched-control (`matched.rs`) and opaque-pair runs both showed *no* decode-vs-direct divergence (both fire). Per @factchecker's verbatim rerun at exact `ae56d9e`, `matched.rs` **emitted two warnings and exited `0`** (`MATCHED_EXIT=0`) — **not** exit `101`; this session-local exit code is not treated as durable evidence in any case. That specific isolation does not discriminate; the committed byte/shift fail→pass is the decisive evidence.
 - **`ae56d9e` is the byte-cell pre-fix baseline only** (parent of `47dc59f`) — it is never the closure anchor. Closure is anchored at `b1bcf49+`.
 
 ## 4. Closure Rationale
