@@ -27,28 +27,8 @@ use crate::tag_domain::Tag;
 
 pub type Z3ExpressionType = z3_sys::Z3_ast;
 
-/// Base per-check wall-clock timeout (milliseconds) applied at solver construction.
-const BASE_TIMEOUT_MS: u32 = 100;
-/// Higher per-check timeout used for a single re-solve when the base check is undefined.
-const RESOLVE_TIMEOUT_MS: u32 = 2000;
-
 lazy_static! {
     static ref Z3_MUTEX: Mutex<()> = Mutex::new(());
-}
-
-fn retry_undefined_once(
-    result: SmtResult,
-    mut solve: impl FnMut() -> SmtResult,
-    mut set_timeout: impl FnMut(u32),
-) -> SmtResult {
-    if result != SmtResult::Undefined {
-        return result;
-    }
-
-    set_timeout(RESOLVE_TIMEOUT_MS);
-    let retry_result = solve();
-    set_timeout(BASE_TIMEOUT_MS);
-    retry_result
 }
 
 pub struct Z3Solver {
@@ -84,9 +64,7 @@ impl Z3Solver {
             let _guard = Z3_MUTEX.lock().unwrap();
             let z3_sys_cfg = z3_sys::Z3_mk_config();
             let time_out = CString::new("timeout").unwrap().into_raw();
-            let ms = CString::new(BASE_TIMEOUT_MS.to_string())
-                .unwrap()
-                .into_raw();
+            let ms = CString::new("100").unwrap().into_raw();
             z3_sys::Z3_set_param_value(z3_sys_cfg, time_out, ms);
 
             let z3_context = z3_sys::Z3_mk_context(z3_sys_cfg);
@@ -278,36 +256,13 @@ impl SmtSolver<Z3ExpressionType> for Z3Solver {
             // ever called (per the trait contract) after a Satisfiable solve with no intervening
             // pop, where Z3_solver_get_model is safe.
             self.release_cached_model();
-            let result = self.solve_current_context();
-            retry_undefined_once(
-                result,
-                || self.solve_current_context(),
-                |timeout_ms| self.set_solver_timeout(timeout_ms),
-            )
+            let result = z3_sys::Z3_solver_check(self.z3_context, self.z3_solver);
+            match result {
+                z3_sys::Z3_L_TRUE => SmtResult::Satisfiable,
+                z3_sys::Z3_L_FALSE => SmtResult::Unsatisfiable,
+                _ => SmtResult::Undefined,
+            }
         }
-    }
-}
-
-impl Z3Solver {
-    /// Solves the current context. The caller must hold `Z3_MUTEX`.
-    unsafe fn solve_current_context(&self) -> SmtResult {
-        match z3_sys::Z3_solver_check(self.z3_context, self.z3_solver) {
-            z3_sys::Z3_L_TRUE => SmtResult::Satisfiable,
-            z3_sys::Z3_L_FALSE => SmtResult::Unsatisfiable,
-            _ => SmtResult::Undefined,
-        }
-    }
-
-    /// Sets the solver's per-check wall-clock timeout, in milliseconds.
-    /// The caller must hold `Z3_MUTEX`.
-    unsafe fn set_solver_timeout(&self, ms: u32) {
-        let params = z3_sys::Z3_mk_params(self.z3_context);
-        z3_sys::Z3_params_inc_ref(self.z3_context, params);
-        let key = CString::new("timeout").unwrap();
-        let symbol = z3_sys::Z3_mk_string_symbol(self.z3_context, key.as_ptr());
-        z3_sys::Z3_params_set_uint(self.z3_context, params, symbol, ms);
-        z3_sys::Z3_solver_set_params(self.z3_context, self.z3_solver, params);
-        z3_sys::Z3_params_dec_ref(self.z3_context, params);
     }
 }
 
@@ -2346,26 +2301,6 @@ impl Drop for Z3Solver {
 mod tests {
     use super::*;
     use crate::abstract_value::TRUE;
-    use std::cell::RefCell;
-
-    #[test]
-    fn undefined_solve_retries_once_and_restores_the_base_timeout() {
-        let retry_results = RefCell::new(vec![SmtResult::Satisfiable].into_iter());
-        let timeouts = RefCell::new(Vec::new());
-
-        let result = retry_undefined_once(
-            SmtResult::Undefined,
-            || retry_results.borrow_mut().next().unwrap(),
-            |timeout_ms| timeouts.borrow_mut().push(timeout_ms),
-        );
-
-        assert_eq!(result, SmtResult::Satisfiable);
-        assert_eq!(
-            *timeouts.borrow(),
-            vec![RESOLVE_TIMEOUT_MS, BASE_TIMEOUT_MS]
-        );
-        assert!(retry_results.borrow_mut().next().is_none());
-    }
 
     #[test]
     fn pushed_sat_queries_do_not_capture_models_before_backtracking() {
