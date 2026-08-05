@@ -36,8 +36,8 @@ Criterion 3 = PASS on the published branch, with the tested code closure at ance
 ### Residual — External-LiteBox opaque pointer (Item 3): non-gating
 The external-LiteBox opaque `read_from_user::<u32>` pointer shape (no concrete bytes to propagate) remains a documented, non-gating backlog item; it does not reproduce in `CvvT/MIRAI`. The pre-existing 2021 `body_visitor.rs:4061` union ICE is resolved by `1990510`, with nested-union regression coverage in `union_field_assignment.rs`. No LiteBox stack-overflow signature is substantiated by any captured artifact (the most recent external capture is a distinct rustc trait-resolution ICE in `try_to_devirtualize`, not stack exhaustion); any such external-only instability, if later reproduced, is orthogonal to Criterion 3's in-repo PASS and non-gating.
 
-### Hygiene: clean
-Canonical `/workspace/MIRAI` matched the published origin tip with empty status at verification. Tested code ancestor `1a00076` contains the durable admissibility control. Union-field ICE hardening (`1990510`) is present in the published branch, and `run_pass` is green. Stale-SHA/dirty banners from frozen session worktrees are known artifacts, not regressions.
+### Hygiene at the verification anchor
+At verification, canonical `/workspace/MIRAI` matched the published origin tip with empty status. Tested code ancestor `1a00076` contained the durable admissibility control, union-field ICE hardening (`1990510`) was present in the verified branch, and `run_pass` completed green. Later worktree state does not alter these commit-scoped results.
 
 ### Solver-timeout false positive: resolved (`23d186a`)
 The solver-timeout false-positive path is **resolved**, not open: `23d186a` "Separate solver timeouts from incomplete encoding" distinguishes `Solver(SmtResult::Undefined)` (timeout — skips diagnostic emission) from `EncodingIncomplete` (retains the guarded diagnostic), covered by the committed test `complete_boolean_query_distinguishes_incomplete_encoding_from_solver_timeout` in `body_visitor.rs`. @factchecker's under-load loop ran 30/30 stable.
