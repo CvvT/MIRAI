@@ -874,6 +874,7 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
             .expect("push_callback_invocation must append an invocation")
             .pre_state
             .extend(argument_projection_state);
+        self.project_last_callback_guard(actual_args);
         true
     }
 
@@ -971,6 +972,7 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
             .expect("push_callback_invocation must append an invocation")
             .pre_state
             .extend(argument_projection_state);
+        self.project_last_callback_guard(actual_args);
         let capture_model_rekeys = capture_aliases
             .iter()
             .filter_map(|(boundary_path, source_value)| {
@@ -1202,6 +1204,49 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
 
     pub(crate) fn callback_argument_projection_root(index: usize) -> Rc<Path> {
         Path::new_field(Rc::new(PathEnum::PhantomData.into()), index)
+    }
+
+    fn project_last_callback_guard(&mut self, actual_args: &[(Rc<Path>, Rc<AbstractValue>)]) {
+        let projected_arguments = {
+            let invocation = self
+                .bv
+                .callback_invocations
+                .last()
+                .expect("push_callback_invocation must append an invocation");
+            actual_args
+                .iter()
+                .enumerate()
+                .filter_map(|(index, (argument_path, argument_value))| {
+                    if argument_value.is_function() {
+                        return None;
+                    }
+                    let projection_root = Self::callback_argument_projection_root(index);
+                    invocation
+                        .pre_state
+                        .iter()
+                        .any(|(path, _)| path.is_rooted_by(&projection_root))
+                        .then_some((argument_path.clone(), projection_root))
+                })
+                .collect::<Vec<_>>()
+        };
+        if projected_arguments.is_empty() {
+            return;
+        }
+        let projected_guard = projected_arguments.iter().fold(
+            self.bv.current_environment.entry_condition.clone(),
+            |guard, (argument_path, projection_root)| {
+                guard.replace_embedded_path_root(argument_path, projection_root.clone())
+            },
+        );
+        let invocation = self
+            .bv
+            .callback_invocations
+            .last_mut()
+            .expect("push_callback_invocation must append an invocation");
+        invocation.guard = projected_guard
+            .extract_promotable_conjuncts(false)
+            .filter(|guard| !guard.expression.contains_local_variable(false))
+            .unwrap_or_else(|| Rc::new(abstract_value::TRUE));
     }
 
     fn find_local_callback_parameter(
