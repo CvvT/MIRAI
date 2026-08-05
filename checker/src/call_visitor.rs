@@ -5187,7 +5187,10 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
         let baseline = promotable_entry_condition.clone().and(resolved_baseline);
         let baseline_result = self.block_visitor.bv.solve_complete_boolean(&baseline);
         debug!("NotAlias inference baseline: {baseline_result:?}");
-        if baseline_result != SmtResult::Satisfiable {
+        // An unsupported value transform can make the baseline undecidable even though alias
+        // substitution removes the unsupported model-field dependency. Continue in that case;
+        // the checks below still require an aliased path with a caller-representable guard.
+        if baseline_result == SmtResult::Unsatisfiable {
             return;
         }
 
@@ -5269,7 +5272,17 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                             }
                             Some(promotable_alias_condition)
                         }
-                        SmtResult::Undefined => continue,
+                        SmtResult::Undefined => {
+                            let Some(promotable_alias_condition) =
+                                resolved.extract_promotable_disjuncts(false)
+                            else {
+                                continue;
+                            };
+                            if promotable_alias_condition != resolved {
+                                continue;
+                            }
+                            Some(promotable_alias_condition)
+                        }
                     };
                     if recovering_incomplete_summary && alias_guard.is_none() {
                         continue;

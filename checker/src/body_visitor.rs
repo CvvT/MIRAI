@@ -1069,6 +1069,10 @@ pub(crate) fn substitute_alias_in_complete_value(
             let (left, right) = substitute_binary(left, right)?;
             Some(left.and(right))
         }
+        Expression::Add { left, right } => {
+            let (left, right) = substitute_binary(left, right)?;
+            Some(left.addition(right))
+        }
         Expression::BitAnd { left, right } => {
             let (left, right) = substitute_binary(left, right)?;
             Some(left.bit_and(right))
@@ -1105,13 +1109,27 @@ pub(crate) fn substitute_alias_in_complete_value(
             let (left, right) = substitute_binary(left, right)?;
             Some(left.not_equals(right))
         }
+        Expression::Mul { left, right } => {
+            let (left, right) = substitute_binary(left, right)?;
+            Some(left.multiply(right))
+        }
         Expression::Or { left, right } => {
             let (left, right) = substitute_binary(left, right)?;
             Some(left.or(right))
         }
+        Expression::Rem { left, right } => {
+            let (left, right) = substitute_binary(left, right)?;
+            Some(left.remainder(right))
+        }
         Expression::LogicalNot { operand } => {
             Some(substitute_alias_in_complete_value(operand, alias, source)?.logical_not())
         }
+        Expression::Transmute {
+            operand,
+            target_type,
+        } => Some(
+            substitute_alias_in_complete_value(operand, alias, source)?.transmute(*target_type),
+        ),
         _ => None,
     }
 }
@@ -1156,7 +1174,8 @@ pub(crate) fn collect_model_field_subjects(
 
             true
         }
-        Expression::And { left, right }
+        Expression::Add { left, right }
+        | Expression::And { left, right }
         | Expression::BitAnd { left, right }
         | Expression::BitOr { left, right }
         | Expression::BitXor { left, right }
@@ -1165,9 +1184,11 @@ pub(crate) fn collect_model_field_subjects(
         | Expression::GreaterThan { left, right }
         | Expression::LessOrEqual { left, right }
         | Expression::LessThan { left, right }
+        | Expression::Mul { left, right }
         | Expression::Ne { left, right }
-        | Expression::Or { left, right } => collect_binary(left, right),
-        Expression::LogicalNot { operand } => {
+        | Expression::Or { left, right }
+        | Expression::Rem { left, right } => collect_binary(left, right),
+        Expression::LogicalNot { operand } | Expression::Transmute { operand, .. } => {
             collect_model_field_subjects(&operand.expression, subjects)
         }
         _ => false,
@@ -1219,6 +1240,10 @@ pub(crate) fn resolve_model_fields_in_complete_value(
             let (left, right) = resolve_binary(left, right)?;
             Some(left.and(right))
         }
+        Expression::Add { left, right } => {
+            let (left, right) = resolve_binary(left, right)?;
+            Some(left.addition(right))
+        }
         Expression::BitAnd { left, right } => {
             let (left, right) = resolve_binary(left, right)?;
             Some(left.bit_and(right))
@@ -1255,13 +1280,27 @@ pub(crate) fn resolve_model_fields_in_complete_value(
             let (left, right) = resolve_binary(left, right)?;
             Some(left.not_equals(right))
         }
+        Expression::Mul { left, right } => {
+            let (left, right) = resolve_binary(left, right)?;
+            Some(left.multiply(right))
+        }
         Expression::Or { left, right } => {
             let (left, right) = resolve_binary(left, right)?;
             Some(left.or(right))
         }
+        Expression::Rem { left, right } => {
+            let (left, right) = resolve_binary(left, right)?;
+            Some(left.remainder(right))
+        }
         Expression::LogicalNot { operand } => {
             Some(resolve_model_fields_in_complete_value(operand, environment)?.logical_not())
         }
+        Expression::Transmute {
+            operand,
+            target_type,
+        } => Some(
+            resolve_model_fields_in_complete_value(operand, environment)?.transmute(*target_type),
+        ),
         _ => None,
     }
 }

@@ -68,7 +68,7 @@ fn dispatch_socket_option(option: SocketOption, callback: impl FnOnce(SocketOpti
 
 fn guarded_dispatched_socket_option(option: SocketOption, read: &Lock, written: &Lock) {
     set_model_field!(written, writer, 1usize);
-    dispatch_socket_option(option, |selected| match selected {
+    dispatch_socket_option(option, |selected| match selected { //~ related location
         SocketOption::KeepAlive => require_unlocked_when(1, read),
         SocketOption::Broadcast => {}
     });
@@ -113,6 +113,19 @@ fn guarded_decoded_socket_option(option: SocketOptionName, read: &Lock, written:
                 let _enabled = value != 0;
             }
         });
+    });
+}
+
+fn dispatch_byte_decoded_option(option: [u8; 4], callback: impl FnOnce(u32)) {
+    callback(u32::from_ne_bytes(option));
+}
+
+fn guarded_byte_decoded_option(option: [u8; 4], read: &Lock, written: &Lock) {
+    set_model_field!(written, writer, 1usize);
+    dispatch_byte_decoded_option(option, |selected| {
+        if selected == 9 {
+            require_unlocked_when(1, read);
+        }
     });
 }
 
@@ -200,6 +213,17 @@ pub fn decoded_broadcast_alias(lock: &Lock) {
         lock,
         lock,
     );
+}
+
+pub fn byte_decoded_keepalive_alias(lock: &Lock) {
+    set_model_field!(lock, writer, 0usize);
+    guarded_byte_decoded_option(9u32.to_ne_bytes(), lock, lock);
+    //~ possible alias violates precondition
+}
+
+pub fn byte_decoded_broadcast_alias(lock: &Lock) {
+    set_model_field!(lock, writer, 0usize);
+    guarded_byte_decoded_option(6u32.to_ne_bytes(), lock, lock);
 }
 
 pub fn main() {}
