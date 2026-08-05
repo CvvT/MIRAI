@@ -10,7 +10,7 @@ Criterion 3 is **PASS** on published branch `codex/arc-deref-model-clean`, ancho
 Enum discriminant lineage tracking verified green. *(analyst/factchecker vetted; high confidence.)*
 
 ### Scope 2 (in-repo) — `u32::from_ne_bytes` decode boundary: PASS
-The decode-boundary acceptance bar is met with a **genuine committed fail→pass oracle**: the **byte/shift cells** in `inferred_guarded_not_alias_precondition.rs`.
+The decode-boundary acceptance bar is met with a **genuine committed fail→pass oracle**: the **byte/shift cells** in `inferred_guarded_not_alias_precondition.rs`. *(Independently gated at exact `b1bcf49` by @factchecker — `run_pass` `test result: ok. 1 passed; 0 failed`, exit 0, byte- and shift-decoded cells each KEEPALIVE=1 / BROADCAST=0; verified, high confidence.)*
 
 The teeth belong to two distinct cells in `inferred_guarded_not_alias_precondition.rs`, each fixed by a distinct commit:
 
