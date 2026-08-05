@@ -855,7 +855,7 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
             return true;
         }
         let (boundary_args, arguments_complete, argument_projection_state) =
-            self.callback_boundary_arguments(actual_args);
+            self.callback_boundary_arguments(actual_args, true);
         self.push_callback_invocation(callee_parameter, &boundary_args, arguments_complete, None);
         self.bv
             .callback_invocations
@@ -941,7 +941,7 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
         }
 
         let (mut boundary_args, arguments_complete, argument_projection_state) =
-            self.callback_boundary_arguments(actual_args);
+            self.callback_boundary_arguments(actual_args, false);
         if boundary_args
             .first()
             .is_some_and(|(_, value)| value.is_function())
@@ -1050,6 +1050,7 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
     fn callback_boundary_arguments(
         &self,
         actual_args: &[(Rc<Path>, Rc<AbstractValue>)],
+        preserve_unprojected_arguments: bool,
     ) -> (
         Vec<(Rc<Path>, Rc<AbstractValue>)>,
         bool,
@@ -1104,6 +1105,9 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                         );
                         return (projection_root, value);
                     }
+                }
+                if preserve_unprojected_arguments {
+                    return (path.clone(), value.clone());
                 }
                 arguments_complete = false;
                 (Path::new_computed(Rc::new(BOTTOM)), Rc::new(BOTTOM))
