@@ -30,6 +30,7 @@ fn invoke_when_active(active: u32, callback: impl FnOnce()) {
 fn guarded_callback_writers(active: u32, read: &Lock, written: &Lock) {
     set_model_field!(written, writer, 1usize);
     invoke_when_active(active, || require_unlocked_when(1, read)); //~ related location
+    //~ related location
 }
 
 #[derive(Clone, Copy)]
@@ -40,6 +41,10 @@ enum SocketOption {
 
 enum SocketOptionName {
     Socket(SocketOption),
+}
+
+enum SocketOptionValue {
+    U32(u32),
 }
 
 fn with_writer(written: &Lock, callback: impl FnOnce()) {
@@ -83,6 +88,31 @@ fn guarded_named_socket_option(option: SocketOptionName, read: &Lock, written: &
     dispatch_named_socket_option(option, |selected| match selected {
         SocketOption::KeepAlive => require_unlocked_when(1, read),
         SocketOption::Broadcast => {}
+    });
+}
+
+fn decode_socket_option(
+    option: SocketOptionName,
+    callback: impl FnOnce(SocketOption, SocketOptionValue),
+) {
+    match option {
+        SocketOptionName::Socket(selected @ (SocketOption::Broadcast | SocketOption::KeepAlive)) => {
+            callback(selected, SocketOptionValue::U32(1))
+        }
+    }
+}
+
+fn guarded_decoded_socket_option(option: SocketOptionName, read: &Lock, written: &Lock) {
+    decode_socket_option(option, |selected, value| {
+        with_writer(written, || match (selected, value) {
+            (SocketOption::KeepAlive, SocketOptionValue::U32(value)) => {
+                let _enabled = value != 0;
+                require_unlocked_when(1, read)
+            }
+            (SocketOption::Broadcast, SocketOptionValue::U32(value)) => {
+                let _enabled = value != 0;
+            }
+        });
     });
 }
 
@@ -147,6 +177,25 @@ pub fn named_keepalive_alias(lock: &Lock) {
 pub fn named_broadcast_alias(lock: &Lock) {
     set_model_field!(lock, writer, 0usize);
     guarded_named_socket_option(
+        SocketOptionName::Socket(SocketOption::Broadcast),
+        lock,
+        lock,
+    );
+}
+
+pub fn decoded_keepalive_alias(lock: &Lock) {
+    set_model_field!(lock, writer, 0usize);
+    guarded_decoded_socket_option(
+        SocketOptionName::Socket(SocketOption::KeepAlive),
+        lock,
+        lock,
+    );
+    //~ possible alias violates precondition
+}
+
+pub fn decoded_broadcast_alias(lock: &Lock) {
+    set_model_field!(lock, writer, 0usize);
+    guarded_decoded_socket_option(
         SocketOptionName::Socket(SocketOption::Broadcast),
         lock,
         lock,
