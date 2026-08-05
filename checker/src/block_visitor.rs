@@ -3717,12 +3717,13 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                         return self.visit_const(&arg_val.expect_const());
                     }
                 }
-                assume_unreachable!(
+                debug!(
                     "reference to unmatched generic constant argument {:?} {:?} {:?}",
                     kind,
                     self.type_visitor().generic_arguments,
                     self.bv.current_span
                 );
+                Rc::new(ConstantDomain::Unimplemented.into())
             }
             rustc_middle::ty::ConstKind::Value(value) => {
                 match *value.valtree {

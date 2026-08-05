@@ -508,10 +508,20 @@ pub fn def_id_display_name(tcx: TyCtxt<'_>, def_id: DefId) -> String {
 /// Returns false if any of the generic arguments are themselves generic
 pub fn are_concrete(gen_args: GenericArgsRef<'_>) -> bool {
     for gen_arg in gen_args.iter() {
-        if let GenericArgKind::Type(ty) = gen_arg.kind() {
-            if !is_concrete(ty.kind()) {
+        match gen_arg.kind() {
+            GenericArgKind::Type(ty) if !is_concrete(ty.kind()) => return false,
+            GenericArgKind::Const(constant)
+                if matches!(
+                    constant.kind(),
+                    ty::ConstKind::Param(..)
+                        | ty::ConstKind::Bound(..)
+                        | ty::ConstKind::Placeholder(..)
+                        | ty::ConstKind::Infer(..)
+                ) =>
+            {
                 return false;
             }
+            _ => {}
         }
     }
     true

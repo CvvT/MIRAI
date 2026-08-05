@@ -3204,10 +3204,8 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
                             target_type,
                         );
                     }
-                } else {
-                    unreachable!("the qualifier path of a union field is not a union");
+                    return;
                 }
-                return;
             }
         }
 
@@ -4147,7 +4145,7 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
                     case_index,
                     num_cases,
                 } => {
-                    let source_path = Path::new_computed(value);
+                    let source_path = Path::new_computed(value.clone());
                     let union_type = self
                         .type_visitor()
                         .get_path_rustc_type(qualifier, self.current_span);
@@ -4175,10 +4173,8 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
                                 target_type,
                             );
                         }
-                    } else {
-                        unreachable!("the qualifier path of a union field is not a union");
+                        return;
                     }
-                    return;
                 }
                 _ => {}
             }

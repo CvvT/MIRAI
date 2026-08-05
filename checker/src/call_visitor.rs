@@ -753,18 +753,20 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 .skip_binder()
                 .fn_sig(tcx)
                 .abi();
-            let resolved_instance =
-                if abi == ExternAbi::Rust && !utils::contains_unresolvable_projection(gen_args) {
-                    // Skip projections that rustc cannot normalize in this typing environment.
-                    Some(rustc_middle::ty::Instance::try_resolve(
-                        tcx,
-                        typing_env,
-                        self.callee_def_id,
-                        gen_args,
-                    ))
-                } else {
-                    None
-                };
+            let resolved_instance = if abi == ExternAbi::Rust
+                && utils::are_concrete(gen_args)
+                && !utils::contains_unresolvable_projection(gen_args)
+            {
+                // Skip projections that rustc cannot normalize in this typing environment.
+                Some(rustc_middle::ty::Instance::try_resolve(
+                    tcx,
+                    typing_env,
+                    self.callee_def_id,
+                    gen_args,
+                ))
+            } else {
+                None
+            };
             if let Some(Ok(Some(instance))) = resolved_instance {
                 let resolved_def_id = instance.def.def_id();
                 let has_mir = tcx.is_mir_available(resolved_def_id);

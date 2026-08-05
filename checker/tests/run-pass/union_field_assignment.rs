@@ -99,6 +99,7 @@ pub fn t4() {
     }
 }
 
+#[derive(Copy, Clone)]
 pub union U1 {
     x: u32,
     y: [u8; 4],
@@ -143,4 +144,22 @@ pub union U3 {
 pub fn t8() {
     let _u = U3 { y: 1 }; //~ The union is not fully initialized by this assignment
 }
+
+#[derive(Copy, Clone)]
+pub struct NestedUnion {
+    pub u: U1,
+}
+
+pub fn t9() {
+    let _nested = NestedUnion { u: U1 { x: 257 } };
+}
+
+pub fn t10(nested: &[NestedUnion]) {
+    precondition!(!nested.is_empty());
+    let copied = nested[0];
+    unsafe {
+        verify!(copied.u.x == nested[0].u.x);
+    }
+}
+
 pub fn main() {}
