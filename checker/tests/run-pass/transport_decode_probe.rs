@@ -2,13 +2,11 @@
 //
 // This source code is licensed under the MIT license found in the root directory of this source tree.
 
-// Faithful production-transport regression: a guarded lock precondition must survive a socket
-// option whose discriminant is carried through a genuine `u32::from_ne_bytes` value-decode in a
-// nested helper (not a literal) and then gated by a raw-integer `== 9` comparison across a
-// dispatch-callback boundary. The precondition obligation forms only if MIRAI value-tracks the
-// byte-decode transform through the comparison; before the decode-intrinsic fix this raw-integer
-// gate was treated as opaque, dropping the KEEPALIVE warning (false negative). The aliased
-// KEEPALIVE caller must warn; the same-shape BROADCAST caller must remain silent.
+// Corroborating production-transport coverage: a socket discriminant flows through a genuine
+// `u32::from_ne_bytes` value-decode in a nested helper and a raw-integer `== 9` gate across a
+// dispatch-callback boundary. Because the guarded call passes a literal `1`, its precondition is
+// decode-independent; this fixture is not a reliable pre-fix differential. The aliased KEEPALIVE
+// caller must warn, while the same-shape BROADCAST caller must remain silent.
 
 use mirai_annotations::*;
 
