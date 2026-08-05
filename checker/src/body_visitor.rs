@@ -91,7 +91,8 @@ mod existential_precondition_tests {
     use super::{
         check_existential_precondition_with_solver, classify_existential_result,
         collect_model_field_subjects, collect_replay_input_roots, evaluate_replay_violation,
-        resolve_model_fields_in_complete_value, ExistentialPreconditionResult, ReplayEvaluation,
+        resolve_model_fields_in_complete_value, solve_complete_boolean_with_solver,
+        CompleteBooleanResult, ExistentialPreconditionResult, ReplayEvaluation,
     };
     use crate::abstract_value::{AbstractValue, AbstractValueTrait, FALSE, TRUE};
     use crate::constant_domain::ConstantDomain;
@@ -174,6 +175,18 @@ mod existential_precondition_tests {
             ),
             ExistentialPreconditionResult::Undefined
         ));
+    }
+
+    #[test]
+    fn complete_boolean_query_distinguishes_incomplete_encoding_from_solver_timeout() {
+        assert_eq!(
+            solve_complete_boolean_with_solver(&SolverStub::default(), &TRUE),
+            CompleteBooleanResult::Solver(SmtResult::Undefined)
+        );
+        assert_eq!(
+            solve_complete_boolean_with_solver(&SolverStub::default(), &crate::abstract_value::TOP,),
+            CompleteBooleanResult::EncodingIncomplete
+        );
     }
 
     #[cfg(feature = "z3")]
@@ -709,6 +722,12 @@ pub(crate) enum ExistentialPreconditionResult {
     Undefined,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CompleteBooleanResult {
+    EncodingIncomplete,
+    Solver(SmtResult),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReplayEvaluation {
     NativePredicateAgreement,
@@ -1023,6 +1042,19 @@ fn check_existential_precondition_with_solver<SmtExpressionType>(
         SmtResult::Unsatisfiable => ExistentialPreconditionResult::UnsatisfiableComplete,
         SmtResult::Undefined => ExistentialPreconditionResult::Undefined,
     }
+}
+
+fn solve_complete_boolean_with_solver<SmtExpressionType>(
+    solver: &impl SmtSolver<SmtExpressionType>,
+    condition: &AbstractValue,
+) -> CompleteBooleanResult {
+    if !existential_encoding_is_complete(&condition.expression)
+        || !model_field_types_are_consistent(&condition.expression, &mut HashMap::new())
+    {
+        return CompleteBooleanResult::EncodingIncomplete;
+    }
+    let predicate = solver.get_as_smt_predicate(&condition.expression);
+    CompleteBooleanResult::Solver(solver.solve_expression(&predicate))
 }
 
 pub(crate) fn substitute_alias_in_complete_value(
@@ -1600,14 +1632,11 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
         result
     }
 
-    pub(crate) fn solve_complete_boolean(&self, condition: &Rc<AbstractValue>) -> SmtResult {
-        if !existential_encoding_is_complete(&condition.expression)
-            || !model_field_types_are_consistent(&condition.expression, &mut HashMap::new())
-        {
-            return SmtResult::Undefined;
-        }
-        let predicate = self.smt_solver.get_as_smt_predicate(&condition.expression);
-        self.smt_solver.solve_expression(&predicate)
+    pub(crate) fn solve_complete_boolean(
+        &self,
+        condition: &Rc<AbstractValue>,
+    ) -> CompleteBooleanResult {
+        solve_complete_boolean_with_solver(&self.smt_solver, condition)
     }
 
     fn record_incomplete_analysis(&mut self) {

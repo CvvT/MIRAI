@@ -22,7 +22,8 @@ use crate::abstract_value::{AbstractValue, AbstractValueTrait};
 use crate::block_visitor::BlockVisitor;
 use crate::body_visitor::{
     collect_model_field_subjects, resolve_model_fields_in_complete_value,
-    substitute_alias_in_complete_value, BodyVisitor, ExistentialPreconditionResult,
+    substitute_alias_in_complete_value, BodyVisitor, CompleteBooleanResult,
+    ExistentialPreconditionResult,
 };
 use crate::constant_domain::{ConstantDomain, FunctionReference};
 use crate::coverage::{CoverageGapKind, CoverageRecord};
@@ -5190,7 +5191,7 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
         // An unsupported value transform can make the baseline undecidable even though alias
         // substitution removes the unsupported model-field dependency. Continue in that case;
         // the checks below still require an aliased path with a caller-representable guard.
-        if baseline_result == SmtResult::Unsatisfiable {
+        if baseline_result == CompleteBooleanResult::Solver(SmtResult::Unsatisfiable) {
             return;
         }
 
@@ -5249,8 +5250,8 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                         callee_subject, live_subject, under_alias_result
                     );
                     let alias_guard = match under_alias_result {
-                        SmtResult::Unsatisfiable => None,
-                        SmtResult::Satisfiable => {
+                        CompleteBooleanResult::Solver(SmtResult::Unsatisfiable) => None,
+                        CompleteBooleanResult::Solver(SmtResult::Satisfiable) => {
                             let Some(promotable_alias_condition) =
                                 resolved.extract_promotable_disjuncts(false)
                             else {
@@ -5266,13 +5267,13 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                                 .block_visitor
                                 .bv
                                 .solve_complete_boolean(&alias_violation)
-                                != SmtResult::Satisfiable
+                                != CompleteBooleanResult::Solver(SmtResult::Satisfiable)
                             {
                                 continue;
                             }
                             Some(promotable_alias_condition)
                         }
-                        SmtResult::Undefined => {
+                        CompleteBooleanResult::EncodingIncomplete => {
                             let Some(promotable_alias_condition) =
                                 resolved.extract_promotable_disjuncts(false)
                             else {
@@ -5283,6 +5284,7 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                             }
                             Some(promotable_alias_condition)
                         }
+                        CompleteBooleanResult::Solver(SmtResult::Undefined) => continue,
                     };
                     if recovering_incomplete_summary && alias_guard.is_none() {
                         continue;
