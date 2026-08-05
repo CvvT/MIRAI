@@ -126,7 +126,7 @@ fn guarded_byte_decoded_option(option: [u8; 4], read: &Lock, written: &Lock) {
         if selected == 9 {
             require_unlocked_when(1, read);
         }
-    });
+    }); //~ related location
 }
 
 pub fn active_alias(lock: &Lock) {
@@ -224,6 +224,34 @@ pub fn byte_decoded_keepalive_alias(lock: &Lock) {
 pub fn byte_decoded_broadcast_alias(lock: &Lock) {
     set_model_field!(lock, writer, 0usize);
     guarded_byte_decoded_option(6u32.to_ne_bytes(), lock, lock);
+}
+
+fn dispatch_shift_decoded_option(option: [u8; 4], callback: impl FnOnce(u32)) {
+    let selected = (option[0] as u32)
+        | ((option[1] as u32) << 8)
+        | ((option[2] as u32) << 16)
+        | ((option[3] as u32) << 24);
+    callback(selected);
+}
+
+fn guarded_shift_decoded_option(option: [u8; 4], read: &Lock, written: &Lock) {
+    set_model_field!(written, writer, 1usize);
+    dispatch_shift_decoded_option(option, |selected| {
+        if selected == 9 {
+            require_unlocked_when(1, read);
+        }
+    });
+}
+
+pub fn shift_decoded_keepalive_alias(lock: &Lock) {
+    set_model_field!(lock, writer, 0usize);
+    guarded_shift_decoded_option([9, 0, 0, 0], lock, lock);
+    //~ possible alias violates precondition
+}
+
+pub fn shift_decoded_broadcast_alias(lock: &Lock) {
+    set_model_field!(lock, writer, 0usize);
+    guarded_shift_decoded_option([6, 0, 0, 0], lock, lock);
 }
 
 pub fn main() {}

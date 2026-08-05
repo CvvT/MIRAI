@@ -1124,12 +1124,32 @@ pub(crate) fn substitute_alias_in_complete_value(
         Expression::LogicalNot { operand } => {
             Some(substitute_alias_in_complete_value(operand, alias, source)?.logical_not())
         }
+        Expression::Sub { left, right } => {
+            let (left, right) = substitute_binary(left, right)?;
+            Some(left.subtract(right))
+        }
+        Expression::Div { left, right } => {
+            let (left, right) = substitute_binary(left, right)?;
+            Some(left.divide(right))
+        }
+        Expression::Shl { left, right } => {
+            let (left, right) = substitute_binary(left, right)?;
+            Some(left.shift_left(right))
+        }
+        Expression::Shr { left, right } => {
+            let (left, right) = substitute_binary(left, right)?;
+            Some(left.shr(right))
+        }
         Expression::Transmute {
             operand,
             target_type,
         } => Some(
             substitute_alias_in_complete_value(operand, alias, source)?.transmute(*target_type),
         ),
+        Expression::Cast {
+            operand,
+            target_type,
+        } => Some(substitute_alias_in_complete_value(operand, alias, source)?.cast(*target_type)),
         _ => None,
     }
 }
@@ -1179,6 +1199,7 @@ pub(crate) fn collect_model_field_subjects(
         | Expression::BitAnd { left, right }
         | Expression::BitOr { left, right }
         | Expression::BitXor { left, right }
+        | Expression::Div { left, right }
         | Expression::Equals { left, right }
         | Expression::GreaterOrEqual { left, right }
         | Expression::GreaterThan { left, right }
@@ -1187,8 +1208,13 @@ pub(crate) fn collect_model_field_subjects(
         | Expression::Mul { left, right }
         | Expression::Ne { left, right }
         | Expression::Or { left, right }
-        | Expression::Rem { left, right } => collect_binary(left, right),
-        Expression::LogicalNot { operand } | Expression::Transmute { operand, .. } => {
+        | Expression::Rem { left, right }
+        | Expression::Shl { left, right }
+        | Expression::Shr { left, right }
+        | Expression::Sub { left, right } => collect_binary(left, right),
+        Expression::Cast { operand, .. }
+        | Expression::LogicalNot { operand }
+        | Expression::Transmute { operand, .. } => {
             collect_model_field_subjects(&operand.expression, subjects)
         }
         _ => false,
@@ -1295,12 +1321,32 @@ pub(crate) fn resolve_model_fields_in_complete_value(
         Expression::LogicalNot { operand } => {
             Some(resolve_model_fields_in_complete_value(operand, environment)?.logical_not())
         }
+        Expression::Sub { left, right } => {
+            let (left, right) = resolve_binary(left, right)?;
+            Some(left.subtract(right))
+        }
+        Expression::Div { left, right } => {
+            let (left, right) = resolve_binary(left, right)?;
+            Some(left.divide(right))
+        }
+        Expression::Shl { left, right } => {
+            let (left, right) = resolve_binary(left, right)?;
+            Some(left.shift_left(right))
+        }
+        Expression::Shr { left, right } => {
+            let (left, right) = resolve_binary(left, right)?;
+            Some(left.shr(right))
+        }
         Expression::Transmute {
             operand,
             target_type,
         } => Some(
             resolve_model_fields_in_complete_value(operand, environment)?.transmute(*target_type),
         ),
+        Expression::Cast {
+            operand,
+            target_type,
+        } => Some(resolve_model_fields_in_complete_value(operand, environment)?.cast(*target_type)),
         _ => None,
     }
 }
