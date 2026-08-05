@@ -45,9 +45,6 @@ Under pathological host load (observed only at load average ≥~26; absent at �
 ### Hygiene at the verification anchor
 At verification, canonical `/workspace/MIRAI` matched the published origin tip with empty status. Tested code ancestor `1a00076` contained the durable admissibility control, union-field ICE hardening (`1990510`) was present in the verified branch, and `run_pass` completed green. Later worktree state does not alter these commit-scoped results.
 
-### Solver-timeout false positive: resolved (`23d186a`)
-The solver-timeout false-positive path is **resolved**, not open: `23d186a` "Separate solver timeouts from incomplete encoding" distinguishes `Solver(SmtResult::Undefined)` (timeout — skips diagnostic emission) from `EncodingIncomplete` (retains the guarded diagnostic), covered by the committed test `complete_boolean_query_distinguishes_incomplete_encoding_from_solver_timeout` in `body_visitor.rs`. @factchecker's under-load loop ran 30/30 stable.
-
 ## 5. Conclusion
 
 Criterion 3 is fully verified and permanently closed on the published branch, with tested code closure at ancestor `1a00076` (after `b1bcf49`). Both in-repo scopes pass, the decode boundary is backed by a real discriminating oracle (byte/shift cells) proven across a cold-built pre-fix checker, and only a non-reproducing external opaque-source item remains — non-gating.
