@@ -540,15 +540,16 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                     .visit_body(&[])
                     .callback_invocations
                     .into_iter()
-                    .filter(|invocation| {
-                        invocation.pre_state.iter().any(|(path, _)| {
+                    .map(|invocation| {
+                        let has_arc_model_state = invocation.pre_state.iter().any(|(path, _)| {
                             Self::is_arc_projected_model_field_with_types(
                                 path,
                                 baseline_visitor.type_visitor(),
                                 tcx,
                                 baseline_visitor.current_span,
                             )
-                        })
+                        });
+                        (invocation, has_arc_model_state)
                     })
                     .collect();
                 drop(baseline_visitor);
@@ -599,8 +600,79 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 }
             }
             let mut summary = body_visitor.visit_body(self.function_constant_args);
-            if summary.callback_invocations.is_empty() && !baseline_callbacks.is_empty() {
-                summary.callback_invocations = baseline_callbacks;
+            if summary.callback_invocations.is_empty() {
+                summary
+                    .callback_invocations
+                    .extend(baseline_callbacks.into_iter().filter_map(
+                        |(invocation, has_arc_model_state)| {
+                            has_arc_model_state.then_some(invocation)
+                        },
+                    ));
+            } else {
+                // Specialized analysis can retain only one mutually exclusive callback arm.
+                // Supplement it only with baseline arms distinguished by concrete argument state.
+                for (mut baseline, _) in baseline_callbacks {
+                    let has_argument_projection = (1..baseline.arguments.len()).any(|index| {
+                        let root = BlockVisitor::callback_argument_projection_root(index);
+                        baseline
+                            .pre_state
+                            .iter()
+                            .any(|(path, _)| path.is_rooted_by(&root))
+                    });
+                    if !baseline.arguments_complete || !has_argument_projection {
+                        continue;
+                    }
+                    let matching_specializations = summary
+                        .callback_invocations
+                        .iter()
+                        .filter(|specialized| {
+                            specialized.callee == baseline.callee
+                                && specialized.arguments.len() == baseline.arguments.len()
+                                && specialized.specialized_callee.is_some()
+                        })
+                        .collect::<Vec<_>>();
+                    let Some(specialized) = matching_specializations.first() else {
+                        continue;
+                    };
+                    if matching_specializations.iter().skip(1).any(|candidate| {
+                        candidate.specialized_callee != specialized.specialized_callee
+                            || candidate.function_constants != specialized.function_constants
+                    }) {
+                        continue;
+                    }
+                    baseline.specialized_callee = specialized.specialized_callee.clone();
+                    baseline.function_constants = specialized.function_constants.clone();
+                    baseline.is_local = specialized.is_local;
+                    if let (
+                        Some((baseline_path, baseline_value)),
+                        Some((specialized_path, specialized_value)),
+                    ) = (
+                        baseline.arguments.first_mut(),
+                        specialized.arguments.first(),
+                    ) {
+                        if baseline_value.is_bottom() || specialized_value.is_function() {
+                            *baseline_path = specialized_path.clone();
+                            *baseline_value = specialized_value.clone();
+                        }
+                    }
+                    let already_represented =
+                        summary.callback_invocations.iter().any(|represented| {
+                            represented.callee == baseline.callee
+                                && represented.arguments == baseline.arguments
+                                && represented.arguments_complete == baseline.arguments_complete
+                                && represented.pre_state == baseline.pre_state
+                                && represented.pre_aliases == baseline.pre_aliases
+                                && represented.pre_guarded_aliases == baseline.pre_guarded_aliases
+                                && represented.guard == baseline.guard
+                                && represented.specialized_callee == baseline.specialized_callee
+                                && represented.function_constants == baseline.function_constants
+                                && represented.is_local == baseline.is_local
+                                && represented.state_rekeys == baseline.state_rekeys
+                        });
+                    if !already_represented {
+                        summary.callback_invocations.push(baseline);
+                    }
+                }
             }
             trace!("summary {:?} {:?}", self.callee_def_id, summary);
             if let Some(func_ref) = &self.callee_func_ref {

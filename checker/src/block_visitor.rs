@@ -192,6 +192,17 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
         let pty = self
             .type_visitor()
             .get_rustc_place_type(place, self.bv.current_span);
+        let lineage_is_recorded_by_rvalue = matches!(
+            rvalue,
+            mir::Rvalue::Use(mir::Operand::Copy(_) | mir::Operand::Move(_), _)
+                | mir::Rvalue::CopyForDeref(_)
+                | mir::Rvalue::WrapUnsafeBinder(mir::Operand::Copy(_) | mir::Operand::Move(_), _)
+        );
+        if !lineage_is_recorded_by_rvalue {
+            self.bv
+                .callback_argument_lineage
+                .retain(|candidate, _| candidate != &path && !candidate.is_rooted_by(&path));
+        }
         self.type_visitor_mut()
             .set_path_rustc_type(path.clone(), pty);
         self.visit_rvalue(path, rvalue);
@@ -1065,17 +1076,31 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                 if index == 0 && value.is_function() {
                     return (path.clone(), value.clone());
                 }
+                let environment_value = self.bv.current_environment.value_at(path).cloned();
+                let value = if environment_value
+                    .as_ref()
+                    .is_some_and(|value| !value.expression.contains_local_variable(false))
+                {
+                    environment_value.unwrap()
+                } else {
+                    self.bv
+                        .callback_argument_lineage
+                        .get(path)
+                        .cloned()
+                        .or(environment_value)
+                        .unwrap_or_else(|| value.clone())
+                };
                 if !path.contains_local_variable(false)
                     && !value.expression.contains_local_variable(false)
                 {
-                    return (path.clone(), value.clone());
+                    return (path.clone(), value);
                 }
                 if !value.expression.contains_local_variable(false) {
                     let boundary_path = Path::get_as_path(value.clone())
                         .remove_initial_value_wrapper()
                         .canonicalize(&self.bv.current_environment);
                     if !boundary_path.contains_local_variable(false) {
-                        return (boundary_path, value.clone());
+                        return (boundary_path, value);
                     }
                 }
                 if path.contains_local_variable(false) {
@@ -1107,7 +1132,7 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                     }
                 }
                 if preserve_unprojected_arguments {
-                    return (path.clone(), value.clone());
+                    return (path.clone(), value);
                 }
                 arguments_complete = false;
                 (Path::new_computed(Rc::new(BOTTOM)), Rc::new(BOTTOM))
@@ -2670,6 +2695,7 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                     .set_path_rustc_type(target_path.clone(), source_type);
             }
         }
+        self.record_callback_argument_lineage(&target_path, &rpath, rtype);
         self.bv
             .copy_or_move_elements(target_path, rpath, rtype, false);
     }
@@ -2699,8 +2725,34 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                     .set_path_rustc_type(target_path.clone(), source_type);
             }
         }
+        self.record_callback_argument_lineage(&target_path, &rpath, rtype);
         self.bv
             .copy_or_move_elements(target_path, rpath, rtype, true);
+    }
+
+    fn record_callback_argument_lineage(
+        &mut self,
+        target_path: &Rc<Path>,
+        source_path: &Rc<Path>,
+        source_type: Ty<'tcx>,
+    ) {
+        let source_value = self
+            .bv
+            .callback_argument_lineage
+            .get(source_path)
+            .cloned()
+            .unwrap_or_else(|| {
+                self.bv
+                    .lookup_path_and_refine_result(source_path.clone(), source_type)
+            });
+        self.bv.callback_argument_lineage.retain(|candidate, _| {
+            candidate != target_path && !candidate.is_rooted_by(target_path)
+        });
+        if !source_value.expression.contains_local_variable(false) {
+            self.bv
+                .callback_argument_lineage
+                .insert(target_path.clone(), source_value);
+        }
     }
 
     /// path = [x; 32]

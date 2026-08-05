@@ -69,6 +69,8 @@ pub struct BodyVisitor<'analysis, 'compilation, 'tcx> {
     pub first_environment: Environment,
     pub function_name: Rc<str>,
     pub heap_addresses: HashMap<mir::Location, Rc<AbstractValue>>,
+    /// Parameter-derived values retained independently of branch-local fixed-point state.
+    pub callback_argument_lineage: HashMap<Rc<Path>, Rc<AbstractValue>>,
     pub post_condition: Option<Rc<AbstractValue>>,
     pub post_condition_block: Option<mir::BasicBlock>,
     pub preconditions: Vec<Precondition>,
@@ -1320,6 +1322,7 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
             first_environment: Environment::default(),
             function_name,
             heap_addresses: HashMap::default(),
+            callback_argument_lineage: HashMap::default(),
             post_condition: None,
             post_condition_block: None,
             preconditions: Vec::new(),
@@ -1347,6 +1350,7 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
         self.start_instant = Instant::now();
         self.exit_environment = None;
         self.heap_addresses = HashMap::default();
+        self.callback_argument_lineage = HashMap::default();
         self.post_condition = None;
         self.post_condition_block = None;
         self.preconditions = Vec::new();

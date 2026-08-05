@@ -13,6 +13,7 @@ fn require_unlocked_when(active: u32, lock: &Lock) {
     precondition!((active != 1) | (get_model_field!(lock, writer, 0usize) == 0));
     //~ related location
     //~ related location
+    //~ related location
 }
 
 fn guarded_distinct_writers(active: u32, read: &Lock, written: &Lock) {
@@ -37,6 +38,10 @@ enum SocketOption {
     KeepAlive,
 }
 
+enum SocketOptionName {
+    Socket(SocketOption),
+}
+
 fn with_writer(written: &Lock, callback: impl FnOnce()) {
     set_model_field!(written, writer, 1usize);
     callback();
@@ -59,6 +64,23 @@ fn dispatch_socket_option(option: SocketOption, callback: impl FnOnce(SocketOpti
 fn guarded_dispatched_socket_option(option: SocketOption, read: &Lock, written: &Lock) {
     set_model_field!(written, writer, 1usize);
     dispatch_socket_option(option, |selected| match selected {
+        SocketOption::KeepAlive => require_unlocked_when(1, read),
+        SocketOption::Broadcast => {}
+    });
+}
+
+fn dispatch_named_socket_option(
+    option: SocketOptionName,
+    callback: impl FnOnce(SocketOption),
+) {
+    match option {
+        SocketOptionName::Socket(selected) => callback(selected),
+    }
+}
+
+fn guarded_named_socket_option(option: SocketOptionName, read: &Lock, written: &Lock) {
+    set_model_field!(written, writer, 1usize);
+    dispatch_named_socket_option(option, |selected| match selected {
         SocketOption::KeepAlive => require_unlocked_when(1, read),
         SocketOption::Broadcast => {}
     });
@@ -110,6 +132,25 @@ pub fn dispatched_keepalive_alias(lock: &Lock) {
 pub fn dispatched_broadcast_alias(lock: &Lock) {
     set_model_field!(lock, writer, 0usize);
     guarded_dispatched_socket_option(SocketOption::Broadcast, lock, lock);
+}
+
+pub fn named_keepalive_alias(lock: &Lock) {
+    set_model_field!(lock, writer, 0usize);
+    guarded_named_socket_option(
+        SocketOptionName::Socket(SocketOption::KeepAlive),
+        lock,
+        lock,
+    );
+    //~ possible alias violates precondition
+}
+
+pub fn named_broadcast_alias(lock: &Lock) {
+    set_model_field!(lock, writer, 0usize);
+    guarded_named_socket_option(
+        SocketOptionName::Socket(SocketOption::Broadcast),
+        lock,
+        lock,
+    );
 }
 
 pub fn main() {}
