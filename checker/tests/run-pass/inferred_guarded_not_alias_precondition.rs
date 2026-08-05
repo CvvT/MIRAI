@@ -12,6 +12,7 @@ pub struct Lock;
 fn require_unlocked_when(active: u32, lock: &Lock) {
     precondition!((active != 1) | (get_model_field!(lock, writer, 0usize) == 0));
     //~ related location
+    //~ related location
 }
 
 fn guarded_distinct_writers(active: u32, read: &Lock, written: &Lock) {
@@ -43,6 +44,21 @@ fn with_writer(written: &Lock, callback: impl FnOnce()) {
 
 fn guarded_socket_option(option: SocketOption, read: &Lock, written: &Lock) {
     with_writer(written, || match option { //~ related location
+        SocketOption::KeepAlive => require_unlocked_when(1, read),
+        SocketOption::Broadcast => {}
+    });
+}
+
+fn dispatch_socket_option(option: SocketOption, callback: impl FnOnce(SocketOption)) {
+    match option {
+        SocketOption::Broadcast => callback(SocketOption::Broadcast),
+        SocketOption::KeepAlive => callback(SocketOption::KeepAlive),
+    }
+}
+
+fn guarded_dispatched_socket_option(option: SocketOption, read: &Lock, written: &Lock) {
+    set_model_field!(written, writer, 1usize);
+    dispatch_socket_option(option, |selected| match selected {
         SocketOption::KeepAlive => require_unlocked_when(1, read),
         SocketOption::Broadcast => {}
     });
@@ -83,6 +99,17 @@ pub fn keepalive_alias(lock: &Lock) {
 pub fn broadcast_alias(lock: &Lock) {
     set_model_field!(lock, writer, 0usize);
     guarded_socket_option(SocketOption::Broadcast, lock, lock);
+}
+
+pub fn dispatched_keepalive_alias(lock: &Lock) {
+    set_model_field!(lock, writer, 0usize);
+    guarded_dispatched_socket_option(SocketOption::KeepAlive, lock, lock);
+    //~ possible alias violates precondition
+}
+
+pub fn dispatched_broadcast_alias(lock: &Lock) {
+    set_model_field!(lock, writer, 0usize);
+    guarded_dispatched_socket_option(SocketOption::Broadcast, lock, lock);
 }
 
 pub fn main() {}

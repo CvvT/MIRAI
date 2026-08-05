@@ -854,7 +854,16 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
         if !self.bv.check_for_errors {
             return true;
         }
-        self.push_callback_invocation(callee_parameter, actual_args, true, None)
+        let (boundary_args, arguments_complete, argument_projection_state) =
+            self.callback_boundary_arguments(actual_args);
+        self.push_callback_invocation(callee_parameter, &boundary_args, arguments_complete, None);
+        self.bv
+            .callback_invocations
+            .last_mut()
+            .expect("push_callback_invocation must append an invocation")
+            .pre_state
+            .extend(argument_projection_state);
+        true
     }
 
     pub fn record_transitive_callback_invocation(
@@ -931,52 +940,14 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
             return true;
         }
 
-        let mut arguments_complete = true;
-        let mut argument_projection_state = Vec::new();
-        let boundary_args = actual_args
-            .iter()
-            .enumerate()
-            .map(|(index, (path, value))| {
-                if index == 0 && value.is_function() {
-                    return (callee_parameter.clone(), value.clone());
-                }
-                if !path.contains_local_variable(false)
-                    && !value.expression.contains_local_variable(false)
-                {
-                    return (path.clone(), value.clone());
-                }
-                if !value.expression.contains_local_variable(false) {
-                    let boundary_path = Path::get_as_path(value.clone())
-                        .remove_initial_value_wrapper()
-                        .canonicalize(&self.bv.current_environment);
-                    if !boundary_path.contains_local_variable(false) {
-                        return (boundary_path, value.clone());
-                    }
-                }
-                if path.contains_local_variable(false) {
-                    let projection_root = Self::callback_argument_projection_root(index);
-                    argument_projection_state.extend(
-                        self.bv
-                            .current_environment
-                            .value_map
-                            .iter()
-                            .filter(|(candidate, projection_value)| {
-                                *candidate != path
-                                    && candidate.is_rooted_by(path)
-                                    && !projection_value.expression.contains_local_variable(false)
-                            })
-                            .map(|(candidate, projection_value)| {
-                                (
-                                    candidate.replace_root(path, projection_root.clone()),
-                                    projection_value.clone(),
-                                )
-                            }),
-                    );
-                }
-                arguments_complete = false;
-                (Path::new_computed(Rc::new(BOTTOM)), Rc::new(BOTTOM))
-            })
-            .collect::<Vec<_>>();
+        let (mut boundary_args, arguments_complete, argument_projection_state) =
+            self.callback_boundary_arguments(actual_args);
+        if boundary_args
+            .first()
+            .is_some_and(|(_, value)| value.is_function())
+        {
+            boundary_args[0].0 = callee_parameter.clone();
+        }
         self.push_callback_invocation(
             callee_parameter,
             &boundary_args,
@@ -1074,6 +1045,71 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
         }
         self.deduplicate_last_callback_invocation();
         true
+    }
+
+    fn callback_boundary_arguments(
+        &self,
+        actual_args: &[(Rc<Path>, Rc<AbstractValue>)],
+    ) -> (
+        Vec<(Rc<Path>, Rc<AbstractValue>)>,
+        bool,
+        Vec<(Rc<Path>, Rc<AbstractValue>)>,
+    ) {
+        let mut arguments_complete = true;
+        let mut argument_projection_state = Vec::new();
+        let boundary_args = actual_args
+            .iter()
+            .enumerate()
+            .map(|(index, (path, value))| {
+                if index == 0 && value.is_function() {
+                    return (path.clone(), value.clone());
+                }
+                if !path.contains_local_variable(false)
+                    && !value.expression.contains_local_variable(false)
+                {
+                    return (path.clone(), value.clone());
+                }
+                if !value.expression.contains_local_variable(false) {
+                    let boundary_path = Path::get_as_path(value.clone())
+                        .remove_initial_value_wrapper()
+                        .canonicalize(&self.bv.current_environment);
+                    if !boundary_path.contains_local_variable(false) {
+                        return (boundary_path, value.clone());
+                    }
+                }
+                if path.contains_local_variable(false) {
+                    let projection_root = Self::callback_argument_projection_root(index);
+                    let projection_count = argument_projection_state.len();
+                    argument_projection_state.extend(
+                        self.bv
+                            .current_environment
+                            .value_map
+                            .iter()
+                            .filter(|(candidate, projection_value)| {
+                                *candidate != path
+                                    && candidate.is_rooted_by(path)
+                                    && !projection_value.expression.contains_local_variable(false)
+                            })
+                            .map(|(candidate, projection_value)| {
+                                (
+                                    candidate.replace_root(path, projection_root.clone()),
+                                    projection_value.clone(),
+                                )
+                            }),
+                    );
+                    if argument_projection_state.len() > projection_count {
+                        let value = AbstractValue::make_typed_unknown(
+                            value.expression.infer_type(),
+                            projection_root.clone(),
+                        );
+                        return (projection_root, value);
+                    }
+                }
+                arguments_complete = false;
+                (Path::new_computed(Rc::new(BOTTOM)), Rc::new(BOTTOM))
+            })
+            .collect();
+        (boundary_args, arguments_complete, argument_projection_state)
     }
 
     pub(crate) fn deduplicate_last_callback_invocation(&mut self) {
